@@ -7,3 +7,4 @@ jobs/
 download_clip*
 dataset/
 glove/
+log/
