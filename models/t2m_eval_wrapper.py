@@ -14,13 +14,15 @@ def build_models(opt):
                                       hidden_size=opt.dim_motion_hidden,
                                       output_size=opt.dim_coemb_hidden,
                                       device=opt.device)
-
-    checkpoint = torch.load(pjoin(opt.checkpoints_dir, opt.dataset_name, 'text_mot_match', 'model', 'finest.tar'),
+    if opt.eval_on:
+        checkpoint = torch.load(pjoin(opt.checkpoints_dir, opt.dataset_name, 'text_mot_match', 'model', 'finest.tar'),
                             map_location=opt.device)
-    movement_enc.load_state_dict(checkpoint['movement_encoder'])
-    text_enc.load_state_dict(checkpoint['text_encoder'])
-    motion_enc.load_state_dict(checkpoint['motion_encoder'])
-    print('Loading Evaluation Model Wrapper (Epoch %d) Completed!!' % (checkpoint['epoch']))
+        movement_enc.load_state_dict(checkpoint['movement_encoder'])
+        text_enc.load_state_dict(checkpoint['text_encoder'])
+        motion_enc.load_state_dict(checkpoint['motion_encoder'])
+        print('Loading Evaluation Model Wrapper (Epoch %d) Completed!!' % (checkpoint['epoch']))
+    else:
+        print('evaluation off, no evaluation model loaded. All parameters are randomly initialized.')
     return text_enc, motion_enc, movement_enc
 
 
@@ -32,14 +34,16 @@ class EvaluatorModelWrapper(object):
             opt.dim_pose = 263
         elif opt.dataset_name == 'kit':
             opt.dim_pose = 251
+        elif opt.dataset_name == 'cam':
+            opt.dim_pose = 5
         else:
             raise KeyError('Dataset not Recognized!!!')
 
         opt.dim_word = 300
-        opt.max_motion_length = 196
+        opt.max_motion_length = 196 if opt.dataset_name == 'kit' else 240
         opt.dim_pos_ohot = len(POS_enumerator)
         opt.dim_motion_hidden = 1024
-        opt.max_text_len = 20
+        opt.max_text_len = 20 if opt.dataset_name == 'kit' else 60
         opt.dim_text_hidden = 512
         opt.dim_coemb_hidden = 512
 

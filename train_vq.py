@@ -70,15 +70,27 @@ if __name__ == "__main__":
         dim_pose = 251
         opt.max_motion_length = 196
         kinematic_chain = paramUtil.kit_kinematic_chain
-        dataset_opt_path = './checkpoints/kit/Comp_v6_KLD005/opt.txt'
+        dataset_opt_path = './checkpoints/kit/Comp_v6_KLD005/opt.txt' # is this generated or hardcoded?
+    elif opt.dataset_name == "cam":
+        opt.data_root = './dataset/CameraTraj/'
+        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
+        opt.text_dir = pjoin(opt.data_root, 'texts')
+        opt.joints_num = 1
+        radius = 240 * 8
+        fps = 12.5
+        dim_pose = 5
+        opt.max_motion_length = 240
+        kinematic_chain = paramUtil.kit_kinematic_chain # ??
+        dataset_opt_path = './checkpoints/cam/Comp_v6_KLD005/opt.txt'
     else:
         raise KeyError('Dataset Does not Exists')
 
     wrapper_opt = get_opt(dataset_opt_path, torch.device('cuda'))
+    wrapper_opt.eval_on = opt.eval_on
     eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
 
-    mean = np.load(pjoin(opt.data_root, 'Mean.npy'))
-    std = np.load(pjoin(opt.data_root, 'Std.npy'))
+    mean = np.load(pjoin(opt.data_root, 'Mean.npy'), allow_pickle=False)
+    std = np.load(pjoin(opt.data_root, 'Std.npy'), allow_pickle=False)
 
     train_split_file = pjoin(opt.data_root, 'train.txt')
     val_split_file = pjoin(opt.data_root, 'val.txt')
@@ -113,6 +125,12 @@ if __name__ == "__main__":
                               shuffle=True, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, drop_last=True, num_workers=4,
                             shuffle=True, pin_memory=True)
+    
+    if opt.eval_on:
+        eval_val_loader, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device)
+    else:
+        eval_val_loader = None
+
     eval_val_loader, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device)
     trainer.train(train_loader, val_loader, eval_val_loader, eval_wrapper, plot_t2m)
 

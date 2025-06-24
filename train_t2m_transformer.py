@@ -96,6 +96,18 @@ if __name__ == '__main__':
         kinematic_chain = kit_kinematic_chain
         dataset_opt_path = './checkpoints/kit/Comp_v6_KLD005/opt.txt'
 
+    elif opt.dataset_name == "cam":
+        opt.data_root = './dataset/CameraTraj/'
+        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
+        opt.text_dir = pjoin(opt.data_root, 'texts')
+        opt.joints_num = 1
+        radius = 240 * 8
+        fps = 12.5
+        dim_pose = 5
+        opt.max_motion_length = 240
+        kinematic_chain = kit_kinematic_chain # TODO
+        dataset_opt_path = './checkpoints/cam/Comp_v6_KLD005/opt.txt'
+
     else:
         raise KeyError('Dataset Does Not Exist')
 

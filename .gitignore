@@ -2,3 +2,8 @@
 checkpoints
 editing
 generation
+
+jobs/
+download_clip*
+dataset/
+glove/

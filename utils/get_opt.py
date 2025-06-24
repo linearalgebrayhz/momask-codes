@@ -29,7 +29,6 @@ def is_number(numStr):
 def get_opt(opt_path, device, **kwargs):
     opt = Namespace()
     opt_dict = vars(opt)
-
     skip = ('-------------- End ----------------',
             '------------ Options -------------',
             '\n')
@@ -49,7 +48,7 @@ def get_opt(opt_path, device, **kwargs):
                 else:
                     opt_dict[key] = str(value)
 
-    # print(opt)
+    print(opt)
     opt_dict['which_epoch'] = 'finest'
     opt.save_root = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.name)
     opt.model_dir = pjoin(opt.save_root, 'model')
@@ -73,6 +72,15 @@ def get_opt(opt_path, device, **kwargs):
         opt.max_motion_length = 196
         opt.max_motion_frame = 196
         opt.max_motion_token = 55
+    elif opt.dataset_name == 'cam':
+        opt.data_root = './dataset/CameraTraj/'
+        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
+        opt.text_dir = pjoin(opt.data_root, 'texts')
+        opt.joints_num = 1
+        opt.dim_pose = 5
+        opt.max_motion_length = 240
+        opt.max_motion_frame = 240
+        opt.max_motion_token = 60
     else:
         raise KeyError('Dataset not recognized')
     if not hasattr(opt, 'unit_length'):
@@ -85,5 +93,6 @@ def get_opt(opt_path, device, **kwargs):
     opt.device = device
 
     opt_dict.update(kwargs) # Overwrite with kwargs params
-
+    print("At the end of get_opt function: ")
+    print(opt)
     return opt

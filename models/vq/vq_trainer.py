@@ -15,6 +15,7 @@ from utils.utils import print_current_loss
 
 import os
 import sys
+from tqdm import tqdm
 
 def def_value():
     return 0.0
@@ -96,7 +97,7 @@ class RVQTokenizerTrainer:
         start_time = time.time()
         total_iters = self.opt.max_epoch * len(train_loader)
         print(f'Total Epochs: {self.opt.max_epoch}, Total Iters: {total_iters}')
-        print('Iters Per Epoch, Training: %04d, Validation: %03d' % (len(train_loader), len(eval_val_loader)))
+        print('Iters Per Epoch, Training: %04d, Validation: %03d' % (len(train_loader), len(val_loader))) #????
         # val_loss = 0
         # min_val_loss = np.inf
         # min_val_epoch = epoch
@@ -104,6 +105,7 @@ class RVQTokenizerTrainer:
         logs = defaultdict(def_value, OrderedDict())
 
         # sys.exit()
+        # if self.opt.eval_on:
         best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer = evaluation_vqvae(
             self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, best_fid=1000,
             best_div=100, best_top1=0,
@@ -112,7 +114,7 @@ class RVQTokenizerTrainer:
 
         while epoch < self.opt.max_epoch:
             self.vq_model.train()
-            for i, batch_data in enumerate(train_loader):
+            for i, batch_data in tqdm(enumerate(train_loader), desc = f"[Train RVQ epoch {epoch}/{self.opt.max_epoch}]", total=len(train_loader)):
                 it += 1
                 if it < self.opt.warm_up_iter:
                     current_lr = self.update_lr_warm_up(it, self.opt.warm_up_iter, self.opt.lr)
@@ -159,7 +161,7 @@ class RVQTokenizerTrainer:
             val_loss = []
             val_perpexity = []
             with torch.no_grad():
-                for i, batch_data in enumerate(val_loader):
+                for i, batch_data in tqdm(enumerate(val_loader), desc = f"[Validation RVQ epoch {epoch}/{self.opt.max_epoch}]", total=len(val_loader)):
                     loss, loss_rec, loss_vel, loss_commit, perplexity = self.forward(batch_data)
                     # val_loss_rec += self.l1_criterion(self.recon_motions, self.motions).item()
                     # val_loss_emb += self.embedding_loss.item()
@@ -190,19 +192,19 @@ class RVQTokenizerTrainer:
             #     min_val_epoch = epoch
             #     self.save(pjoin(self.opt.model_dir, 'finest.tar'), epoch, it)
             #     print('Best Validation Model So Far!~')
-
+            # if self.opt.eval_on:
             best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer = evaluation_vqvae(
                 self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, best_fid=best_fid,
                 best_div=best_div, best_top1=best_top1,
                 best_top2=best_top2, best_top3=best_top3, best_matching=best_matching, eval_wrapper=eval_wrapper)
 
 
-            if epoch % self.opt.eval_every_e == 0:
-                data = torch.cat([self.motions[:4], self.pred_motion[:4]], dim=0).detach().cpu().numpy()
-                # np.save(pjoin(self.opt.eval_dir, 'E%04d.npy' % (epoch)), data)
-                save_dir = pjoin(self.opt.eval_dir, 'E%04d' % (epoch))
-                os.makedirs(save_dir, exist_ok=True)
-                plot_eval(data, save_dir)
+            # if self.opt.eval_on and epoch % self.opt.eval_every_e == 0:
+            data = torch.cat([self.motions[:4], self.pred_motion[:4]], dim=0).detach().cpu().numpy()
+            # np.save(pjoin(self.opt.eval_dir, 'E%04d.npy' % (epoch)), data)
+            save_dir = pjoin(self.opt.eval_dir, 'E%04d' % (epoch))
+            os.makedirs(save_dir, exist_ok=True)
+            plot_eval(data, save_dir)
                 # if plot_eval is not None:
                 #     save_dir = pjoin(self.opt.eval_dir, 'E%04d' % (epoch))
                 #     os.makedirs(save_dir, exist_ok=True)

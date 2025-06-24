@@ -37,31 +37,38 @@ class MotionDataset(data.Dataset):
                 pass
 
         self.cumsum = np.cumsum([0] + self.lengths)
+        if opt.dataset_name == "cam":
+            if opt.is_train:
+                std = std / opt.feat_bias  # Scale all features by feat_bias
+                # Save updated mean and std to meta_dir
+                np.save(pjoin(opt.meta_dir, 'mean.npy'), mean)
+                np.save(pjoin(opt.meta_dir, 'std.npy'), std)
+            assert mean.shape[-1] == 5, f"Expected 5 features for cam dataset, got {mean.shape[-1]}"
+        else: 
+            if opt.is_train:
+                # root_rot_velocity (B, seq_len, 1)
+                std[0:1] = std[0:1] / opt.feat_bias
+                # root_linear_velocity (B, seq_len, 2)
+                std[1:3] = std[1:3] / opt.feat_bias
+                # root_y (B, seq_len, 1)
+                std[3:4] = std[3:4] / opt.feat_bias
+                # ric_data (B, seq_len, (joint_num - 1)*3)
+                std[4: 4 + (joints_num - 1) * 3] = std[4: 4 + (joints_num - 1) * 3] / 1.0
+                # rot_data (B, seq_len, (joint_num - 1)*6)
+                std[4 + (joints_num - 1) * 3: 4 + (joints_num - 1) * 9] = std[4 + (joints_num - 1) * 3: 4 + (
+                        joints_num - 1) * 9] / 1.0
+                # local_velocity (B, seq_len, joint_num*3)
+                std[4 + (joints_num - 1) * 9: 4 + (joints_num - 1) * 9 + joints_num * 3] = std[
+                                                                                        4 + (joints_num - 1) * 9: 4 + (
+                                                                                                joints_num - 1) * 9 + joints_num * 3] / 1.0
+                # foot contact (B, seq_len, 4)
+                std[4 + (joints_num - 1) * 9 + joints_num * 3:] = std[
+                                                                4 + (
+                                                                            joints_num - 1) * 9 + joints_num * 3:] / opt.feat_bias
 
-        if opt.is_train:
-            # root_rot_velocity (B, seq_len, 1)
-            std[0:1] = std[0:1] / opt.feat_bias
-            # root_linear_velocity (B, seq_len, 2)
-            std[1:3] = std[1:3] / opt.feat_bias
-            # root_y (B, seq_len, 1)
-            std[3:4] = std[3:4] / opt.feat_bias
-            # ric_data (B, seq_len, (joint_num - 1)*3)
-            std[4: 4 + (joints_num - 1) * 3] = std[4: 4 + (joints_num - 1) * 3] / 1.0
-            # rot_data (B, seq_len, (joint_num - 1)*6)
-            std[4 + (joints_num - 1) * 3: 4 + (joints_num - 1) * 9] = std[4 + (joints_num - 1) * 3: 4 + (
-                    joints_num - 1) * 9] / 1.0
-            # local_velocity (B, seq_len, joint_num*3)
-            std[4 + (joints_num - 1) * 9: 4 + (joints_num - 1) * 9 + joints_num * 3] = std[
-                                                                                       4 + (joints_num - 1) * 9: 4 + (
-                                                                                               joints_num - 1) * 9 + joints_num * 3] / 1.0
-            # foot contact (B, seq_len, 4)
-            std[4 + (joints_num - 1) * 9 + joints_num * 3:] = std[
-                                                              4 + (
-                                                                          joints_num - 1) * 9 + joints_num * 3:] / opt.feat_bias
-
-            assert 4 + (joints_num - 1) * 9 + joints_num * 3 + 4 == mean.shape[-1]
-            np.save(pjoin(opt.meta_dir, 'mean.npy'), mean)
-            np.save(pjoin(opt.meta_dir, 'std.npy'), std)
+                assert 4 + (joints_num - 1) * 9 + joints_num * 3 + 4 == mean.shape[-1]
+                np.save(pjoin(opt.meta_dir, 'mean.npy'), mean)
+                np.save(pjoin(opt.meta_dir, 'std.npy'), std)
 
         self.mean = mean
         self.std = std
@@ -91,7 +98,7 @@ class Text2MotionDatasetEval(data.Dataset):
     def __init__(self, opt, mean, std, split_file, w_vectorizer):
         self.opt = opt
         self.w_vectorizer = w_vectorizer
-        self.max_length = 20
+        self.max_length = 20 #?
         self.pointer = 0
         self.max_motion_length = opt.max_motion_length
         min_motion_len = 40 if self.opt.dataset_name =='t2m' else 24
@@ -102,58 +109,103 @@ class Text2MotionDatasetEval(data.Dataset):
             for line in f.readlines():
                 id_list.append(line.strip())
         # id_list = id_list[:250]
-
+        # print("[Testing] id list:")
+        # print("Length of id_list:", len(id_list))
+        # print(id_list[:10])
+        
         new_name_list = []
         length_list = []
-        for name in tqdm(id_list):
-            try:
-                motion = np.load(pjoin(opt.motion_dir, name + '.npy'))
-                if (len(motion)) < min_motion_len or (len(motion) >= 200):
-                    continue
-                text_data = []
-                flag = False
-                with cs.open(pjoin(opt.text_dir, name + '.txt')) as f:
-                    for line in f.readlines():
-                        text_dict = {}
-                        line_split = line.strip().split('#')
-                        caption = line_split[0]
-                        tokens = line_split[1].split(' ')
-                        f_tag = float(line_split[2])
-                        to_tag = float(line_split[3])
-                        f_tag = 0.0 if np.isnan(f_tag) else f_tag
-                        to_tag = 0.0 if np.isnan(to_tag) else to_tag
+        if opt.dataset_name == "cam":
+            for name in tqdm(id_list):
+                try:
+                    motion_path = pjoin(opt.motion_dir, name + '.npy')
+                    text_path = pjoin(opt.text_dir, name + '.txt')
+                    motion = np.load(motion_path)
+                    if (len(motion)) < min_motion_len or (len(motion) >= 300):
+                        continue
+                    text_data = []
+                    flag = False
+                    with cs.open(pjoin(opt.text_dir, name + '.txt')) as f:
+                        for line in f.readlines():
+                            text_dict = {}
+                            line_split = line.strip().split('#')
+                            caption = line_split[0]
+                            tokens = line_split[1].split(' ')
+                            f_tag = 0.0
+                            to_tag = 0.0
+                            text_dict['caption'] = caption
+                            text_dict['tokens'] = tokens 
+                            print(f"loading text file:\ncaption - {caption},\ntokens - {tokens},\n{f_tag}, {to_tag}")
+                            if f_tag == 0.0 and to_tag == 0.0:
+                                flag = True
+                                text_data.append(text_dict)
+                    if flag:
+                        data_dict[name] = {'motion': motion,
+                                        'length': len(motion),
+                                        'text': text_data}
+                        new_name_list.append(name)
+                        length_list.append(len(motion))
+                except:
+                    print("error loading text")
+        else:
+            for name in tqdm(id_list):
+                try:
+                    motion_path = pjoin(opt.motion_dir, name + '.npy')
+                    text_path = pjoin(opt.text_dir, name + '.txt')
+                    print(f"Attempting to load motion: {motion_path}")
+                    print(f"Attempting to load text: {text_path}")
+                    motion = np.load(motion_path)
+                    print(f"Motion loaded, shape: {motion.shape}")
+                    # motion = np.load(pjoin(opt.motion_dir, name + '.npy'))
+                    if (len(motion)) < min_motion_len or (len(motion) >= 300):
+                        continue
+                    text_data = []
+                    flag = False
+                    with cs.open(pjoin(opt.text_dir, name + '.txt')) as f:
+                        for line in f.readlines():
+                            text_dict = {}
+                            line_split = line.strip().split('#')
+                            caption = line_split[0]
+                            tokens = line_split[1].split(' ')
+                            f_tag = float(line_split[2])
+                            to_tag = float(line_split[3])
+                            f_tag = 0.0 if np.isnan(f_tag) else f_tag
+                            to_tag = 0.0 if np.isnan(to_tag) else to_tag
 
-                        text_dict['caption'] = caption
-                        text_dict['tokens'] = tokens
-                        if f_tag == 0.0 and to_tag == 0.0:
-                            flag = True
-                            text_data.append(text_dict)
-                        else:
-                            try:
-                                n_motion = motion[int(f_tag*20) : int(to_tag*20)]
-                                if (len(n_motion)) < min_motion_len or (len(n_motion) >= 200):
-                                    continue
-                                new_name = random.choice('ABCDEFGHIJKLMNOPQRSTUVW') + '_' + name
-                                while new_name in data_dict:
+                            text_dict['caption'] = caption
+                            text_dict['tokens'] = tokens
+                            print(f"loading text file: \n caption {caption},\n tokens {tokens},\n {f_tag}, {to_tag}")
+                            if f_tag == 0.0 and to_tag == 0.0:
+                                flag = True
+                                text_data.append(text_dict)
+                            else:
+                                try:
+                                    n_motion = motion[int(f_tag*20) : int(to_tag*20)]
+                                    if (len(n_motion)) < min_motion_len or (len(n_motion) >= 200):
+                                        continue
                                     new_name = random.choice('ABCDEFGHIJKLMNOPQRSTUVW') + '_' + name
-                                data_dict[new_name] = {'motion': n_motion,
-                                                       'length': len(n_motion),
-                                                       'text':[text_dict]}
-                                new_name_list.append(new_name)
-                                length_list.append(len(n_motion))
-                            except:
-                                print(line_split)
-                                print(line_split[2], line_split[3], f_tag, to_tag, name)
-                                # break
+                                    while new_name in data_dict:
+                                        new_name = random.choice('ABCDEFGHIJKLMNOPQRSTUVW') + '_' + name
+                                    data_dict[new_name] = {'motion': n_motion,
+                                                        'length': len(n_motion),
+                                                        'text':[text_dict]}
+                                    new_name_list.append(new_name)
+                                    length_list.append(len(n_motion))
+                                except:
+                                    print(line_split)
+                                    print(line_split[2], line_split[3], f_tag, to_tag, name)
+                                    # break
 
-                if flag:
-                    data_dict[name] = {'motion': motion,
-                                       'length': len(motion),
-                                       'text': text_data}
-                    new_name_list.append(name)
-                    length_list.append(len(motion))
-            except:
-                pass
+                    if flag:
+                        data_dict[name] = {'motion': motion,
+                                        'length': len(motion),
+                                        'text': text_data}
+                        new_name_list.append(name)
+                        length_list.append(len(motion))
+                except:
+                    print("error loading text")
+                
+                
 
         name_list, length_list = zip(*sorted(zip(new_name_list, length_list), key=lambda x: x[1]))
 

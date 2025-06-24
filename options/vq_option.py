@@ -54,6 +54,7 @@ def arg_parse(is_train=False):
     parser.add_argument('--save_latest', default=500, type=int, help='iter save latest model frequency')
     parser.add_argument('--save_every_e', default=2, type=int, help='save model every n epoch')
     parser.add_argument('--eval_every_e', default=1, type=int, help='save eval results every n epoch')
+    parser.add_argument('--eval_on', action="store_true", help='turn off evaluation when there is no pretrained evaluator')
     # parser.add_argument('--early_stop_e', default=5, type=int, help='early stopping epoch')
     parser.add_argument('--feat_bias', type=float, default=5, help='Layers of GRU')
 
