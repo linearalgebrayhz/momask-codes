@@ -2,12 +2,12 @@ import os
 from os.path import join as pjoin
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data.dataloader import DataLoader
 
 from models.vq.model import RVQVAE
 from models.vq.vq_trainer import RVQTokenizerTrainer
 from options.vq_option import arg_parse
-from data.t2m_dataset import MotionDataset
+from data.t2m_dataset import MotionDataset, collate_fn_camera
 from utils import paramUtil
 import numpy as np
 
@@ -16,18 +16,26 @@ from utils.get_opt import get_opt
 from motion_loaders.dataset_motion_loader import get_dataset_motion_loader
 
 from utils.motion_process import recover_from_ric
-from utils.plot_script import plot_3d_motion
+from utils.plot_script import plot_3d_motion, plot_3d_motion_camera
+from utils.camera_plot import create_camera_plot_function
 from utils.fixseed import fixseed
 
 os.environ["OMP_NUM_THREADS"] = "1"
 
 def plot_t2m(data, save_dir):
     data = train_dataset.inv_transform(data)
-    for i in range(len(data)):
-        joint_data = data[i]
-        joint = recover_from_ric(torch.from_numpy(joint_data).float(), opt.joints_num).numpy()
-        save_path = pjoin(save_dir, '%02d.mp4' % (i))
-        plot_3d_motion(save_path, kinematic_chain, joint, title="None", fps=fps, radius=radius)
+    
+    if opt.dataset_name == "cam":
+        # For camera data, use the new 3D plotting function
+        camera_plot_func = create_camera_plot_function()
+        camera_plot_func(data, save_dir)
+    else:
+        # For human motion data, use original plotting
+        for i in range(len(data)):
+            joint_data = data[i]
+            joint = recover_from_ric(torch.from_numpy(joint_data).float(), opt.joints_num).numpy()
+            save_path = pjoin(save_dir, '%02d.mp4' % (i))
+            plot_3d_motion(save_path, kinematic_chain, joint, title="None", fps=fps, radius=radius)
 
 
 if __name__ == "__main__":
@@ -66,7 +74,7 @@ if __name__ == "__main__":
         opt.text_dir = pjoin(opt.data_root, 'texts')
         opt.joints_num = 21
         radius = 240 * 8
-        fps = 12.5
+        fps = int(12.5)
         dim_pose = 251
         opt.max_motion_length = 196
         kinematic_chain = paramUtil.kit_kinematic_chain
@@ -77,7 +85,7 @@ if __name__ == "__main__":
         opt.text_dir = pjoin(opt.data_root, 'texts')
         opt.joints_num = 1
         radius = 240 * 8
-        fps = 12.5
+        fps = 30  # Unity typically records at 30 fps
         dim_pose = 5
         opt.max_motion_length = 240
         kinematic_chain = paramUtil.kit_kinematic_chain # ??
@@ -121,10 +129,17 @@ if __name__ == "__main__":
     train_dataset = MotionDataset(opt, mean, std, train_split_file)
     val_dataset = MotionDataset(opt, mean, std, val_split_file)
 
-    train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, drop_last=True, num_workers=4,
-                              shuffle=True, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, drop_last=True, num_workers=4,
-                            shuffle=True, pin_memory=True)
+    # Use camera-specific collate function for camera datasets
+    if opt.dataset_name == "cam":
+        train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, drop_last=True, num_workers=4,
+                                  shuffle=True, pin_memory=True, collate_fn=collate_fn_camera)
+        val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, drop_last=True, num_workers=4,
+                                shuffle=True, pin_memory=True, collate_fn=collate_fn_camera)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, drop_last=True, num_workers=4,
+                                  shuffle=True, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, drop_last=True, num_workers=4,
+                                shuffle=True, pin_memory=True)
     
     if opt.eval_on:
         eval_val_loader, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device)

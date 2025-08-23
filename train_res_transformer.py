@@ -11,13 +11,13 @@ from models.vq.model import RVQVAE
 
 from options.train_option import TrainT2MOptions
 
-from utils.plot_script import plot_3d_motion
+from utils.plot_script import plot_3d_motion, plot_3d_motion_camera
 from utils.motion_process import recover_from_ric
 from utils.get_opt import get_opt
 from utils.fixseed import fixseed
 from utils.paramUtil import t2m_kinematic_chain, kit_kinematic_chain
 
-from data.t2m_dataset import Text2MotionDataset
+from data.t2m_dataset import Text2MotionDataset, collate_fn_text2motion_camera_train
 from motion_loaders.dataset_motion_loader import get_dataset_motion_loader
 from models.t2m_eval_wrapper import EvaluatorModelWrapper
 
@@ -28,10 +28,16 @@ def plot_t2m(data, save_dir, captions, m_lengths):
     # print(ep_curves.shape)
     for i, (caption, joint_data) in enumerate(zip(captions, data)):
         joint_data = joint_data[:m_lengths[i]]
-        joint = recover_from_ric(torch.from_numpy(joint_data).float(), opt.joints_num).numpy()
         save_path = pjoin(save_dir, '%02d.mp4'%i)
-        # print(joint.shape)
-        plot_3d_motion(save_path, kinematic_chain, joint, title=caption, fps=fps, radius=radius)
+        
+        if opt.dataset_name == "cam":
+            # For camera trajectories, extract position data [x, y, z] from [x, y, z, pitch, yaw]
+            position_data = joint_data[:, :3]  # Extract [x, y, z]
+            plot_3d_motion_camera(save_path, position_data, title=caption, fps=fps, radius=radius)
+        else:
+            # For human motion, use the original plotting function
+            joint = recover_from_ric(torch.from_numpy(joint_data).float(), opt.joints_num).numpy()
+            plot_3d_motion(save_path, kinematic_chain, joint, title=caption, fps=fps, radius=radius)
 
 def load_vq_model():
     opt_path = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.vq_name, 'opt.txt')
@@ -48,11 +54,38 @@ def load_vq_model():
                 vq_opt.dilation_growth_rate,
                 vq_opt.vq_act,
                 vq_opt.vq_norm)
-    ckpt = torch.load(pjoin(vq_opt.checkpoints_dir, vq_opt.dataset_name, vq_opt.name, 'model', 'net_best_fid.tar'),
-                            map_location=opt.device)
-    model_key = 'vq_model' if 'vq_model' in ckpt else 'net'
-    vq_model.load_state_dict(ckpt[model_key])
-    print(f'Loading VQ Model {opt.vq_name}')
+    
+    # Choose checkpoint file based on dataset type
+    if opt.dataset_name == "cam":
+        # For camera datasets, try different checkpoint files in order of preference
+        checkpoint_files = [
+            'net_best_recon.tar',      # Best reconstruction loss
+            'net_best_position.tar',   # Best position accuracy
+            'net_best_smoothness.tar', # Best smoothness
+            'latest.tar'               # Latest checkpoint
+        ]
+        
+        checkpoint_loaded = False
+        for checkpoint_file in checkpoint_files:
+            checkpoint_path = pjoin(vq_opt.checkpoints_dir, vq_opt.dataset_name, vq_opt.name, 'model', checkpoint_file)
+            if os.path.exists(checkpoint_path):
+                ckpt = torch.load(checkpoint_path, map_location=opt.device)
+                model_key = 'vq_model' if 'vq_model' in ckpt else 'net'
+                vq_model.load_state_dict(ckpt[model_key])
+                print(f'Loading VQ Model {opt.vq_name} from {checkpoint_file}')
+                checkpoint_loaded = True
+                break
+        
+        if not checkpoint_loaded:
+            raise FileNotFoundError(f"No checkpoint found in {pjoin(vq_opt.checkpoints_dir, vq_opt.dataset_name, vq_opt.name, 'model')}")
+    else:
+        # For human motion datasets, use the original logic
+        ckpt = torch.load(pjoin(vq_opt.checkpoints_dir, vq_opt.dataset_name, vq_opt.name, 'model', 'net_best_fid.tar'),
+                                map_location=opt.device)
+        model_key = 'vq_model' if 'vq_model' in ckpt else 'net'
+        vq_model.load_state_dict(ckpt[model_key])
+        print(f'Loading VQ Model {opt.vq_name}')
+    
     vq_model.to(opt.device)
     return vq_model, vq_opt
 
@@ -62,7 +95,7 @@ if __name__ == '__main__':
     fixseed(opt.seed)
 
     opt.device = torch.device("cpu" if opt.gpu_id == -1 else "cuda:" + str(opt.gpu_id))
-    torch.autograd.set_detect_anomaly(True)
+    # torch.autograd.set_detect_anomaly(True)  # Commented out for compatibility
 
     opt.save_root = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.name)
     opt.model_dir = pjoin(opt.save_root, 'model')
@@ -91,7 +124,7 @@ if __name__ == '__main__':
         opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
         opt.joints_num = 21
         radius = 240 * 8
-        fps = 12.5
+        fps = int(12.5)
         dim_pose = 251
         opt.max_motion_len = 55
         kinematic_chain = kit_kinematic_chain
@@ -103,7 +136,7 @@ if __name__ == '__main__':
         opt.text_dir = pjoin(opt.data_root, 'texts')
         opt.joints_num = 1
         radius = 240 * 8
-        fps = 12.5
+        fps = 30  # Unity typically records at 30 fps
         dim_pose = 5
         opt.max_motion_length = 240
         kinematic_chain = kit_kinematic_chain # TODO
@@ -170,12 +203,19 @@ if __name__ == '__main__':
     train_dataset = Text2MotionDataset(opt, mean, std, train_split_file)
     val_dataset = Text2MotionDataset(opt, mean, std, val_split_file)
 
-    train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True)
+    # Use camera-specific collate function for camera datasets
+    if opt.dataset_name == "cam":
+        train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, collate_fn=collate_fn_text2motion_camera_train)
+        val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, collate_fn=collate_fn_text2motion_camera_train)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True)
 
     eval_val_loader, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device)
 
     wrapper_opt = get_opt(dataset_opt_path, torch.device('cuda'))
+    # Add eval_on attribute - set to False for camera datasets since we don't have pretrained evaluation models
+    wrapper_opt.eval_on = False if opt.dataset_name == "cam" else True
     eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
 
     trainer = ResidualTransformerTrainer(opt, res_transformer, vq_model)

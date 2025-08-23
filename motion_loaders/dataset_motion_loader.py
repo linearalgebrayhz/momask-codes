@@ -1,4 +1,4 @@
-from data.t2m_dataset import Text2MotionDatasetEval, collate_fn # TODO
+from data.t2m_dataset import Text2MotionDatasetEval, collate_fn, collate_fn_text2motion_camera, collate_fn_text2motion_camera_train # TODO
 from utils.word_vectorizer import WordVectorizer
 import numpy as np
 from os.path import join as pjoin
@@ -18,8 +18,13 @@ def get_dataset_motion_loader(opt_path, batch_size, fname, device):
         w_vectorizer = WordVectorizer('./glove', 'our_vab')
         split_file = pjoin(opt.data_root, '%s.txt'%fname)
         dataset = Text2MotionDatasetEval(opt, mean, std, split_file, w_vectorizer)
-        dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=4, drop_last=True,
-                                collate_fn=collate_fn, shuffle=True)
+        # Use camera-specific collate function for camera datasets
+        if opt.dataset_name == 'cam':
+            dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=4, drop_last=True,
+                                    collate_fn=collate_fn_text2motion_camera, shuffle=True)
+        else:
+            dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=4, drop_last=True,
+                                    collate_fn=collate_fn, shuffle=True)
     else:
         raise KeyError('Dataset not Recognized !!')
 

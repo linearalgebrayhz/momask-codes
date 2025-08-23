@@ -71,6 +71,11 @@ class EvaluatorModelWrapper(object):
             align_idx = np.argsort(m_lens.data.tolist())[::-1].copy()
             motions = motions[align_idx]
             m_lens = m_lens[align_idx]
+            
+            # Also reorder text inputs to match the sorted order
+            word_embs = word_embs[align_idx]
+            pos_ohot = pos_ohot[align_idx]
+            cap_lens = cap_lens[align_idx]
 
             '''Movement Encoding'''
             movements = self.movement_encoder(motions[..., :-4]).detach()
@@ -79,7 +84,7 @@ class EvaluatorModelWrapper(object):
 
             '''Text Encoding'''
             text_embedding = self.text_encoder(word_embs, pos_ohot, cap_lens)
-            text_embedding = text_embedding[align_idx]
+            # No need to reorder text_embedding since inputs are already sorted
         return text_embedding, motion_embedding
 
     # Please note that the results does not follow the order of inputs
@@ -167,6 +172,11 @@ class EvaluatorWrapper(object):
             align_idx = np.argsort(m_lens.data.tolist())[::-1].copy()
             motions = motions[align_idx]
             m_lens = m_lens[align_idx]
+            
+            # Also reorder text inputs to match the sorted order
+            word_embs = word_embs[align_idx]
+            pos_ohot = pos_ohot[align_idx]
+            cap_lens = cap_lens[align_idx]
 
             '''Movement Encoding'''
             movements = self.movement_encoder(motions[..., :-4]).detach()
@@ -176,7 +186,7 @@ class EvaluatorWrapper(object):
 
             '''Text Encoding'''
             text_embedding = self.text_encoder(word_embs, pos_ohot, cap_lens)
-            text_embedding = text_embedding[align_idx]
+            # No need to reorder text_embedding since inputs are already sorted
         return text_embedding, motion_embedding
 
     # Please note that the results does not following the order of inputs

@@ -57,8 +57,30 @@ def arg_parse(is_train=False):
     parser.add_argument('--eval_on', action="store_true", help='turn off evaluation when there is no pretrained evaluator')
     # parser.add_argument('--early_stop_e', default=5, type=int, help='early stopping epoch')
     parser.add_argument('--feat_bias', type=float, default=5, help='Layers of GRU')
+    
+    ## logging
+    parser.add_argument('--use_wandb', action="store_true", help='Use Weights & Biases for logging')
+    parser.add_argument('--wandb_project', type=str, default='momask-vq', help='W&B project name')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity/team name')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name (defaults to experiment name)')
+    parser.add_argument('--wandb_tags', type=str, nargs='*', default=[], help='W&B tags for the run')
+    parser.add_argument('--wandb_notes', type=str, default='', help='W&B run notes')
+    parser.add_argument('--disable_tensorboard', action="store_true", help='Disable TensorBoard logging')
+    parser.add_argument('--log_gradients', action="store_true", help='Log gradient norms and histograms')
+    parser.add_argument('--log_codebook_usage', action="store_true", help='Log codebook usage statistics')
+    parser.add_argument('--log_model_weights', action="store_true", help='Log model weight histograms periodically')
 
     parser.add_argument('--which_epoch', type=str, default="all", help='Name of this trial')
+
+    ## Visual Consistency Module
+    parser.add_argument('--use_visual_consistency', action="store_true", help='Enable visual consistency module with LPIPS loss')
+    parser.add_argument('--no_video_data', action="store_true", help='Disable visual consistency if no video data available')
+    parser.add_argument('--visual_consistency_weight', type=float, default=0.01, help='Weight for LPIPS visual consistency loss (γ)')
+    parser.add_argument('--visual_consistency_freq', type=int, default=10, help='Compute visual consistency every N steps')
+    parser.add_argument('--visual_consistency_image_size', type=int, default=256, help='Image size for rendering and LPIPS computation')
+    parser.add_argument('--lpips_net', type=str, default='alex', choices=['alex', 'vgg', 'squeeze'], help='Network backbone for LPIPS')
+    parser.add_argument('--num_keyframes', type=int, default=4, help='Number of keyframes to render for visual consistency')
+    parser.add_argument('--keyframe_strategy', type=str, default='uniform', choices=['uniform', 'motion_based'], help='Keyframe selection strategy')
 
     ## For Res Predictor only
     parser.add_argument('--vq_name', type=str, default="rvq_nq6_dc512_nc512_noshare_qdp0.2", help='Name of this trial')

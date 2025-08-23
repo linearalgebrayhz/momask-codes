@@ -28,6 +28,15 @@ class TrainT2MOptions(BaseOptions):
         self.parser.add_argument('--eval_every_e', type=int, default=10, help='Frequency of animating eval results, (epoch)')
         self.parser.add_argument('--save_latest', type=int, default=500, help='Frequency of saving checkpoint, (iteration)')
 
+        '''Visual Consistency Module'''
+        self.parser.add_argument('--use_visual_consistency', action="store_true", help='Enable visual consistency module with LPIPS loss')
+        self.parser.add_argument('--no_video_data', action="store_true", help='Disable visual consistency if no video data available')
+        self.parser.add_argument('--visual_consistency_weight', type=float, default=0.01, help='Weight for LPIPS visual consistency loss (γ)')
+        self.parser.add_argument('--visual_consistency_freq', type=int, default=10, help='Compute visual consistency every N steps')
+        self.parser.add_argument('--visual_consistency_image_size', type=int, default=256, help='Image size for rendering and LPIPS computation')
+        self.parser.add_argument('--lpips_net', type=str, default='alex', choices=['alex', 'vgg', 'squeeze'], help='Network backbone for LPIPS')
+        self.parser.add_argument('--num_keyframes', type=int, default=4, help='Number of keyframes to render for visual consistency')
+        self.parser.add_argument('--keyframe_strategy', type=str, default='uniform', choices=['uniform', 'motion_based'], help='Keyframe selection strategy')
 
         self.is_train = True
 

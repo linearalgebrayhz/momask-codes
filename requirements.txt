@@ -26,3 +26,4 @@ tornado
 tqdm
 trimesh
 vector-quantize-pytorch==1.6.30
+wandb

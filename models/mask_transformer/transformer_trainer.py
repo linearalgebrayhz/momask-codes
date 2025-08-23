@@ -11,6 +11,8 @@ from models.mask_transformer.tools import *
 
 from einops import rearrange, repeat
 
+from tqdm import tqdm
+
 def def_value():
     return 0.0
 
@@ -25,6 +27,15 @@ class MaskTransformerTrainer:
         if args.is_train:
             self.logger = SummaryWriter(args.log_dir)
 
+        # Initialize visual consistency module
+        try:
+            from utils.visual_consistency import create_visual_consistency_module
+            self.visual_consistency = create_visual_consistency_module(args)
+            print(f"Visual consistency module enabled: {self.visual_consistency.enabled}")
+        except ImportError:
+            print("Visual consistency module not available")
+            self.visual_consistency = None
+
 
     def update_lr_warm_up(self, nb_iter, warm_up_iter, lr):
 
@@ -35,7 +46,7 @@ class MaskTransformerTrainer:
         return current_lr
 
 
-    def forward(self, batch_data):
+    def forward(self, batch_data, step=None):
 
         conds, motion, m_lens = batch_data
         motion = motion.detach().float().to(self.device)
@@ -53,17 +64,52 @@ class MaskTransformerTrainer:
 
         _loss, _pred_ids, _acc = self.t2m_transformer(code_idx[..., 0], conds, m_lens)
 
-        return _loss, _acc
+        # Visual consistency loss for transformer training
+        loss_lpips = torch.tensor(0.0, device=self.device)
+        if (self.visual_consistency is not None and 
+            self.visual_consistency.enabled and 
+            step is not None and 
+            step % getattr(self.opt, 'visual_consistency_freq', 10) == 0 and
+            self.opt.dataset_name == 'cam'):
+            
+            # Generate motion from predicted tokens
+            with torch.no_grad():
+                pred_motion = self.vq_model.forward_decoder(_pred_ids.unsqueeze(-1))
+                pred_motion = pred_motion.permute(0, 2, 1)  # [B, T, D]
+            
+            batch_size = motion.shape[0]
+            total_lpips_loss = 0.0
+            num_valid_samples = 0
+            
+            for i in range(batch_size):
+                pred_traj = pred_motion[i][:m_lens[i] * 4]  # Adjust for downsampling
+                gt_traj = motion[i][:m_lens[i] * 4]
+                
+                # Compute visual consistency loss for this sample
+                try:
+                    visual_losses = self.visual_consistency.compute_visual_loss(
+                        pred_traj, gt_traj, data_id=None, step=step)
+                    total_lpips_loss += visual_losses['lpips_loss']
+                    num_valid_samples += 1
+                except Exception as e:
+                    # Handle any errors gracefully
+                    continue
+            
+            if num_valid_samples > 0:
+                loss_lpips = total_lpips_loss / num_valid_samples
+                _loss += getattr(self.opt, 'visual_consistency_weight', 0.01) * loss_lpips
 
-    def update(self, batch_data):
-        loss, acc = self.forward(batch_data)
+        return _loss, _acc, loss_lpips
+
+    def update(self, batch_data, step=None):
+        loss, acc, loss_lpips = self.forward(batch_data, step=step)
 
         self.opt_t2m_transformer.zero_grad()
         loss.backward()
         self.opt_t2m_transformer.step()
         self.scheduler.step()
 
-        return loss.item(), acc
+        return loss.item(), acc, loss_lpips.item() if isinstance(loss_lpips, torch.Tensor) else loss_lpips
 
     def save(self, file_name, ep, total_it):
         t2m_trans_state_dict = self.t2m_transformer.state_dict()
@@ -129,14 +175,18 @@ class MaskTransformerTrainer:
             self.t2m_transformer.train()
             self.vq_model.eval()
 
-            for i, batch in enumerate(train_loader):
+            for i, batch in enumerate(tqdm(train_loader, desc=f"Train Epoch {epoch+1}/{self.opt.max_epoch}")):
                 it += 1
                 if it < self.opt.warm_up_iter:
                     self.update_lr_warm_up(it, self.opt.warm_up_iter, self.opt.lr)
 
-                loss, acc = self.update(batch_data=batch)
+                loss, acc, loss_lpips = self.update(batch_data=batch)
                 logs['loss'] += loss
                 logs['acc'] += acc
+                if loss_lpips is not None:
+                    if 'lpips' not in logs:
+                        logs['lpips'] = 0.0
+                    logs['lpips'] += loss_lpips
                 logs['lr'] += self.opt_t2m_transformer.param_groups[0]['lr']
 
                 if it % self.opt.log_every == 0:
@@ -151,7 +201,6 @@ class MaskTransformerTrainer:
 
                 if it % self.opt.save_latest == 0:
                     self.save(pjoin(self.opt.model_dir, 'latest.tar'), epoch, it)
-
             self.save(pjoin(self.opt.model_dir, 'latest.tar'), epoch, it)
             epoch += 1
 
@@ -161,16 +210,23 @@ class MaskTransformerTrainer:
 
             val_loss = []
             val_acc = []
+            val_lpips = []
             with torch.no_grad():
                 for i, batch_data in enumerate(val_loader):
-                    loss, acc = self.forward(batch_data)
+                    loss, acc, loss_lpips = self.forward(batch_data)
                     val_loss.append(loss.item())
                     val_acc.append(acc)
+                    if loss_lpips is not None:
+                        val_lpips.append(loss_lpips.item() if isinstance(loss_lpips, torch.Tensor) else loss_lpips)
 
             print(f"Validation loss:{np.mean(val_loss):.3f}, accuracy:{np.mean(val_acc):.3f}")
+            if val_lpips:
+                print(f"Validation LPIPS loss:{np.mean(val_lpips):.3f}")
 
             self.logger.add_scalar('Val/loss', np.mean(val_loss), epoch)
             self.logger.add_scalar('Val/acc', np.mean(val_acc), epoch)
+            if val_lpips:
+                self.logger.add_scalar('Val/lpips', np.mean(val_lpips), epoch)
 
             if np.mean(val_acc) > best_acc:
                 print(f"Improved accuracy from {best_acc:.02f} to {np.mean(val_acc)}!!!")
@@ -298,7 +354,7 @@ class ResidualTransformerTrainer:
             self.res_transformer.train()
             self.vq_model.eval()
 
-            for i, batch in enumerate(train_loader):
+            for i, batch in enumerate(tqdm(train_loader, desc=f"Train Epoch {epoch+1}/{self.opt.max_epoch}")):
                 it += 1
                 if it < self.opt.warm_up_iter:
                     self.update_lr_warm_up(it, self.opt.warm_up_iter, self.opt.lr)
