@@ -181,9 +181,18 @@ def load_len_estimator(opt):
     
     return model
 
-def plot_camera_trajectory(data, save_path, title="Camera Trajectory"):
+def plot_camera_trajectory(data, save_path, title="Camera Trajectory", arrow_scale_factor=0.05, 
+                          min_arrow_length=0.01, max_arrow_length=0.2):
     """
-    Plot camera trajectory as a 3D path
+    Plot camera trajectory as a 3D path with dynamically scaled orientation arrows
+    
+    Args:
+        data: Camera trajectory data (seq_len, 5) - [x, y, z, pitch, yaw]
+        save_path: Path to save the plot
+        title: Title for the plot
+        arrow_scale_factor: Factor to scale arrows relative to trajectory extent (default: 0.05 = 5%)
+        min_arrow_length: Minimum arrow length to ensure visibility (default: 0.01)
+        max_arrow_length: Maximum arrow length to prevent overly long arrows (default: 0.2)
     """
     positions, orientations = recover_from_camera_data(data)
     
@@ -199,26 +208,61 @@ def plot_camera_trajectory(data, save_path, title="Camera Trajectory"):
     ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2], c='g', s=100, label='Start')
     ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], c='r', s=100, label='End')
     
+    # Calculate dynamic arrow length based on trajectory extent
+    pos_ranges = np.ptp(positions, axis=0)  # Range (max - min) for each axis
+    trajectory_extent = np.max(pos_ranges)  # Maximum extent across all axes
+    
+    # Also consider average step size for more refined scaling
+    if len(positions) > 1:
+        step_distances = np.sqrt(np.sum(np.diff(positions, axis=0)**2, axis=1))
+        avg_step_size = np.mean(step_distances)
+        # Use the larger of trajectory extent or a multiple of average step size
+        # This helps when trajectories are very dense or very sparse
+        scale_reference = max(trajectory_extent, avg_step_size * 10)
+    else:
+        scale_reference = trajectory_extent
+    
+    # Adaptive arrow length: scale based on trajectory characteristics with user-configurable parameters
+    base_arrow_length = max(arrow_scale_factor * scale_reference, min_arrow_length)
+    base_arrow_length = min(base_arrow_length, max_arrow_length)
+    
     # Plot camera orientations as arrows at key points
     step = max(1, len(positions) // 10)  # Show every 10th orientation
     for i in range(0, len(positions), step):
         pos = positions[i]
         ori = orientations[i]
         
-        # Convert pitch, yaw to direction vector
+        # Convert pitch, yaw to direction vector (normalized to unit length)
         pitch, yaw = ori[0], ori[1]
         dx = np.cos(pitch) * np.sin(yaw)
         dy = -np.sin(pitch)
         dz = np.cos(pitch) * np.cos(yaw)
         
-        # Draw arrow
-        ax.quiver(pos[0], pos[1], pos[2], dx, dy, dz, length=0.5, color='orange', alpha=0.7)
+        # Normalize direction vector to ensure unit length
+        direction_magnitude = np.sqrt(dx**2 + dy**2 + dz**2)
+        if direction_magnitude > 1e-6:  # Avoid division by zero
+            dx /= direction_magnitude
+            dy /= direction_magnitude
+            dz /= direction_magnitude
+        
+        # Draw arrow with adaptive length
+        ax.quiver(pos[0], pos[1], pos[2], dx, dy, dz, 
+                 length=1.5*base_arrow_length, color='orange', alpha=0.7, 
+                 arrow_length_ratio=0.3)  # Make arrowhead proportional
     
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
     ax.set_title(title)
     ax.legend()
+    
+    # Add text annotation showing the arrow scale for reference
+    # info_text = f'Arrow scale: {base_arrow_length:.3f}\nTrajectory extent: {trajectory_extent:.3f}'
+    # if len(positions) > 1:
+    #     info_text += f'\nAvg step size: {avg_step_size:.3f}'
+    # ax.text2D(0.02, 0.98, info_text, 
+    #           transform=ax.transAxes, fontsize=8, verticalalignment='top',
+    #           bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
     
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
