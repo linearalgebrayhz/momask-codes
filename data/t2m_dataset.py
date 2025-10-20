@@ -394,6 +394,7 @@ class Text2MotionDataset(data.Dataset):
                     flag = False
                     with cs.open(pjoin(opt.text_dir, name + '.txt')) as f:
                         for line in f.readlines():
+                            # print(line)
                             text_dict = {}
                             line_split = line.strip().split('#')
                             caption = line_split[0]

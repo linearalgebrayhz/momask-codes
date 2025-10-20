@@ -8,5 +8,5 @@ download_clip*
 dataset/
 glove/
 log/
-
 debug/
+test_logs/
