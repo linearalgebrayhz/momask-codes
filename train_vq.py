@@ -19,16 +19,74 @@ from utils.motion_process import recover_from_ric
 from utils.plot_script import plot_3d_motion, plot_3d_motion_camera
 from utils.camera_plot import create_camera_plot_function
 from utils.fixseed import fixseed
+from utils.dataset_config import get_unified_dataset_config
 
 os.environ["OMP_NUM_THREADS"] = "1"
 
 def plot_t2m(data, save_dir):
     data = train_dataset.inv_transform(data)
     
-    if opt.dataset_name == "cam":
-        # For camera data, use the new 3D plotting function
-        camera_plot_func = create_camera_plot_function()
-        camera_plot_func(data, save_dir)
+    # Check if this is a camera dataset
+    is_camera_dataset = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+    
+    if is_camera_dataset:
+        # For camera data, use GT vs Pred comparison visualizations
+        from gen_camera import plot_camera_trajectory_animation, plot_camera_trajectory
+        from utils.camera_plot import plot_camera_trajectory_3d
+        import os
+        
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Data is structured as: [GT_0, GT_1, GT_2, GT_3, Pred_0, Pred_1, Pred_2, Pred_3]
+        # Split into GT and Pred
+        num_samples = len(data) // 2
+        gt_data = data[:num_samples]
+        pred_data = data[num_samples:]
+        
+        for i in range(num_samples):
+            gt_trajectory = gt_data[i]
+            pred_trajectory = pred_data[i]
+            
+            # 1. Generate comprehensive GT vs Pred comparison plot
+            # This includes: 3D trajectory, top-down view, position error, orientation comparison
+            comparison_path = pjoin(save_dir, f'camera_viz_sample_{i:02d}_comparison.png')
+            try:
+                plot_camera_trajectory_3d(
+                    gt_data=gt_trajectory[None, ...],  # Add batch dimension
+                    pred_data=pred_trajectory[None, ...],  # Add batch dimension
+                    save_path=comparison_path,
+                    title=f"RVQ Training Sample {i:02d} - GT vs Pred Comparison",
+                    seq_idx=0
+                )
+                print(f"Camera comparison plot saved: {comparison_path}")
+            except Exception as e:
+                print(f"Error creating comparison plot {i}: {e}")
+            
+            # 2. Generate MP4 animations for both GT and Pred
+            gt_video_path = pjoin(save_dir, f'camera_viz_sample_{i:02d}_gt.mp4')
+            pred_video_path = pjoin(save_dir, f'camera_viz_sample_{i:02d}_pred.mp4')
+            try:
+                plot_camera_trajectory_animation(
+                    data=gt_trajectory,
+                    save_path=gt_video_path,
+                    title=f"Sample {i:02d} - Ground Truth",
+                    fps=30,
+                    show_trail=True,
+                    trail_length=30,
+                    figsize=(10, 8)
+                )
+                plot_camera_trajectory_animation(
+                    data=pred_trajectory,
+                    save_path=pred_video_path,
+                    title=f"Sample {i:02d} - Predicted",
+                    fps=30,
+                    show_trail=True,
+                    trail_length=30,
+                    figsize=(10, 8)
+                )
+                print(f"Camera videos saved: {gt_video_path}, {pred_video_path}")
+            except Exception as e:
+                print(f"Error creating camera videos {i}: {e}")
     else:
         # For human motion data, use original plotting
         for i in range(len(data)):
@@ -39,10 +97,11 @@ def plot_t2m(data, save_dir):
 
 
 if __name__ == "__main__":
-    # torch.autograd.set_detect_anomaly(True)
+    # torch.autograd.set_detect_anomaly(True)  # Disabled for performance with replicated samples
     opt = arg_parse(True)
     fixseed(opt.seed)
-
+    # print(f"opt: {opt}")
+    # exit()
     opt.device = torch.device("cpu" if opt.gpu_id == -1 else "cuda:" + str(opt.gpu_id))
     print(f"Using Device: {opt.device}")
 
@@ -57,41 +116,26 @@ if __name__ == "__main__":
     os.makedirs(opt.eval_dir, exist_ok=True)
     os.makedirs(opt.log_dir, exist_ok=True)
 
-    if opt.dataset_name == "t2m":
-        opt.data_root = './dataset/HumanML3D/'
-        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-        opt.text_dir = pjoin(opt.data_root, 'texts')
-        opt.joints_num = 22
-        dim_pose = 263
-        fps = 20
-        radius = 4
-        kinematic_chain = paramUtil.t2m_kinematic_chain
-        dataset_opt_path = './checkpoints/t2m/Comp_v6_KLD005/opt.txt'
-
-    elif opt.dataset_name == "kit":
-        opt.data_root = './dataset/KIT-ML/'
-        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-        opt.text_dir = pjoin(opt.data_root, 'texts')
-        opt.joints_num = 21
-        radius = 240 * 8
-        fps = int(12.5)
-        dim_pose = 251
-        opt.max_motion_length = 196
-        kinematic_chain = paramUtil.kit_kinematic_chain
-        dataset_opt_path = './checkpoints/kit/Comp_v6_KLD005/opt.txt' # is this generated or hardcoded?
-    elif opt.dataset_name == "cam":
-        opt.data_root = './dataset/CameraTraj/'
-        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-        opt.text_dir = pjoin(opt.data_root, 'texts')
-        opt.joints_num = 1
-        radius = 240 * 8
-        fps = 30  # Unity typically records at 30 fps
-        dim_pose = 5
-        opt.max_motion_length = 240
-        kinematic_chain = paramUtil.kit_kinematic_chain # ??
-        dataset_opt_path = './checkpoints/cam/Comp_v6_KLD005/opt.txt'
-    else:
-        raise KeyError('Dataset Does not Exists')
+    # Get unified dataset configuration with automatic format detection
+    dataset_config = get_unified_dataset_config(opt)
+    
+    # Extract configuration values
+    dim_pose = dataset_config['dim_pose']
+    fps = dataset_config['fps']
+    radius = dataset_config['radius']
+    kinematic_chain = dataset_config['kinematic_chain']
+    dataset_opt_path = dataset_config['dataset_opt_path']
+    
+    print(f"Dataset: {opt.dataset_name}")
+    print(f"Data root: {opt.data_root}")
+    print(f"Detected format: {dataset_config.get('detected_format', 'N/A')}")
+    print(f"Feature dimensions: {dim_pose}")
+    
+    # Validate that dataset exists
+    if not os.path.exists(opt.data_root):
+        raise FileNotFoundError(f"Dataset directory does not exist: {opt.data_root}")
+    if not os.path.exists(opt.motion_dir):
+        raise FileNotFoundError(f"Motion directory does not exist: {opt.motion_dir}")
 
     wrapper_opt = get_opt(dataset_opt_path, torch.device('cuda'))
     wrapper_opt.eval_on = opt.eval_on
@@ -130,7 +174,9 @@ if __name__ == "__main__":
     val_dataset = MotionDataset(opt, mean, std, val_split_file)
 
     # Use camera-specific collate function for camera datasets
-    if opt.dataset_name == "cam":
+    is_camera_dataset = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+    
+    if is_camera_dataset:
         train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, drop_last=True, num_workers=4,
                                   shuffle=True, pin_memory=True, collate_fn=collate_fn_camera)
         val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, drop_last=True, num_workers=4,

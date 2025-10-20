@@ -12,10 +12,12 @@ from models.vq.model import RVQVAE
 from options.train_option import TrainT2MOptions
 
 from utils.plot_script import plot_3d_motion, plot_3d_motion_camera
+from utils.unified_plotting import create_plotting_function_for_transformer
 from utils.motion_process import recover_from_ric
 from utils.get_opt import get_opt
 from utils.fixseed import fixseed
 from utils.paramUtil import t2m_kinematic_chain, kit_kinematic_chain
+from utils.dataset_config import get_unified_dataset_config
 
 from data.t2m_dataset import Text2MotionDataset, collate_fn_text2motion_camera_train
 from motion_loaders.dataset_motion_loader import get_dataset_motion_loader
@@ -24,20 +26,18 @@ from models.t2m_eval_wrapper import EvaluatorModelWrapper
 
 def plot_t2m(data, save_dir, captions, m_lengths):
     data = train_dataset.inv_transform(data)
-
-    # print(ep_curves.shape)
-    for i, (caption, joint_data) in enumerate(zip(captions, data)):
-        joint_data = joint_data[:m_lengths[i]]
-        save_path = pjoin(save_dir, '%02d.mp4'%i)
-        
-        if opt.dataset_name == "cam":
-            # For camera trajectories, extract position data [x, y, z] from [x, y, z, pitch, yaw]
-            position_data = joint_data[:, :3]  # Extract [x, y, z]
-            plot_3d_motion_camera(save_path, position_data, title=caption, fps=fps, radius=radius)
-        else:
-            # For human motion, use the original plotting function
-            joint = recover_from_ric(torch.from_numpy(joint_data).float(), opt.joints_num).numpy()
-            plot_3d_motion(save_path, kinematic_chain, joint, title=caption, fps=fps, radius=radius)
+    
+    # Create unified plotting function that handles different camera formats automatically
+    plot_function = create_plotting_function_for_transformer(opt.dataset_name)
+    
+    # Call the unified plotting function with all necessary parameters
+    plot_function(
+        data, save_dir, captions, m_lengths,
+        fps=fps, 
+        radius=radius, 
+        joints_num=opt.joints_num,
+        kinematic_chain=kinematic_chain
+    )
 
 def load_vq_model():
     opt_path = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.vq_name, 'opt.txt')
@@ -56,7 +56,8 @@ def load_vq_model():
                 vq_opt.vq_norm)
     
     # Choose checkpoint file based on dataset type
-    if opt.dataset_name == "cam":
+    is_camera_dataset = any(name in vq_opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+    if is_camera_dataset:
         # For camera datasets, try different checkpoint files in order of preference
         checkpoint_files = [
             'net_best_recon.tar',      # Best reconstruction loss
@@ -108,42 +109,30 @@ if __name__ == '__main__':
     os.makedirs(opt.eval_dir, exist_ok=True)
     os.makedirs(opt.log_dir, exist_ok=True)
 
-    if opt.dataset_name == 't2m':
-        opt.data_root = './dataset/HumanML3D'
-        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-        opt.joints_num = 22
+    # Get unified dataset configuration with automatic format detection
+    dataset_config = get_unified_dataset_config(opt)
+    
+    # Extract configuration values
+    dim_pose = dataset_config['dim_pose']
+    fps = dataset_config['fps']
+    radius = dataset_config['radius']
+    kinematic_chain = dataset_config['kinematic_chain']
+    dataset_opt_path = dataset_config['dataset_opt_path']
+    
+    print(f"Dataset: {opt.dataset_name}")
+    print(f"Data root: {opt.data_root}")
+    print(f"Detected format: {dataset_config.get('detected_format', 'N/A')}")
+    print(f"Feature dimensions: {dim_pose}")
+    
+    # Validate that dataset exists
+    if not os.path.exists(opt.data_root):
+        raise FileNotFoundError(f"Dataset directory does not exist: {opt.data_root}")
+    if not os.path.exists(opt.motion_dir):
+        raise FileNotFoundError(f"Motion directory does not exist: {opt.motion_dir}")
+    
+    # Set motion length for human motion datasets
+    if opt.dataset_name in ['t2m', 'kit']:
         opt.max_motion_len = 55
-        dim_pose = 263
-        radius = 4
-        fps = 20
-        kinematic_chain = t2m_kinematic_chain
-        dataset_opt_path = './checkpoints/t2m/Comp_v6_KLD005/opt.txt'
-
-    elif opt.dataset_name == 'kit': #TODO
-        opt.data_root = './dataset/KIT-ML'
-        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-        opt.joints_num = 21
-        radius = 240 * 8
-        fps = int(12.5)
-        dim_pose = 251
-        opt.max_motion_len = 55
-        kinematic_chain = kit_kinematic_chain
-        dataset_opt_path = './checkpoints/kit/Comp_v6_KLD005/opt.txt'
-
-    elif opt.dataset_name == "cam":
-        opt.data_root = './dataset/CameraTraj/'
-        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-        opt.text_dir = pjoin(opt.data_root, 'texts')
-        opt.joints_num = 1
-        radius = 240 * 8
-        fps = 30  # Unity typically records at 30 fps
-        dim_pose = 5
-        opt.max_motion_length = 240
-        kinematic_chain = kit_kinematic_chain # TODO
-        dataset_opt_path = './checkpoints/cam/Comp_v6_KLD005/opt.txt'
-
-    else:
-        raise KeyError('Dataset Does Not Exist')
 
     opt.text_dir = pjoin(opt.data_root, 'texts')
 
@@ -204,7 +193,9 @@ if __name__ == '__main__':
     val_dataset = Text2MotionDataset(opt, mean, std, val_split_file)
 
     # Use camera-specific collate function for camera datasets
-    if opt.dataset_name == "cam":
+    is_camera_dataset = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+    
+    if is_camera_dataset:
         train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, collate_fn=collate_fn_text2motion_camera_train)
         val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, collate_fn=collate_fn_text2motion_camera_train)
     else:
@@ -215,7 +206,8 @@ if __name__ == '__main__':
 
     wrapper_opt = get_opt(dataset_opt_path, torch.device('cuda'))
     # Add eval_on attribute - set to False for camera datasets since we don't have pretrained evaluation models
-    wrapper_opt.eval_on = False if opt.dataset_name == "cam" else True
+    is_camera_dataset = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+    wrapper_opt.eval_on = False if is_camera_dataset else True
     eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
 
     trainer = ResidualTransformerTrainer(opt, res_transformer, vq_model)

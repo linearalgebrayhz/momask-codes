@@ -66,11 +66,12 @@ class MaskTransformerTrainer:
 
         # Visual consistency loss for transformer training
         loss_lpips = torch.tensor(0.0, device=self.device)
+        is_camera_dataset = any(name in self.opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
         if (self.visual_consistency is not None and 
             self.visual_consistency.enabled and 
             step is not None and 
             step % getattr(self.opt, 'visual_consistency_freq', 10) == 0 and
-            self.opt.dataset_name == 'cam'):
+            is_camera_dataset):
             
             # Generate motion from predicted tokens
             with torch.no_grad():
@@ -139,6 +140,12 @@ class MaskTransformerTrainer:
             print('Resume wo optimizer')
         return checkpoint['ep'], checkpoint['total_it']
 
+
+    # dataset
+    # train: 13963
+    # val:2992
+    # test: 2993
+    # total = 19948
     def train(self, train_loader, val_loader, eval_val_loader, eval_wrapper, plot_eval):
         self.t2m_transformer.to(self.device)
         self.vq_model.to(self.device)
@@ -179,7 +186,7 @@ class MaskTransformerTrainer:
                 it += 1
                 if it < self.opt.warm_up_iter:
                     self.update_lr_warm_up(it, self.opt.warm_up_iter, self.opt.lr)
-
+                # where does clip encoding happen?
                 loss, acc, loss_lpips = self.update(batch_data=batch)
                 logs['loss'] += loss
                 logs['acc'] += acc

@@ -93,22 +93,40 @@ def calculate_activation_statistics(activations):
 
 def calculate_diversity(activation, diversity_times):
     assert len(activation.shape) == 2
-    assert activation.shape[0] > diversity_times
     num_samples = activation.shape[0]
-
-    first_indices = np.random.choice(num_samples, diversity_times, replace=False)
-    second_indices = np.random.choice(num_samples, diversity_times, replace=False)
+    
+    # Handle case where we have fewer samples than diversity_times (debugging scenarios)
+    if num_samples <= diversity_times:
+        print(f"Warning: Only {num_samples} samples available, but {diversity_times} requested for diversity calculation. Using all available samples.")
+        if num_samples <= 1:
+            return 0.0  # No diversity with 0 or 1 sample
+        # Use all available samples with replacement if necessary
+        first_indices = np.random.choice(num_samples, num_samples, replace=True)
+        second_indices = np.random.choice(num_samples, num_samples, replace=True)
+    else:
+        first_indices = np.random.choice(num_samples, diversity_times, replace=False)
+        second_indices = np.random.choice(num_samples, diversity_times, replace=False)
+    
     dist = linalg.norm(activation[first_indices] - activation[second_indices], axis=1)
     return dist.mean()
 
 
 def calculate_multimodality(activation, multimodality_times):
     assert len(activation.shape) == 3
-    assert activation.shape[1] > multimodality_times
     num_per_sent = activation.shape[1]
-
-    first_dices = np.random.choice(num_per_sent, multimodality_times, replace=False)
-    second_dices = np.random.choice(num_per_sent, multimodality_times, replace=False)
+    
+    # Handle case where we have fewer samples than multimodality_times (debugging scenarios)
+    if num_per_sent <= multimodality_times:
+        print(f"Warning: Only {num_per_sent} samples per sentence available, but {multimodality_times} requested for multimodality calculation. Using all available samples.")
+        if num_per_sent <= 1:
+            return 0.0  # No multimodality with 0 or 1 sample per sentence
+        # Use all available samples with replacement if necessary
+        first_dices = np.random.choice(num_per_sent, num_per_sent, replace=True)
+        second_dices = np.random.choice(num_per_sent, num_per_sent, replace=True)
+    else:
+        first_dices = np.random.choice(num_per_sent, multimodality_times, replace=False)
+        second_dices = np.random.choice(num_per_sent, multimodality_times, replace=False)
+    
     dist = linalg.norm(activation[:, first_dices] - activation[:, second_dices], axis=2)
     return dist.mean()
 

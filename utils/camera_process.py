@@ -2,6 +2,11 @@ import numpy as np
 import torch
 from os.path import join as pjoin
 import math
+from .camera_format_handler import (
+    recover_from_camera_data_universal, 
+    detect_camera_format, 
+    CameraFormat
+)
 
 def process_camera_file(positions, orientations):
     """
@@ -46,6 +51,7 @@ def process_camera_file(positions, orientations):
 def recover_from_camera_data(data):
     """
     Recover camera positions and orientations from processed data
+    Supports legacy 5-feature format for backward compatibility
     
     Args:
         data: (seq_len, 5) - processed camera data [x, y, z, pitch, yaw]
@@ -55,30 +61,48 @@ def recover_from_camera_data(data):
         orientations: (seq_len, 2) - camera orientations
     """
     positions = data[..., :3]  # x, y, z
-    orientations = data[..., 3:]  # pitch, yaw
+    orientations = data[..., 3:5]  # pitch, yaw (only first 2 for legacy compatibility)
     
     return positions, orientations
 
 def calculate_camera_metrics(pred_data, gt_data):
     """
     Calculate camera-specific evaluation metrics
+    Supports all camera formats: 5, 6, and 12 features
     
     Args:
-        pred_data: (batch, seq_len, 5) - predicted camera data
-        gt_data: (batch, seq_len, 5) - ground truth camera data
+        pred_data: (batch, seq_len, features) - predicted camera data
+        gt_data: (batch, seq_len, features) - ground truth camera data
     
     Returns:
         metrics: dict with various camera metrics
     """
-    pred_pos, pred_ori = recover_from_camera_data(pred_data)
-    gt_pos, gt_ori = recover_from_camera_data(gt_data)
+    # Detect formats
+    pred_format = detect_camera_format(pred_data)
+    gt_format = detect_camera_format(gt_data)
+    
+    if pred_format != gt_format:
+        print(f"Warning: Pred format ({pred_format.value}) != GT format ({gt_format.value})")
+    
+    # Use universal recovery function
+    pred_pos, pred_ori, pred_vel, pred_ang_vel = recover_from_camera_data_universal(pred_data)
+    gt_pos, gt_ori, gt_vel, gt_ang_vel = recover_from_camera_data_universal(gt_data)
     
     # Handle batch dimension - take the first (and should be only) batch
     if pred_pos.ndim == 3:  # (batch, seq_len, 3)
         pred_pos = pred_pos[0]  # (seq_len, 3)
-        pred_ori = pred_ori[0]  # (seq_len, 2)
+        pred_ori = pred_ori[0]  # (seq_len, 2 or 3)
         gt_pos = gt_pos[0]      # (seq_len, 3)
-        gt_ori = gt_ori[0]      # (seq_len, 2)
+        gt_ori = gt_ori[0]      # (seq_len, 2 or 3)
+        
+        if pred_vel is not None:
+            pred_vel = pred_vel[0]  # (seq_len, 3)
+        if gt_vel is not None:
+            gt_vel = gt_vel[0]      # (seq_len, 3)
+        if pred_ang_vel is not None:
+            pred_ang_vel = pred_ang_vel[0]  # (seq_len, 3)
+        if gt_ang_vel is not None:
+            gt_ang_vel = gt_ang_vel[0]      # (seq_len, 3)
     
     # Position error (Euclidean distance)
     pos_error = np.sqrt(np.sum((pred_pos - gt_pos) ** 2, axis=-1))
@@ -104,13 +128,38 @@ def calculate_camera_metrics(pred_data, gt_data):
     gt_velocity = np.diff(gt_pos, axis=0)
     velocity_error = np.mean(np.sqrt(np.sum((pred_velocity - gt_velocity) ** 2, axis=-1)))
     
-    return {
+    metrics = {
         'mean_position_error': mean_pos_error,
         'mean_orientation_error': mean_angle_error,
         'pred_smoothness': pred_smoothness,
         'gt_smoothness': gt_smoothness,
-        'velocity_error': velocity_error
+        'velocity_error': velocity_error,
+        'format': gt_format.value
     }
+    
+    # Add velocity metrics for 12-feature format
+    if gt_vel is not None and pred_vel is not None:
+        vel_error = np.sqrt(np.sum((pred_vel - gt_vel) ** 2, axis=-1))
+        mean_vel_error = np.mean(vel_error)
+        std_vel_error = np.std(vel_error)
+        
+        metrics.update({
+            'direct_velocity_error': mean_vel_error,
+            'direct_velocity_error_std': std_vel_error
+        })
+    
+    # Add angular velocity metrics for 12-feature format
+    if gt_ang_vel is not None and pred_ang_vel is not None:
+        ang_vel_error = np.sqrt(np.sum((pred_ang_vel - gt_ang_vel) ** 2, axis=-1))
+        mean_ang_vel_error = np.mean(ang_vel_error)
+        std_ang_vel_error = np.std(ang_vel_error)
+        
+        metrics.update({
+            'angular_velocity_error': mean_ang_vel_error,
+            'angular_velocity_error_std': std_ang_vel_error
+        })
+    
+    return metrics
 
 def orientation_to_vector(orientations):
     """

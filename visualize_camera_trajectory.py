@@ -26,10 +26,24 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 class CameraTrajectoryVisualizer:
-    def __init__(self, dataset_path="./dataset/CameraTraj"):
+    def __init__(self, dataset_path="./dataset/CameraTraj", realestate10k=False):
         self.dataset_path = Path(dataset_path)
-        self.motion_dir = self.dataset_path / "new_joint_vecs"
-        self.text_dir = self.dataset_path / "texts"
+        self.realestate10k = realestate10k
+        
+        if realestate10k:
+            # RealEstate10K dataset structure
+            # Check if dataset_path already points to train_frames_recon* directory
+            if self.dataset_path.name.startswith('train_frames_recon'):
+                self.motion_dir = self.dataset_path
+                self.text_dir = self.dataset_path.parent / "train_video_captions"
+            else:
+                self.motion_dir = self.dataset_path / "train_frames_recon"
+                self.text_dir = self.dataset_path / "train_video_captions"
+        else:
+            # Original dataset structure
+            self.motion_dir = self.dataset_path / "new_joint_vecs"
+            self.text_dir = self.dataset_path / "texts"
+        
         # self.validated_dir = self.dataset_path / "validated"
         # self.validated_dir.mkdir(exist_ok=True)
         
@@ -59,32 +73,116 @@ class CameraTrajectoryVisualizer:
     
     def load_motion_data(self, data_id):
         """Load motion data for given ID"""
-        motion_file = self.motion_dir / f"{data_id}.npy"
-        if not motion_file.exists():
-            raise FileNotFoundError(f"Motion file not found: {motion_file}")
+        if self.realestate10k:
+            # RealEstate10K format: data_id/camera_trajectory_advanced.txt
+            motion_file = self.motion_dir / data_id / "camera_trajectory_advanced.txt"
+            if not motion_file.exists():
+                raise FileNotFoundError(f"Motion file not found: {motion_file}")
+            
+            # Load text file with 12 columns: x y z dx dy dz pitch yaw roll dpitch dyaw droll
+            motion_data = []
+            with open(motion_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        values = [float(x) for x in line.split()]
+                        if len(values) >= 9:  # Need at least x,y,z,dx,dy,dz,pitch,yaw,roll
+                            # Extract x,y,z,pitch,yaw,roll (indices 0,1,2,6,7,8)
+                            motion_data.append([values[0], values[1], values[2], values[6], values[7], values[8]])
+            
+            motion = np.array(motion_data)
+            print(f"Loaded RealEstate10K motion {data_id}: shape {motion.shape}")
+            if len(motion) > 0:
+                pos_range = [motion[:, i].max() - motion[:, i].min() for i in range(3)]
+                print(f"Position ranges: X={pos_range[0]:.6f}, Y={pos_range[1]:.6f}, Z={pos_range[2]:.6f}")
+                print(f"Position sample: {motion[0, :3]}")
+        else:
+            # Original format: data_id.npy
+            motion_file = self.motion_dir / f"{data_id}.npy"
+            if not motion_file.exists():
+                raise FileNotFoundError(f"Motion file not found: {motion_file}")
+            
+            motion = np.load(motion_file)
+            print(f"Loaded motion {data_id}: shape {motion.shape}")
         
-        motion = np.load(motion_file)
-        print(f"Loaded motion {data_id}: shape {motion.shape}")
         return motion
     
     def load_text_data(self, data_id):
         """Load text descriptions for given ID"""
-        text_file = self.text_dir / f"{data_id}.txt"
-        if not text_file.exists():
-            raise FileNotFoundError(f"Text file not found: {text_file}")
-        
         text_lines = []
-        with open(text_file, 'r') as f:
-            for i, line in enumerate(f.readlines()):
-                line = line.strip()
-                if line:
-                    # Extract caption (before #)
-                    caption = line.split('#')[0].strip()
-                    text_lines.append({
-                        'line_num': i,
-                        'caption': caption,
-                        'full_line': line
-                    })
+        
+        if self.realestate10k:
+            # RealEstate10K format: data_id/video_captions.json and separate text files
+            caption_dir = self.text_dir / data_id
+            
+            # Try to load from video_captions.json first (prioritize technical captions only)
+            json_file = caption_dir / "video_captions.json"
+            if json_file.exists():
+                with open(json_file, 'r') as f:
+                    data = json.load(f)
+                    captions = data.get('captions', {})
+                    
+                    # Only add technical caption to avoid overlap
+                    if 'technical' in captions and captions['technical'].get('success'):
+                        text_lines.append({
+                            'line_num': 0,
+                            'caption': captions['technical']['caption'],
+                            'full_line': f"technical: {captions['technical']['caption']}"
+                        })
+                    # Fallback to camera trajectory caption if no technical caption
+                    elif 'camera_trajectory' in captions and captions['camera_trajectory'].get('success'):
+                        text_lines.append({
+                            'line_num': 0,
+                            'caption': captions['camera_trajectory']['caption'],
+                            'full_line': f"camera_trajectory: {captions['camera_trajectory']['caption']}"
+                        })
+            
+            # If no JSON caption found, try individual text files (prioritize technical)
+            if not text_lines:
+                technical_file = caption_dir / "caption_technical.txt"
+                if technical_file.exists():
+                    with open(technical_file, 'r') as f:
+                        content = f.read().strip()
+                        if content:
+                            text_lines.append({
+                                'line_num': 0,
+                                'caption': content,
+                                'full_line': f"technical_file: {content}"
+                            })
+                
+                # Fallback to trajectory file if no technical file
+                if not text_lines:
+                    trajectory_file = caption_dir / "caption_camera_trajectory.txt"
+                    if trajectory_file.exists():
+                        with open(trajectory_file, 'r') as f:
+                            content = f.read().strip()
+                            if content:
+                                text_lines.append({
+                                    'line_num': 0,
+                                    'caption': content,
+                                    'full_line': f"trajectory_file: {content}"
+                                })
+            
+            if not text_lines:
+                raise FileNotFoundError(f"No text data found in {caption_dir}")
+                
+        else:
+            # Original format: data_id.txt
+            text_file = self.text_dir / f"{data_id}.txt"
+            if not text_file.exists():
+                raise FileNotFoundError(f"Text file not found: {text_file}")
+            
+            with open(text_file, 'r') as f:
+                for i, line in enumerate(f.readlines()):
+                    line = line.strip()
+                    if line:
+                        # Extract caption (before #)
+                        caption = line.split('#')[0].strip()
+                        text_lines.append({
+                            'line_num': i,
+                            'caption': caption,
+                            'full_line': line
+                        })
         
         print(f"Loaded {len(text_lines)} text descriptions for {data_id}")
         return text_lines
@@ -92,7 +190,7 @@ class CameraTrajectoryVisualizer:
     def analyze_motion(self, motion):
         """Analyze motion characteristics"""
         positions = motion[:, :3]  # x, y, z
-        orientations = motion[:, 3:]  # pitch, yaw
+        orientations = motion[:, 3:]  # pitch, yaw, (roll if available)
         
         # Position analysis
         pos_range = {
@@ -107,7 +205,7 @@ class CameraTrajectoryVisualizer:
             'z': positions[:, 2].max() - positions[:, 2].min()
         }
         
-        # Orientation analysis
+        # Orientation analysis (handle both 2D and 3D orientations)
         ori_range = {
             'pitch': (orientations[:, 0].min(), orientations[:, 0].max()),
             'yaw': (orientations[:, 1].min(), orientations[:, 1].max())
@@ -117,6 +215,11 @@ class CameraTrajectoryVisualizer:
             'pitch': orientations[:, 0].max() - orientations[:, 0].min(),
             'yaw': orientations[:, 1].max() - orientations[:, 1].min()
         }
+        
+        # Add roll if available (RealEstate10K format)
+        if orientations.shape[1] >= 3:
+            ori_range['roll'] = (orientations[:, 2].min(), orientations[:, 2].max())
+            ori_movement['roll'] = orientations[:, 2].max() - orientations[:, 2].min()
         
         # Motion characteristics
         total_distance = np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1))
@@ -147,15 +250,22 @@ class CameraTrajectoryVisualizer:
         positions = motion[:, :3]
         orientations = motion[:, 3:]
         
-        # Plot trajectory path
-        ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], 
-                'b-', linewidth=2, label='Camera Path', alpha=0.8)
+        # Calculate range for scaling decisions
+        data_range = np.array([positions[:, 0].max() - positions[:, 0].min(),
+                              positions[:, 1].max() - positions[:, 1].min(),
+                              positions[:, 2].max() - positions[:, 2].min()]).max()
         
-        # Mark start and end points
+        # Plot trajectory path
+        linewidth = 3 if data_range < 1e-3 else 2
+        ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], 
+                'b-', linewidth=linewidth, label='Camera Path', alpha=0.8)
+        
+        # Mark start and end points (larger for small-scale data)
+        point_size = 150 if data_range < 1e-3 else 100
         ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2], 
-                  c='green', s=100, label='Start', marker='o')
+                  c='green', s=point_size, label='Start', marker='o', edgecolors='black', linewidth=1)
         ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], 
-                  c='red', s=100, label='End', marker='s')
+                  c='red', s=point_size, label='End', marker='s', edgecolors='black', linewidth=1)
         
         # Add orientation arrows at key points
         step = max(1, len(positions) // 15)  # Show ~15 arrows
@@ -168,12 +278,15 @@ class CameraTrajectoryVisualizer:
             dy = -np.sin(pitch)
             dz = np.cos(pitch) * np.cos(yaw)
             
-            # Scale arrow based on movement amount
-            arrow_scale = 0.05
+            # Scale arrow based on movement amount and data scale
+            arrow_scale = data_range * 0.3  # Scale arrows relative to data range
+            if arrow_scale < 1e-5:
+                arrow_scale = 1e-4  # Minimum arrow size
             arrow_norm = np.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
-            ax.quiver(pos[0], pos[1], pos[2],
-                     dx / arrow_norm * arrow_scale, dy / arrow_norm * arrow_scale, dz / arrow_norm * arrow_scale,
-                     color='orange', alpha=0.7, arrow_length_ratio=0.3)
+            if arrow_norm > 0:
+                ax.quiver(pos[0], pos[1], pos[2],
+                         dx / arrow_norm * arrow_scale, dy / arrow_norm * arrow_scale, dz / arrow_norm * arrow_scale,
+                         color='orange', alpha=0.7, arrow_length_ratio=0.3)
         
         # Set labels and title
         ax.set_xlabel('X Position')
@@ -182,10 +295,16 @@ class CameraTrajectoryVisualizer:
         ax.set_title(title + str(data_id))
         ax.legend()
         
-        # Equal aspect ratio
+        # Equal aspect ratio with better handling for small scales
         max_range = np.array([positions[:, 0].max() - positions[:, 0].min(),
                              positions[:, 1].max() - positions[:, 1].min(),
                              positions[:, 2].max() - positions[:, 2].min()]).max() / 2.0
+        
+        # Ensure minimum range for visualization (handle very small movements)
+        min_range = 1e-4  # Minimum range for visibility
+        if max_range < min_range:
+            max_range = min_range
+        
         mid_x = (positions[:, 0].max() + positions[:, 0].min()) * 0.5
         mid_y = (positions[:, 1].max() + positions[:, 1].min()) * 0.5
         mid_z = (positions[:, 2].max() + positions[:, 2].min()) * 0.5
@@ -193,6 +312,10 @@ class CameraTrajectoryVisualizer:
         ax.set_xlim(mid_x - max_range, mid_x + max_range)
         ax.set_ylim(mid_y - max_range, mid_y + max_range)
         ax.set_zlim(mid_z - max_range, mid_z + max_range)
+        
+        # Add grid and better formatting for small scales
+        ax.grid(True, alpha=0.3)
+        ax.ticklabel_format(style='scientific', scilimits=(-3, 3))
         
         # Add text descriptions in right subplot if provided
         if text_lines:
@@ -345,14 +468,24 @@ class CameraTrajectoryVisualizer:
     
     def load_random_data(self):
         """Load a random data sample"""
-        # Get all available motion files
-        motion_files = list(self.motion_dir.glob("*.npy"))
-        if motion_files:
-            random_file = np.random.choice(motion_files)
-            data_id = random_file.stem
-            self.id_entry.delete(0, tk.END)
-            self.id_entry.insert(0, data_id)
-            self.load_and_display_data(data_id)
+        if self.realestate10k:
+            # Get all available directories (each contains motion data)
+            motion_dirs = [d for d in self.motion_dir.iterdir() if d.is_dir() and not d.name.endswith('.json')]
+            if motion_dirs:
+                random_dir = np.random.choice(motion_dirs)
+                data_id = random_dir.name
+                self.id_entry.delete(0, tk.END)
+                self.id_entry.insert(0, data_id)
+                self.load_and_display_data(data_id)
+        else:
+            # Get all available motion files
+            motion_files = list(self.motion_dir.glob("*.npy"))
+            if motion_files:
+                random_file = np.random.choice(motion_files)
+                data_id = random_file.stem
+                self.id_entry.delete(0, tk.END)
+                self.id_entry.insert(0, data_id)
+                self.load_and_display_data(data_id)
     
     def load_and_display_data(self, data_id):
         """Load and display motion and text data"""
@@ -394,10 +527,13 @@ Position Movement:
 
 Orientation Movement:
   Pitch: {analysis['orientation_movement']['pitch']:.3f} rad
-  Yaw: {analysis['orientation_movement']['yaw']:.3f} rad
-
-Status: {'STATIC' if analysis['is_static'] else 'MOVING'}
-"""
+  Yaw: {analysis['orientation_movement']['yaw']:.3f} rad"""
+        
+        # Add roll if available (RealEstate10K format)
+        if 'roll' in analysis['orientation_movement']:
+            text += f"\n  Roll: {analysis['orientation_movement']['roll']:.3f} rad"
+        
+        text += f"\n\nStatus: {'STATIC' if analysis['is_static'] else 'MOVING'}\n"
         self.analysis_text.insert(1.0, text)
     
     def update_text_display(self):
@@ -458,8 +594,19 @@ Status: {'STATIC' if analysis['is_static'] else 'MOVING'}
         ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], 
                   c='red', s=100, label='End')
         
+        # Calculate max_range for arrow scaling
+        max_range = np.array([positions[:, 0].max() - positions[:, 0].min(),
+                             positions[:, 1].max() - positions[:, 1].min(),
+                             positions[:, 2].max() - positions[:, 2].min()]).max() / 2.0
+        min_range = 1e-4
+        if max_range < min_range:
+            max_range = min_range
+        
         # Orientation arrows
         step = max(1, len(positions) // 10)
+        arrow_scale = max_range * 0.3
+        if arrow_scale < 1e-5:
+            arrow_scale = 1e-4
         for i in range(0, len(positions), step):
             pos = positions[i]
             pitch, yaw = orientations[i, 0], orientations[i, 1]
@@ -468,14 +615,39 @@ Status: {'STATIC' if analysis['is_static'] else 'MOVING'}
             dy = -np.sin(pitch)
             dz = np.cos(pitch) * np.cos(yaw)
             
-            ax.quiver(pos[0], pos[1], pos[2], dx*0.1, dy*0.1, dz*0.1,
-                     color='orange', alpha=0.7)
+            arrow_norm = np.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+            if arrow_norm > 0:
+                ax.quiver(pos[0], pos[1], pos[2], 
+                         dx/arrow_norm*arrow_scale, dy/arrow_norm*arrow_scale, dz/arrow_norm*arrow_scale,
+                         color='orange', alpha=0.7)
         
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         ax.set_zlabel('Z')
         ax.set_title(f'Camera Trajectory: {self.current_data_id}')
         ax.legend()
+        
+        # Better handling for small scales
+        max_range = np.array([positions[:, 0].max() - positions[:, 0].min(),
+                             positions[:, 1].max() - positions[:, 1].min(),
+                             positions[:, 2].max() - positions[:, 2].min()]).max() / 2.0
+        
+        # Ensure minimum range for visualization
+        min_range = 1e-4
+        if max_range < min_range:
+            max_range = min_range
+        
+        mid_x = (positions[:, 0].max() + positions[:, 0].min()) * 0.5
+        mid_y = (positions[:, 1].max() + positions[:, 1].min()) * 0.5
+        mid_z = (positions[:, 2].max() + positions[:, 2].min()) * 0.5
+        
+        ax.set_xlim(mid_x - max_range, mid_x + max_range)
+        ax.set_ylim(mid_y - max_range, mid_y + max_range)
+        ax.set_zlim(mid_z - max_range, mid_z + max_range)
+        
+        # Add grid and scientific notation for small scales
+        ax.grid(True, alpha=0.3)
+        ax.ticklabel_format(style='scientific', scilimits=(-3, 3))
         
         self.canvas.draw()
     
@@ -548,19 +720,34 @@ Status: {'STATIC' if analysis['is_static'] else 'MOVING'}
     
     def load_next_sample(self):
         """Load next unvalidated sample"""
-        # Get all motion files
-        motion_files = sorted([f.stem for f in self.motion_dir.glob("*.npy")])
-        
-        # Find next unvalidated sample
-        current_idx = motion_files.index(self.current_data_id) if self.current_data_id in motion_files else -1
-        
-        for i in range(current_idx + 1, len(motion_files)):
-            data_id = motion_files[i]
-            if data_id not in self.validation_log:
-                self.id_entry.delete(0, tk.END)
-                self.id_entry.insert(0, data_id)
-                self.load_and_display_data(data_id)
-                return
+        if self.realestate10k:
+            # Get all motion directories
+            motion_dirs = sorted([d.name for d in self.motion_dir.iterdir() if d.is_dir() and not d.name.endswith('.json')])
+            
+            # Find next unvalidated sample
+            current_idx = motion_dirs.index(self.current_data_id) if self.current_data_id in motion_dirs else -1
+            
+            for i in range(current_idx + 1, len(motion_dirs)):
+                data_id = motion_dirs[i]
+                if data_id not in self.validation_log:
+                    self.id_entry.delete(0, tk.END)
+                    self.id_entry.insert(0, data_id)
+                    self.load_and_display_data(data_id)
+                    return
+        else:
+            # Get all motion files
+            motion_files = sorted([f.stem for f in self.motion_dir.glob("*.npy")])
+            
+            # Find next unvalidated sample
+            current_idx = motion_files.index(self.current_data_id) if self.current_data_id in motion_files else -1
+            
+            for i in range(current_idx + 1, len(motion_files)):
+                data_id = motion_files[i]
+                if data_id not in self.validation_log:
+                    self.id_entry.delete(0, tk.END)
+                    self.id_entry.insert(0, data_id)
+                    self.load_and_display_data(data_id)
+                    return
         
         messagebox.showinfo("Complete", "No more unvalidated samples!")
     
@@ -576,12 +763,15 @@ Status: {'STATIC' if analysis['is_static'] else 'MOVING'}
         analysis = self.analyze_motion(motion)
         
         # Create plot with text descriptions
-        fig = self.plot_trajectory_3d(motion, data_id, text_lines, f"Camera Trajectory: {data_id}")
+        fig = self.plot_trajectory_3d(motion, data_id, text_lines, f"Camera Trajectory: ")
         
         if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            fig.savefig(save_path, dpi=150, bbox_inches='tight')
             print(f"Saved visualization to {save_path}")
         else:
+            # For showing, we need to use pyplot
+            import matplotlib.pyplot as plt
+            plt.figure(fig.number)
             plt.show()
         
         return fig, analysis
@@ -596,10 +786,12 @@ def main():
     parser.add_argument('--batch_mode', action='store_true', help='Batch visualization mode')
     parser.add_argument('--start_id', type=int, default=0, help='Start ID for batch mode')
     parser.add_argument('--end_id', type=int, default=100, help='End ID for batch mode')
+    parser.add_argument('--RealEstate10K', action='store_true', 
+                       help='Use RealEstate10K dataset format (camera_trajectory_advanced.txt + video_captions.json)')
     
     args = parser.parse_args()
     
-    visualizer = CameraTrajectoryVisualizer(args.dataset_path)
+    visualizer = CameraTrajectoryVisualizer(args.dataset_path, realestate10k=args.RealEstate10K)
     
     if args.gui:
         visualizer.run_gui()
@@ -610,20 +802,40 @@ def main():
         output_dir = Path("trajectory_visualizations")
         output_dir.mkdir(exist_ok=True)
         
-        for i in range(args.start_id, args.end_id):
-            data_id = f"{i:05d}"
-            try:
-                save_path = output_dir / f"{data_id}_trajectory.png"
-                visualizer.visualize_single(data_id, save_path)
-                print(f"Processed {data_id}")
-            except Exception as e:
-                print(f"Error processing {data_id}: {e}")
+        if args.RealEstate10K:
+            # For RealEstate10K, get all available directories
+            motion_dirs = sorted([d.name for d in visualizer.motion_dir.iterdir() 
+                                if d.is_dir() and not d.name.endswith('.json')])
+            start_idx = max(0, args.start_id)
+            end_idx = min(len(motion_dirs), args.end_id)
+            
+            for i in range(start_idx, end_idx):
+                data_id = motion_dirs[i]
+                try:
+                    save_path = output_dir / f"{data_id}_trajectory.png"
+                    visualizer.visualize_single(data_id, save_path)
+                    print(f"Processed {data_id}")
+                except Exception as e:
+                    print(f"Error processing {data_id}: {e}")
+        else:
+            # Original format with numeric IDs
+            for i in range(args.start_id, args.end_id):
+                data_id = f"{i:05d}"
+                try:
+                    save_path = output_dir / f"{data_id}_trajectory.png"
+                    visualizer.visualize_single(data_id, save_path)
+                    print(f"Processed {data_id}")
+                except Exception as e:
+                    print(f"Error processing {data_id}: {e}")
     else:
         print("Please specify --data_id, --gui, or --batch_mode")
         print("Examples:")
         print("  python visualize_camera_trajectory.py --gui")
         print("  python visualize_camera_trajectory.py --data_id 00006")
         print("  python visualize_camera_trajectory.py --batch_mode --start_id 0 --end_id 50")
+        print("  # For RealEstate10K dataset:")
+        print("  python visualize_camera_trajectory.py --RealEstate10K --data_id 00703cbf7531ef11 --dataset_path /data5/haozhe/CamTraj/data/processed_estate")
+        print("  python visualize_camera_trajectory.py --RealEstate10K --gui --dataset_path /data5/haozhe/CamTraj/data/processed_estate")
 
 if __name__ == "__main__":
     main() 

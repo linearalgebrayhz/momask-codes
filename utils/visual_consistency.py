@@ -317,7 +317,8 @@ def create_visual_consistency_module(opt) -> VisualConsistencyModule:
     enabled = getattr(opt, 'use_visual_consistency', False)
     
     # For camera datasets, try to enable by default if not explicitly disabled
-    if opt.dataset_name == "cam" and not hasattr(opt, 'use_visual_consistency'):
+    is_camera_dataset = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+    if is_camera_dataset and not hasattr(opt, 'use_visual_consistency'):
         enabled = True
     
     # Disable if no video data available

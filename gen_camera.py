@@ -13,6 +13,8 @@ from utils.get_opt import get_opt
 from utils.fixseed import fixseed
 from utils.camera_process import recover_from_camera_data, denormalize_camera_data
 from utils.plot_script import plot_3d_motion
+from utils.unified_data_format import UnifiedCameraData, CameraDataFormat
+from utils.dataset_config import get_unified_dataset_config
 
 import numpy as np
 from torch.distributions.categorical import Categorical
@@ -33,7 +35,7 @@ def load_vq_model(vq_opt):
                 vq_opt.vq_norm)
     
     # Choose checkpoint file based on dataset type
-    if vq_opt.dataset_name == "cam":
+    if vq_opt.dataset_name == "cam" or vq_opt.dataset_name == "realestate10k_6" or vq_opt.dataset_name == "realestate10k_12":
         # For camera datasets, try different checkpoint files in order of preference
         checkpoint_files = [
             'net_best_recon.tar',      # Best reconstruction loss
@@ -104,7 +106,7 @@ def load_res_model(res_opt, vq_opt, opt):
                                             opt=res_opt)
 
     # Choose checkpoint file based on dataset type
-    if res_opt.dataset_name == "cam":
+    if res_opt.dataset_name == "cam" or res_opt.dataset_name == "realestate10k_6" or res_opt.dataset_name == "realestate10k_12":
         # For camera datasets, try different checkpoint files in order of preference
         checkpoint_files = [
             'net_best_acc.tar',        # Best accuracy
@@ -142,7 +144,7 @@ def load_len_estimator(opt):
     checkpoint_files = ['finest.tar', 'latest.tar']
     
     # For camera dataset, also try fallback to t2m length estimator
-    if opt.dataset_name == 'cam':
+    if opt.dataset_name == 'cam' or opt.dataset_name == 'realestate10k_6' or opt.dataset_name == 'realestate10k_12':
         t2m_estimator_dir = pjoin(opt.checkpoints_dir, 't2m', 'length_estimator', 'model')
         checkpoint_files.extend([
             pjoin(t2m_estimator_dir, 'finest.tar'),
@@ -174,34 +176,537 @@ def load_len_estimator(opt):
     model.load_state_dict(ckpt['estimator'])
     epoch = ckpt.get('epoch', 'unknown')
     
-    if loaded_file and 't2m' in loaded_file and opt.dataset_name == 'cam':
+    if loaded_file and 't2m' in loaded_file and opt.dataset_name == 'cam' or opt.dataset_name == 'realestate10k_6' or opt.dataset_name == 'realestate10k_12':
         print(f'Loading Length Estimator from t2m dataset (epoch {epoch}) as fallback for camera dataset!')
     else:
         print(f'Loading Length Estimator from epoch {epoch}!')
     
     return model
 
+def plot_camera_trajectory_animation(data, save_path, title="Camera Trajectory", 
+                                   fps=30, arrow_scale_factor=0.05, 
+                                   min_arrow_length=0.01, max_arrow_length=0.2,
+                                   show_trail=True, trail_length=30, figsize=(12, 10)):
+    """
+    Create an animated 3D visualization of camera trajectory with smooth movement
+    Supports multiple camera data formats (5D, 6D, 12D) with automatic detection
+    
+    Args:
+        data: Camera trajectory data (seq_len, features) - supports 5D, 6D, or 12D formats
+        save_path: Path to save the animation (supports .gif, .mp4)
+        title: Title for the animation
+        fps: Frames per second for the animation
+        arrow_scale_factor: Factor to scale arrows relative to trajectory extent
+        min_arrow_length: Minimum arrow length to ensure visibility
+        max_arrow_length: Maximum arrow length to prevent overly long arrows
+        show_trail: Whether to show a trail behind the camera
+        trail_length: Number of previous positions to show in trail
+        figsize: Figure size tuple
+    """
+    from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    import numpy as np
+    
+    # Use unified data format for automatic handling of different dimensions
+    unified_data = UnifiedCameraData(data)
+    raw_positions = unified_data.positions.numpy()  # Always [x, y, z]
+    orientations = unified_data.orientations.numpy()  # Depends on format
+    
+    # Remap coordinates for proper visualization:
+    # Raw data: [x, y, z] where x=right, y=up, z=forward (negative z = forward motion)
+    # Matplotlib 3D: expects [x, y, z] where x=right, y=depth, z=up
+    # So we remap: [x, y, z] -> [x, -z, y] to get proper camera coordinate visualization
+    positions = np.column_stack([
+        raw_positions[:, 0],   # X stays the same (right)
+        -raw_positions[:, 2],  # Z becomes Y (forward becomes depth, with sign flip)
+        raw_positions[:, 1]    # Y becomes Z (up becomes up)
+    ])
+    
+    # Create figure and 3D axis
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Calculate dynamic arrow length based on trajectory extent
+    pos_ranges = np.ptp(positions, axis=0)
+    trajectory_extent = np.max(pos_ranges)
+    
+    if len(positions) > 1:
+        step_distances = np.sqrt(np.sum(np.diff(positions, axis=0)**2, axis=1))
+        avg_step_size = np.mean(step_distances)
+        scale_reference = max(trajectory_extent, avg_step_size * 10)
+    else:
+        scale_reference = trajectory_extent
+    
+    base_arrow_length = max(arrow_scale_factor * scale_reference, min_arrow_length)
+    base_arrow_length = min(base_arrow_length, max_arrow_length)
+    
+    # Set up plot limits with some padding
+    padding = trajectory_extent * 0.1
+    ax.set_xlim(positions[:, 0].min() - padding, positions[:, 0].max() + padding)
+    ax.set_ylim(positions[:, 1].min() - padding, positions[:, 1].max() + padding)
+    ax.set_zlim(positions[:, 2].min() - padding, positions[:, 2].max() + padding)
+    
+    # Format title
+    title_length = len(title)
+    if title_length > 100:
+        title_fontsize = 8
+        title_wrap_width = 80
+    elif title_length > 60:
+        title_fontsize = 10
+        title_wrap_width = 60
+    elif title_length > 30:
+        title_fontsize = 12
+        title_wrap_width = 40
+    else:
+        title_fontsize = 14
+        title_wrap_width = 30
+    
+    import textwrap
+    wrapped_title = '\n'.join(textwrap.wrap(title, width=title_wrap_width))
+    format_info = f"[{unified_data.format_type.name}: {unified_data.num_features}D]"
+    display_title = f"{wrapped_title}\n{format_info}"
+    
+    ax.set_title(display_title, fontsize=title_fontsize, pad=20)
+    ax.set_xlabel('X (Right)')
+    ax.set_ylabel('Depth (Forward)')  # This is now -Z from original data
+    ax.set_zlabel('Y (Up)')           # This is now Y from original data
+    
+    # Initialize empty line and point objects for animation
+    trajectory_line, = ax.plot([], [], [], 'b-', linewidth=2, alpha=0.6, label='Full Path')
+    trail_line, = ax.plot([], [], [], 'orange', linewidth=3, alpha=0.8, label='Recent Trail')
+    current_point = ax.scatter([], [], [], c='red', s=200, label='Current Position')
+    orientation_arrow = None
+    
+    # Add start and end markers
+    ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2], 
+              c='green', s=150, label='Start', marker='^')
+    ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], 
+              c='red', s=150, label='End', marker='v')
+    
+    ax.legend()
+    
+    def animate(frame):
+        nonlocal orientation_arrow
+        
+        # Clear previous orientation arrow
+        if orientation_arrow is not None:
+            orientation_arrow.remove()
+        
+        # Update full trajectory (fade in effect)
+        alpha = min(1.0, frame / 20)  # Fade in over first 20 frames
+        trajectory_line.set_data_3d(positions[:frame+1, 0], 
+                                   positions[:frame+1, 1], 
+                                   positions[:frame+1, 2])
+        trajectory_line.set_alpha(alpha * 0.6)
+        
+        # Update trail
+        if show_trail and frame > 0:
+            trail_start = max(0, frame - trail_length)
+            trail_positions = positions[trail_start:frame+1]
+            trail_line.set_data_3d(trail_positions[:, 0], 
+                                  trail_positions[:, 1], 
+                                  trail_positions[:, 2])
+        
+        # Update current position
+        current_pos = positions[frame]
+        current_point._offsets3d = ([current_pos[0]], [current_pos[1]], [current_pos[2]])
+        
+        # Update orientation arrow
+        ori = orientations[frame]
+        
+        # Handle different orientation formats
+        if unified_data.format_type == CameraDataFormat.LEGACY_5:
+            pitch, yaw = ori[0], ori[1]
+            # Original camera direction in camera coordinates
+            dx_orig = np.cos(pitch) * np.sin(yaw)   # Right
+            dy_orig = -np.sin(pitch)                # Up (negative because of camera convention)
+            dz_orig = np.cos(pitch) * np.cos(yaw)   # Forward
+        else:
+            pitch, yaw = ori[0], ori[1]
+            # Original camera direction in camera coordinates
+            dx_orig = np.cos(pitch) * np.sin(yaw)   # Right
+            dy_orig = -np.sin(pitch)                # Up (negative because of camera convention)
+            dz_orig = np.cos(pitch) * np.cos(yaw)   # Forward
+        
+        # Remap orientation to match the coordinate transformation
+        # [dx, dy, dz] -> [dx, dz, dy] to match position remapping
+        # Note: For positions we used [x, -z, y], but for directions we want [x, z, y]
+        # because camera "forward" (+z) should map to visualization "forward" (+y)
+        dx = dx_orig      # X stays the same (right)
+        dy = dz_orig      # Z becomes Y (forward becomes depth, no sign flip for direction)
+        dz = dy_orig      # Y becomes Z (up becomes up)
+        
+        # Normalize direction vector
+        direction_magnitude = np.sqrt(dx**2 + dy**2 + dz**2)
+        if direction_magnitude > 1e-6:
+            dx /= direction_magnitude
+            dy /= direction_magnitude
+            dz /= direction_magnitude
+        
+        # Draw orientation arrow
+        orientation_arrow = ax.quiver(current_pos[0], current_pos[1], current_pos[2], 
+                                     dx, dy, dz, 
+                                     length=1.5*base_arrow_length, 
+                                     color='purple', alpha=0.8, 
+                                     arrow_length_ratio=0.3,
+                                     linewidth=2)
+        
+        # Update view angle for dynamic perspective (optional)
+        ax.view_init(elev=20, azim=frame * 0.5 % 360)
+        
+        return trajectory_line, trail_line, current_point, orientation_arrow
+    
+    # Create animation
+    interval = 1000 / fps  # Convert fps to interval in milliseconds
+    anim = FuncAnimation(fig, animate, frames=len(positions), 
+                        interval=interval, blit=False, repeat=True)
+    
+    # Save animation
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    
+    if save_path.endswith('.gif'):
+        writer = PillowWriter(fps=fps)
+        anim.save(save_path, writer=writer, dpi=100)
+    elif save_path.endswith('.mp4'):
+        writer = FFMpegWriter(fps=fps, metadata=dict(artist='CamTraj'), bitrate=1800)
+        anim.save(save_path, writer=writer, dpi=100)
+    else:
+        # Default to gif
+        writer = PillowWriter(fps=fps)
+        anim.save(save_path + '.gif', writer=writer, dpi=100)
+    
+    plt.close()
+    print(f"Camera trajectory animation saved to {save_path}")
+
+def plot_camera_trajectory_debug(data, save_path, title="Camera Trajectory Debug", 
+                                fps=20, show_velocity=True, show_topdown=True,
+                                show_statistics=True, figsize=(15, 12), text_prompt=None):
+    """
+    Create comprehensive debugging visualization with multiple views and analysis
+    
+    Args:
+        data: Camera trajectory data (seq_len, features)
+        save_path: Path to save the debug animation
+        title: Title for the debug view
+        fps: Frames per second
+        show_velocity: Whether to show velocity vectors
+        show_topdown: Whether to show top-down view (X-Depth plane)
+        show_statistics: Whether to show statistical information
+        figsize: Figure size tuple
+        text_prompt: Optional text prompt to display in statistics panel for comparison
+    """
+    from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    import numpy as np
+    
+    # Use unified data format
+    unified_data = UnifiedCameraData(data)
+    raw_positions = unified_data.positions.numpy()
+    orientations = unified_data.orientations.numpy()
+    
+    # Apply coordinate remapping for visualization consistency
+    # Raw data: [x, y, z] where x=right, y=up, z=forward (negative z = forward motion)
+    # Remap: [x, y, z] -> [x, -z, y] for proper visualization
+    positions = np.column_stack([
+        raw_positions[:, 0],   # X stays the same (right)
+        -raw_positions[:, 2],  # Z becomes Y (forward becomes depth, with sign flip)
+        raw_positions[:, 1]    # Y becomes Z (up becomes up)
+    ])
+    
+    # Calculate derivatives for analysis
+    velocities = np.zeros_like(positions)
+    if len(positions) > 1:
+        velocities[1:] = np.diff(positions, axis=0)
+    
+    # Calculate statistics
+    velocity_magnitudes = np.linalg.norm(velocities, axis=1)
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=figsize)
+    
+    # Main 3D view
+    ax_3d = fig.add_subplot(2, 2, 1, projection='3d')
+    
+    # Velocity plot
+    ax_vel = fig.add_subplot(2, 2, 2)
+    
+    # Top-down view (X-Depth plane)
+    ax_topdown = fig.add_subplot(2, 2, 3)
+    
+    # Statistics text
+    ax_stats = fig.add_subplot(2, 2, 4)
+    ax_stats.axis('off')
+    
+    # Set up 3D plot
+    padding = np.max(np.ptp(positions, axis=0)) * 0.1
+    ax_3d.set_xlim(positions[:, 0].min() - padding, positions[:, 0].max() + padding)
+    ax_3d.set_ylim(positions[:, 1].min() - padding, positions[:, 1].max() + padding)
+    ax_3d.set_zlim(positions[:, 2].min() - padding, positions[:, 2].max() + padding)
+    ax_3d.set_title('3D Camera Trajectory')
+    ax_3d.set_xlabel('X (Right)')
+    ax_3d.set_ylabel('Depth (Forward)')
+    ax_3d.set_zlabel('Y (Up)')
+    
+    # Set up velocity plot
+    ax_vel.set_title('Velocity Magnitude Over Time')
+    ax_vel.set_xlabel('Frame')
+    ax_vel.set_ylabel('Velocity')
+    ax_vel.grid(True)
+    
+    # Set up top-down view
+    ax_topdown.set_title('Top-Down View (X-Depth Plane)')
+    ax_topdown.set_xlabel('X (Right)')
+    ax_topdown.set_ylabel('Depth (Forward)')
+    ax_topdown.grid(True)
+    ax_topdown.set_aspect('equal', adjustable='box')
+    
+    def animate_debug(frame):
+        # Clear all plots
+        ax_3d.clear()
+        ax_vel.clear()
+        ax_topdown.clear()
+        ax_stats.clear()
+        ax_stats.axis('off')
+        
+        # Re-setup 3D plot
+        ax_3d.set_xlim(positions[:, 0].min() - padding, positions[:, 0].max() + padding)
+        ax_3d.set_ylim(positions[:, 1].min() - padding, positions[:, 1].max() + padding)
+        ax_3d.set_zlim(positions[:, 2].min() - padding, positions[:, 2].max() + padding)
+        ax_3d.set_title('3D Camera Trajectory')
+        ax_3d.set_xlabel('X (Right)')
+        ax_3d.set_ylabel('Depth (Forward)')
+        ax_3d.set_zlabel('Y (Up)')
+        
+        # Plot trajectory up to current frame
+        if frame > 0:
+            ax_3d.plot(positions[:frame+1, 0], positions[:frame+1, 1], positions[:frame+1, 2], 
+                      'b-', linewidth=2, alpha=0.7)
+        
+        # Current position
+        current_pos = positions[frame]
+        ax_3d.scatter(*current_pos, c='red', s=100)
+        
+        # Orientation arrow (with coordinate remapping)
+        ori = orientations[frame]
+        if unified_data.format_type == CameraDataFormat.LEGACY_5:
+            pitch, yaw = ori[0], ori[1]
+            # Original camera direction in camera coordinates
+            dx_orig = np.cos(pitch) * np.sin(yaw)   # Right
+            dy_orig = -np.sin(pitch)                # Up (negative because of camera convention)
+            dz_orig = np.cos(pitch) * np.cos(yaw)   # Forward
+        else:
+            pitch, yaw = ori[0], ori[1]
+            # Original camera direction in camera coordinates
+            dx_orig = np.cos(pitch) * np.sin(yaw)   # Right
+            dy_orig = -np.sin(pitch)                # Up (negative because of camera convention)
+            dz_orig = np.cos(pitch) * np.cos(yaw)   # Forward
+        
+        # Remap orientation to match the coordinate transformation
+        dx = dx_orig      # X stays the same (right)
+        dy = dz_orig      # Z becomes Y (forward becomes depth)
+        dz = dy_orig      # Y becomes Z (up becomes up)
+        
+        # Normalize and draw orientation
+        norm = np.sqrt(dx**2 + dy**2 + dz**2)
+        if norm > 1e-6:
+            dx, dy, dz = dx/norm, dy/norm, dz/norm
+            arrow_length = np.max(np.ptp(positions, axis=0)) * 0.1
+            ax_3d.quiver(current_pos[0], current_pos[1], current_pos[2], 
+                        dx, dy, dz, length=arrow_length, color='purple', alpha=0.8)
+        
+        # Velocity vector
+        if show_velocity and frame > 0:
+            vel = velocities[frame]
+            vel_norm = np.linalg.norm(vel)
+            if vel_norm > 1e-6:
+                vel_normalized = vel / vel_norm
+                vel_length = min(vel_norm * 10, arrow_length)
+                ax_3d.quiver(current_pos[0], current_pos[1], current_pos[2], 
+                           vel_normalized[0], vel_normalized[1], vel_normalized[2], 
+                           length=vel_length, color='green', alpha=0.6)
+        
+        # Plot velocity over time
+        ax_vel.set_title('Velocity Magnitude Over Time')
+        ax_vel.set_xlabel('Frame')
+        ax_vel.set_ylabel('Velocity')
+        ax_vel.grid(True)
+        frames_so_far = range(frame + 1)
+        ax_vel.plot(frames_so_far, velocity_magnitudes[:frame+1], 'g-', linewidth=2)
+        ax_vel.scatter(frame, velocity_magnitudes[frame], c='red', s=50, zorder=5)
+        if frame > 0:
+            ax_vel.set_xlim(0, max(10, frame + 1))
+            ax_vel.set_ylim(0, max(velocity_magnitudes[:frame+1]) * 1.1 if max(velocity_magnitudes[:frame+1]) > 0 else 1)
+        
+        # Plot top-down view (X-Depth plane)
+        ax_topdown.set_title('Top-Down View (X-Depth Plane)')
+        ax_topdown.set_xlabel('X (Right)')
+        ax_topdown.set_ylabel('Depth (Forward)')
+        ax_topdown.grid(True)
+        ax_topdown.set_aspect('equal', adjustable='box')
+        
+        # Plot trajectory in top-down view
+        if frame > 0:
+            ax_topdown.plot(positions[:frame+1, 0], positions[:frame+1, 1], 'b-', linewidth=2, alpha=0.7)
+        
+        # Current position in top-down view
+        ax_topdown.scatter(current_pos[0], current_pos[1], c='red', s=100, zorder=5)
+        
+        # Orientation arrow in top-down view
+        if norm > 1e-6:
+            arrow_scale = np.max(np.ptp(positions[:, :2], axis=0)) * 0.1
+            ax_topdown.arrow(current_pos[0], current_pos[1], 
+                           dx * arrow_scale, dy * arrow_scale,
+                           head_width=arrow_scale*0.3, head_length=arrow_scale*0.2,
+                           fc='purple', ec='purple', alpha=0.8)
+        
+        # Set limits for top-down view
+        x_range = positions[:, 0].max() - positions[:, 0].min()
+        y_range = positions[:, 1].max() - positions[:, 1].min()
+        max_range = max(x_range, y_range)
+        center_x = (positions[:, 0].max() + positions[:, 0].min()) / 2
+        center_y = (positions[:, 1].max() + positions[:, 1].min()) / 2
+        margin = max_range * 0.1
+        ax_topdown.set_xlim(center_x - max_range/2 - margin, center_x + max_range/2 + margin)
+        ax_topdown.set_ylim(center_y - max_range/2 - margin, center_y + max_range/2 + margin)
+        
+        # Statistics text
+        if show_statistics:
+            stats_text = f"""Frame: {frame}/{len(positions)-1}
+
+Current Position:
+X: {current_pos[0]:.3f}
+Y: {current_pos[1]:.3f}  
+Z: {current_pos[2]:.3f}
+
+Current Orientation:
+Pitch: {ori[0]:.3f}
+Yaw: {ori[1]:.3f}
+"""
+            
+            # Add text prompt for comparison if provided
+            if text_prompt:
+                # Wrap long text prompts
+                import textwrap
+                wrapped_prompt = textwrap.fill(text_prompt, width=35)
+                stats_text = f"""TEXT PROMPT:
+"{wrapped_prompt}"
+{'─' * 40}
+
+{stats_text}"""
+            if len(ori) > 2:
+                stats_text += f"Roll: {ori[2]:.3f}\n"
+                
+            if frame > 0:
+                stats_text += f"""
+Current Velocity: {velocity_magnitudes[frame]:.3f}
+Avg Velocity: {np.mean(velocity_magnitudes[1:frame+1]):.3f}
+"""
+            
+            # Add orientation information
+            stats_text += f"""
+Orientation Vector:
+X-component: {dx:.3f}
+Y-component: {dy:.3f}
+Z-component: {dz:.3f}
+"""
+            
+            # Add trajectory statistics and motion analysis
+            if frame > 5:
+                recent_positions = positions[max(0, frame-5):frame+1]
+                path_length = np.sum(np.linalg.norm(np.diff(recent_positions, axis=0), axis=1))
+                smoothness = 1.0 / (1.0 + np.std(velocity_magnitudes[max(1, frame-5):frame+1]))
+                
+                # Analyze dominant motion direction
+                recent_displacement = recent_positions[-1] - recent_positions[0]
+                dominant_axis = np.argmax(np.abs(recent_displacement))
+                axis_names = ['X (Right)', 'Depth (Forward)', 'Y (Up)']
+                direction = 'positive' if recent_displacement[dominant_axis] > 0 else 'negative'
+                
+                stats_text += f"""
+MOTION ANALYSIS:
+Recent Path Length: {path_length:.3f}
+Smoothness: {smoothness:.3f}
+Dominant Motion: {direction} {axis_names[dominant_axis]}
+Speed: {velocity_magnitudes[frame]:.3f}
+"""
+            
+            ax_stats.text(0.05, 0.95, stats_text, transform=ax_stats.transAxes, 
+                         fontsize=10, verticalalignment='top', fontfamily='monospace',
+                         bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.8))
+    
+    plt.tight_layout()
+    
+    # Create animation
+    interval = 1000 / fps
+    anim = FuncAnimation(fig, animate_debug, frames=len(positions), 
+                        interval=interval, blit=False, repeat=True)
+    
+    # Save animation
+    if save_path.endswith('.gif'):
+        writer = PillowWriter(fps=fps)
+        anim.save(save_path, writer=writer, dpi=80)
+    elif save_path.endswith('.mp4'):
+        writer = FFMpegWriter(fps=fps, metadata=dict(artist='CamTraj'), bitrate=1800)
+        anim.save(save_path, writer=writer, dpi=100)
+    else:
+        # Default to mp4 for better quality
+        writer = FFMpegWriter(fps=fps, metadata=dict(artist='CamTraj'), bitrate=1800)
+        anim.save(save_path + '.mp4', writer=writer, dpi=100)
+    
+    plt.close()
+    print(f"Debug animation saved to {save_path}")
+
 def plot_camera_trajectory(data, save_path, title="Camera Trajectory", arrow_scale_factor=0.05, 
                           min_arrow_length=0.01, max_arrow_length=0.2):
     """
     Plot camera trajectory as a 3D path with dynamically scaled orientation arrows
+    Supports multiple camera data formats (5D, 6D, 12D) with automatic detection
     
     Args:
-        data: Camera trajectory data (seq_len, 5) - [x, y, z, pitch, yaw]
+        data: Camera trajectory data (seq_len, features) - supports 5D, 6D, or 12D formats
         save_path: Path to save the plot
         title: Title for the plot
         arrow_scale_factor: Factor to scale arrows relative to trajectory extent (default: 0.05 = 5%)
         min_arrow_length: Minimum arrow length to ensure visibility (default: 0.01)
         max_arrow_length: Maximum arrow length to prevent overly long arrows (default: 0.2)
     """
-    positions, orientations = recover_from_camera_data(data)
+    # Use unified data format for automatic handling of different dimensions
+    unified_data = UnifiedCameraData(data)
+    positions = unified_data.positions.numpy()  # Always [x, y, z]
+    orientations = unified_data.orientations.numpy()  # Depends on format
     
     # Create a simple 3D plot
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D
     
-    fig = plt.figure(figsize=(10, 8))
+    fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
+    
+    # Adaptive font size based on title length
+    title_length = len(title)
+    if title_length > 100:
+        title_fontsize = 8
+        title_wrap_width = 80
+    elif title_length > 60:
+        title_fontsize = 10
+        title_wrap_width = 60
+    elif title_length > 30:
+        title_fontsize = 12
+        title_wrap_width = 40
+    else:
+        title_fontsize = 14
+        title_wrap_width = 30
+    
+    # Wrap long titles
+    import textwrap
+    wrapped_title = '\n'.join(textwrap.wrap(title, width=title_wrap_width))
+    
+    # Add format information to title
+    format_info = f"[{unified_data.format_type.name}: {unified_data.num_features}D]"
+    display_title = f"{wrapped_title}\n{format_info}"
     
     # Plot camera positions
     ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], 'b-', linewidth=2, label='Camera Path')
@@ -232,11 +737,21 @@ def plot_camera_trajectory(data, save_path, title="Camera Trajectory", arrow_sca
         pos = positions[i]
         ori = orientations[i]
         
-        # Convert pitch, yaw to direction vector (normalized to unit length)
-        pitch, yaw = ori[0], ori[1]
-        dx = np.cos(pitch) * np.sin(yaw)
-        dy = -np.sin(pitch)
-        dz = np.cos(pitch) * np.cos(yaw)
+        # Handle different orientation formats
+        if unified_data.format_type == CameraDataFormat.LEGACY_5:
+            # 5D format: [pitch, yaw]
+            pitch, yaw = ori[0], ori[1]
+            # Convert pitch, yaw to direction vector (normalized to unit length)
+            dx = np.cos(pitch) * np.sin(yaw)
+            dy = -np.sin(pitch)
+            dz = np.cos(pitch) * np.cos(yaw)
+        else:
+            # 6D and 12D formats: [pitch, yaw, roll] (roll not used for direction)
+            pitch, yaw = ori[0], ori[1]
+            # Convert pitch, yaw to direction vector (same as 5D)
+            dx = np.cos(pitch) * np.sin(yaw)
+            dy = -np.sin(pitch)
+            dz = np.cos(pitch) * np.cos(yaw)
         
         # Normalize direction vector to ensure unit length
         direction_magnitude = np.sqrt(dx**2 + dy**2 + dz**2)
@@ -253,7 +768,7 @@ def plot_camera_trajectory(data, save_path, title="Camera Trajectory", arrow_sca
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
-    ax.set_title(title)
+    ax.set_title(display_title, fontsize=title_fontsize, pad=20)
     ax.legend()
     
     # Add text annotation showing the arrow scale for reference
@@ -275,8 +790,14 @@ if __name__ == '__main__':
     opt.device = torch.device("cpu" if opt.gpu_id == -1 else "cuda:" + str(opt.gpu_id))
     torch.autograd.set_detect_anomaly(True)
 
-    # Camera-specific configuration
-    dim_pose = 5  # [x, y, z, pitch, yaw]
+    # Get dataset configuration with automatic format detection
+    dataset_config = get_unified_dataset_config(opt)
+    dim_pose = dataset_config['dim_pose']
+    detected_format = dataset_config.get('detected_format', 'Unknown')
+    
+    print(f"Dataset: {opt.dataset_name}")
+    print(f"Detected camera format: {detected_format}")
+    print(f"Feature dimensions: {dim_pose}")
 
     root_dir = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.name)
     model_dir = pjoin(root_dir, 'model')
@@ -406,16 +927,109 @@ if __name__ == '__main__':
             # Save raw camera data
             np.save(pjoin(joint_path, "sample%d_repeat%d_len%d.npy"%(k, r, m_length[k])), joint_data)
             
-            # Create camera trajectory visualization
+            # Create camera trajectory visualization (both static and animated)
             plot_path = pjoin(animation_path, "sample%d_repeat%d_len%d_trajectory.png"%(k, r, m_length[k]))
             plot_camera_trajectory(joint_data, plot_path, title=caption)
             
-            # Save camera data as text file for easy inspection
-            positions, orientations = recover_from_camera_data(joint_data)
+            # Create animated version for better debugging (MP4 for better quality & smaller size)
+            anim_path = pjoin(animation_path, "sample%d_repeat%d_len%d_trajectory.mp4"%(k, r, m_length[k]))
+            plot_camera_trajectory_animation(joint_data, anim_path, title=caption, 
+                                           fps=30, show_trail=True, trail_length=20)
+            
+            # Create comprehensive debug animation with analysis
+            debug_path = pjoin(animation_path, "sample%d_repeat%d_len%d_debug.mp4"%(k, r, m_length[k]))
+            plot_camera_trajectory_debug(joint_data, debug_path, title=f"Debug: {caption}",
+                                       fps=30, show_velocity=True, show_topdown=True, 
+                                       text_prompt=caption)
+            
+            # Save camera data as text file for easy inspection with format-aware headers
+            unified_data = UnifiedCameraData(joint_data)
+            positions = unified_data.positions.numpy()
+            orientations = unified_data.orientations.numpy()
+            
+            # Create format-appropriate header
+            if unified_data.format_type == CameraDataFormat.LEGACY_5:
+                header = 'x y z pitch yaw'
+            elif unified_data.format_type == CameraDataFormat.POSITION_ORIENTATION_6:
+                header = 'x y z pitch yaw roll'
+            else:  # FULL_12
+                header = 'x y z pitch yaw roll'  # Only save position + orientation for readability
+            
             camera_data = np.column_stack([positions, orientations])
             np.savetxt(pjoin(joint_path, "sample%d_repeat%d_len%d.txt"%(k, r, m_length[k])), 
                       camera_data, fmt='%.6f', 
-                      header='x y z pitch yaw', comments='')
+                      header=header, comments='')
+            
+            # Also save format information
+            format_info_path = pjoin(joint_path, "sample%d_repeat%d_len%d_format.txt"%(k, r, m_length[k]))
+            with open(format_info_path, 'w') as f:
+                f.write(f"Original format: {unified_data.format_type.name}\n")
+                f.write(f"Original dimensions: {unified_data.num_features}\n")
+                f.write(f"Raw data shape: {joint_data.shape}\n")
+                f.write(f"Position shape: {positions.shape}\n")
+                f.write(f"Orientation shape: {orientations.shape}\n")
+                f.write(f"Caption: {caption}\n")
 
             print(f"Camera trajectory saved to {plot_path}")
+            print(f"Camera trajectory animation saved to {anim_path}")
+            print(f"Debug animation saved to {debug_path}")
             print(f"Raw data saved to {pjoin(joint_path, 'sample%d_repeat%d_len%d.npy'%(k, r, m_length[k]))}") 
+
+"""
+Enhanced Camera Trajectory Generation Script with 3D Animation Support
+
+Supports multiple camera data formats:
+- 5D: [x, y, z, pitch, yaw] (legacy cam dataset)
+- 6D: [x, y, z, pitch, yaw, roll] (realestate10k_6 dataset)
+- 12D: [x, y, z, dx, dy, dz, pitch, yaw, roll, dpitch, dyaw, droll] (full format)
+
+NEW FEATURES:
+- 3D animated trajectory visualization for better debugging
+- Comprehensive debug animations with velocity/acceleration analysis
+- Interactive trail visualization showing camera movement history
+- Multi-format support with automatic detection
+
+Output Files Generated Per Sample:
+- sample_X_repeat_Y_len_Z_trajectory.png (static 3D plot)
+- sample_X_repeat_Y_len_Z_trajectory.mp4 (smooth 3D animation video)
+- sample_X_repeat_Y_len_Z_debug.mp4 (comprehensive debug animation video)
+- sample_X_repeat_Y_len_Z.npy (raw trajectory data)
+- sample_X_repeat_Y_len_Z.txt (human-readable trajectory)
+- sample_X_repeat_Y_len_Z_format.txt (format information)
+
+Usage Examples:
+
+# For 6D realestate10k_6 dataset with animations
+CUDA_VISIBLE_DEVICES=7 python gen_camera.py \
+    --dataset_name realestate10k_6 \
+    --name mtrans_realestate10k_6_new_captions \
+    --res_name rtrans_realestate10k_6_qwen_vl_captions \
+    --gpu_id 0 \
+    --text_path camera_prompts.txt \
+    --repeat_times 1 \
+    --time_steps 10 \
+    --cond_scale 3 \
+    --temperature 1.0 \
+    --topkr 0.9 \
+    --ext camera_batch_generation_6_qwen_vl_captions
+
+# Demo the animation features
+python demo_camera_animation.py --demo-type full
+
+# Quick animation demo
+python demo_camera_animation.py --demo-type quick
+
+Animation Features:
+- Smooth camera movement with orientation arrows
+- Dynamic trail showing recent camera positions
+- Real-time velocity and acceleration analysis
+- Format-aware visualization (5D/6D/12D)
+- Statistical debugging information
+- Multi-panel debug view with comprehensive analysis
+
+echo "Batch Camera Trajectory Generation with Animations completed!"
+echo "Results saved in ./generation/camera_batch_generation/"
+echo "Generated static plots, animations, and debug visualizations"
+echo "Check the animations folder for .mp4 files with smooth 3D movement"
+nvidia-smi 
+"""

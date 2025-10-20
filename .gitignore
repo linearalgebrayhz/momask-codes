@@ -10,3 +10,10 @@ glove/
 log/
 
 debug/
+
+# debug files
+coordinate_debug.md
+dataset_structure.txt
+camera_prompts.txt
+dataset_vis/
+rvq_dataset_comparison/

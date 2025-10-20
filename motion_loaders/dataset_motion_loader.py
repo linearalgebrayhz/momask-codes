@@ -25,6 +25,16 @@ def get_dataset_motion_loader(opt_path, batch_size, fname, device):
         else:
             dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=4, drop_last=True,
                                     collate_fn=collate_fn, shuffle=True)
+    elif opt.dataset_name == 'realestate10k_6' or opt.dataset_name == 'realestate10k_12':
+        print('Loading dataset %s ...' % opt.dataset_name)
+        mean = np.load(pjoin(opt.meta_dir, 'mean.npy'), allow_pickle=True)
+        std = np.load(pjoin(opt.meta_dir, 'std.npy'), allow_pickle=True)
+        w_vectorizer = WordVectorizer('./glove', 'our_vab')
+        split_file = pjoin(opt.data_root, '%s.txt'%fname)
+        # print(f"opt.data_root: {opt.data_root}")
+        # exit()
+        dataset = Text2MotionDatasetEval(opt, mean, std, split_file, w_vectorizer)
+        dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=4, drop_last=True,collate_fn=collate_fn_text2motion_camera, shuffle=True) # collate fn for realestate10k_6 and realestate10k_6?
     else:
         raise KeyError('Dataset not Recognized !!')
 

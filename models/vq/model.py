@@ -1,5 +1,6 @@
 import random
 
+import torch
 import torch.nn as nn
 from models.vq.encdec import Encoder, Decoder
 from models.vq.residual_vq import ResidualVQ
@@ -94,17 +95,17 @@ class LengthEstimator(nn.Module):
         self.output = nn.Sequential(
             nn.Linear(input_size, nd),
             nn.LayerNorm(nd),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=False),  # Fixed: avoid in-place operations
 
             nn.Dropout(0.2),
             nn.Linear(nd, nd // 2),
             nn.LayerNorm(nd // 2),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=False),  # Fixed: avoid in-place operations
 
             nn.Dropout(0.2),
             nn.Linear(nd // 2, nd // 4),
             nn.LayerNorm(nd // 4),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=False),  # Fixed: avoid in-place operations
 
             nn.Linear(nd // 4, output_size)
         )
