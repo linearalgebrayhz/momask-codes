@@ -36,6 +36,10 @@ class EvaluatorModelWrapper(object):
             opt.dim_pose = 251
         elif opt.dataset_name == 'cam':
             opt.dim_pose = 5
+        elif opt.dataset_name == 'realestate10k_6':
+            opt.dim_pose = 6
+        elif opt.dataset_name == 'realestate10k_12':
+            opt.dim_pose = 12
         else:
             raise KeyError('Dataset not Recognized!!!')
 

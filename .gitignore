@@ -8,5 +8,12 @@ download_clip*
 dataset/
 glove/
 log/
+
 debug/
-test_logs/
+
+# debug files
+coordinate_debug.md
+dataset_structure.txt
+camera_prompts.txt
+dataset_vis/
+rvq_dataset_comparison/

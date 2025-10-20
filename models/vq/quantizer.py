@@ -108,13 +108,13 @@ class QuantizeEMAReset(nn.Module):
         out = self._tile(x)
         code_rand = out[:self.nb_code]
 
-        # Update centres
-        self.code_sum = self.mu * self.code_sum + (1. - self.mu) * code_sum
-        self.code_count = self.mu * self.code_count + (1. - self.mu) * code_count
+        # Update centres (avoid in-place operations)
+        self.code_sum.data = self.mu * self.code_sum.data + (1. - self.mu) * code_sum
+        self.code_count.data = self.mu * self.code_count.data + (1. - self.mu) * code_count
 
         usage = (self.code_count.view(self.nb_code, 1) >= 1.0).float()
         code_update = self.code_sum.view(self.nb_code, self.code_dim) / self.code_count.view(self.nb_code, 1)
-        self.codebook = usage * code_update + (1-usage) * code_rand
+        self.codebook.data = usage * code_update + (1-usage) * code_rand
 
 
         prob = code_count / torch.sum(code_count)
@@ -166,13 +166,13 @@ class QuantizeEMA(QuantizeEMAReset):
         code_sum = torch.matmul(code_onehot, x) # nb_code, c
         code_count = code_onehot.sum(dim=-1) # nb_code
 
-        # Update centres
-        self.code_sum = self.mu * self.code_sum + (1. - self.mu) * code_sum
-        self.code_count = self.mu * self.code_count + (1. - self.mu) * code_count
+        # Update centres (avoid in-place operations)
+        self.code_sum.data = self.mu * self.code_sum.data + (1. - self.mu) * code_sum
+        self.code_count.data = self.mu * self.code_count.data + (1. - self.mu) * code_count
 
         usage = (self.code_count.view(self.nb_code, 1) >= 1.0).float()
         code_update = self.code_sum.view(self.nb_code, self.code_dim) / self.code_count.view(self.nb_code, 1)
-        self.codebook = usage * code_update + (1-usage) * self.codebook
+        self.codebook.data = usage * code_update + (1-usage) * self.codebook.data
 
         prob = code_count / torch.sum(code_count)
         perplexity = torch.exp(-torch.sum(prob * torch.log(prob + 1e-7)))

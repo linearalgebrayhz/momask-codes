@@ -81,6 +81,24 @@ def get_opt(opt_path, device, **kwargs):
         opt.max_motion_length = 240
         opt.max_motion_frame = 240
         opt.max_motion_token = 60
+    elif opt.dataset_name == 'realestate10k_6':
+        opt.data_root = './dataset/RealEstate10K_6feat/'
+        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
+        opt.text_dir = pjoin(opt.data_root, 'texts')
+        opt.joints_num = 1
+        opt.dim_pose = 6
+        opt.max_motion_length = 240
+        opt.max_motion_frame = 240
+        opt.max_motion_token = 60
+    elif opt.dataset_name == 'realestate10k_12':
+        opt.data_root = './dataset/RealEstate10K_12feat/'
+        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
+        opt.text_dir = pjoin(opt.data_root, 'texts')
+        opt.joints_num = 1
+        opt.dim_pose = 12
+        opt.max_motion_length = 240
+        opt.max_motion_frame = 240
+        opt.max_motion_token = 60
     else:
         raise KeyError('Dataset not recognized')
     if not hasattr(opt, 'unit_length'):

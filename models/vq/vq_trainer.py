@@ -56,18 +56,69 @@ class RVQTokenizerTrainer:
 
         loss_rec = self.l1_criterion(pred_motion, motions)
         
-        if self.opt.dataset_name == 'cam':
-            # For camera data, use position and orientation separately
-            pred_pos = pred_motion[..., :3]  # x, y, z
-            gt_pos = motions[..., :3]
-            pred_ori = pred_motion[..., 3:]  # pitch, yaw
-            gt_ori = motions[..., 3:]
+        # Check if this is a camera dataset
+        is_camera_dataset = any(name in self.opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+        
+        if is_camera_dataset:
+            # For camera data, handle different feature dimensions
+            feature_dim = motions.shape[-1]
             
-            # Position loss
-            loss_pos = self.l1_criterion(pred_pos, gt_pos)
-            # Orientation loss (with angle wrapping consideration)
-            loss_ori = self.l1_criterion(pred_ori, gt_ori)
-            loss_explicit = loss_pos + loss_ori
+            if feature_dim == 5:
+                # Legacy 5-feature: [x, y, z, pitch, yaw]
+                pred_pos = pred_motion[..., :3]  # x, y, z
+                gt_pos = motions[..., :3]
+                pred_ori = pred_motion[..., 3:5]  # pitch, yaw
+                gt_ori = motions[..., 3:5]
+                
+                loss_pos = self.l1_criterion(pred_pos, gt_pos)
+                loss_ori = self.l1_criterion(pred_ori, gt_ori)
+                loss_explicit = loss_pos + loss_ori
+                
+            elif feature_dim == 6:
+                # 6-feature: [x, y, z, pitch, yaw, roll]
+                pred_pos = pred_motion[..., :3]  # x, y, z
+                gt_pos = motions[..., :3]
+                pred_ori = pred_motion[..., 3:6]  # pitch, yaw, roll
+                gt_ori = motions[..., 3:6]
+                
+                loss_pos = self.l1_criterion(pred_pos, gt_pos)
+                loss_ori = self.l1_criterion(pred_ori, gt_ori)
+                loss_explicit = loss_pos + loss_ori
+                
+            elif feature_dim == 12:
+                # 12-feature: [x, y, z, dx, dy, dz, pitch, yaw, roll, dpitch, dyaw, droll]
+                pred_pos = pred_motion[..., :3]      # x, y, z
+                pred_vel = pred_motion[..., 3:6]     # dx, dy, dz
+                pred_ori = pred_motion[..., 6:9]     # pitch, yaw, roll
+                pred_ang_vel = pred_motion[..., 9:12]  # dpitch, dyaw, droll
+                
+                gt_pos = motions[..., :3]
+                gt_vel = motions[..., 3:6]
+                gt_ori = motions[..., 6:9]
+                gt_ang_vel = motions[..., 9:12]
+                
+                # Weighted loss for different components
+                loss_pos = self.l1_criterion(pred_pos, gt_pos)
+                loss_vel = self.l1_criterion(pred_vel, gt_vel)
+                loss_ori = self.l1_criterion(pred_ori, gt_ori)
+                loss_ang_vel = self.l1_criterion(pred_ang_vel, gt_ang_vel)
+                
+                # Scale-aware weighting based on typical feature magnitudes
+                # Positions: ~1.0 scale, Velocities: ~0.01 scale, Orientations: ~0.5 scale, Angular vel: ~0.005 scale
+                pos_weight = 100.0
+                vel_weight = 10.0   # Boost velocity importance due to small scale
+                ori_weight = 2.0     # Boost orientation slightly
+                ang_vel_weight = 20.0  # Heavily boost angular velocity due to tiny scale
+                
+                loss_explicit = (pos_weight * loss_pos + 
+                               vel_weight * loss_vel + 
+                               ori_weight * loss_ori + 
+                               ang_vel_weight * loss_ang_vel) / (pos_weight + vel_weight + ori_weight + ang_vel_weight)
+                
+            else:
+                # Fallback for unknown camera data format
+                print(f"Warning: Unknown camera data format with {feature_dim} features, using simple reconstruction loss")
+                loss_explicit = loss_rec
         else:
             # For human motion data, use original local position loss
             pred_local_pos = pred_motion[..., 4 : (self.opt.joints_num - 1) * 3 + 4]
@@ -75,6 +126,17 @@ class RVQTokenizerTrainer:
             loss_explicit = self.l1_criterion(pred_local_pos, local_pos)
 
         loss = loss_rec + self.opt.loss_vel * loss_explicit + self.opt.commit * loss_commit
+        
+        # Debug NaN detection
+        if torch.isnan(loss).any() or torch.isnan(loss_explicit).any():
+            print(f"NaN detected! Feature dim: {motions.shape[-1]}, Dataset: {self.opt.dataset_name}")
+            print(f"loss_rec: {loss_rec.item():.6f}, loss_explicit: {loss_explicit.item():.6f}, loss_commit: {loss_commit.item():.6f}")
+            print(f"Motions range: [{motions.min().item():.6f}, {motions.max().item():.6f}]")
+            print(f"Pred_motion range: [{pred_motion.min().item():.6f}, {pred_motion.max().item():.6f}]")
+            if is_camera_dataset and feature_dim == 12:
+                print(f"Angular velocity range: [{motions[..., 9:12].min().item():.6f}, {motions[..., 9:12].max().item():.6f}]")
+            # Set loss to a small positive value to continue training
+            loss = torch.tensor(1e-6, device=self.device, requires_grad=True)
 
         # Visual consistency loss
         loss_lpips = torch.tensor(0.0, device=self.device)
@@ -82,7 +144,7 @@ class RVQTokenizerTrainer:
             self.visual_consistency.enabled and 
             step is not None and 
             step % getattr(self.opt, 'visual_consistency_freq', 10) == 0 and
-            self.opt.dataset_name == 'cam'):
+            is_camera_dataset):
             
             batch_size = motions.shape[0]
             total_lpips_loss = 0.0
@@ -109,7 +171,6 @@ class RVQTokenizerTrainer:
         # return loss, loss_rec, loss_vel, loss_commit, perplexity
         # return loss, loss_rec, loss_percept, loss_commit, perplexity
         return loss, loss_rec, loss_explicit, loss_commit, perplexity, loss_lpips
-        return loss, loss_rec, loss_explicit, loss_commit, perplexity
 
 
     # @staticmethod
@@ -191,7 +252,8 @@ class RVQTokenizerTrainer:
         best_orientation_error = float('inf')
         
         # if self.opt.eval_on:
-        if self.opt.dataset_name == 'cam':
+        is_camera_dataset = any(name in self.opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+        if is_camera_dataset:
             # Use camera-specific evaluation (now includes FID and other motion metrics)
             best_recon, best_smoothness, best_position_error, best_orientation_error, writer = evaluation_camera_vqvae(
                 self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, 
@@ -215,6 +277,10 @@ class RVQTokenizerTrainer:
                 loss, loss_rec, loss_vel, loss_commit, perplexity, loss_lpips = self.forward(batch_data, step=it)
                 self.opt_vq_model.zero_grad()
                 loss.backward()
+                
+                # Add gradient clipping to prevent NaN from gradient explosions
+                clip_grad_norm_(self.vq_model.parameters(), max_norm=1.0)
+                
                 self.opt_vq_model.step()
 
                 if it >= self.opt.warm_up_iter:
@@ -312,7 +378,8 @@ class RVQTokenizerTrainer:
             #     self.save(pjoin(self.opt.model_dir, 'finest.tar'), epoch, it)
             #     print('Best Validation Model So Far!~')
             # if self.opt.eval_on:
-            if self.opt.dataset_name == 'cam':
+            is_camera_dataset = any(name in self.opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+            if is_camera_dataset:
                 # Use camera-specific evaluation (now includes FID and other motion metrics)
                 best_recon, best_smoothness, best_position_error, best_orientation_error, writer = evaluation_camera_vqvae(
                     self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, 

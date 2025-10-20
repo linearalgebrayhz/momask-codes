@@ -27,8 +27,8 @@ def evaluation_vqvae(out_dir, val_loader, net, writer, ep, best_fid, best_div, b
     motion_annotation_list = []
     motion_pred_list = []
 
-    R_precision_real = 0
-    R_precision = 0
+    R_precision_real = np.zeros(3)
+    R_precision = np.zeros(3)
 
     nb_sample = 0
     matching_score_real = 0
@@ -64,19 +64,24 @@ def evaluation_vqvae(out_dir, val_loader, net, writer, ep, best_fid, best_div, b
 
         nb_sample += bs
 
-    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
-    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    # Safety check for empty motion lists (single sample debugging)
+    if motion_annotation_list and motion_pred_list:
+        motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+        motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    else:
+        print("Warning: No motion samples for evaluation, using dummy data")
+        motion_annotation_np = motion_pred_np = np.zeros((1, 512))
     gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
     mu, cov = calculate_activation_statistics(motion_pred_np)
 
     diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
     diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
 
-    R_precision_real = R_precision_real / nb_sample
-    R_precision = R_precision / nb_sample
+    R_precision_real = R_precision_real / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
+    R_precision = R_precision / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
 
-    matching_score_real = matching_score_real / nb_sample
-    matching_score_pred = matching_score_pred / nb_sample
+    matching_score_real = matching_score_real / nb_sample if nb_sample > 0 else 0.0
+    matching_score_pred = matching_score_pred / nb_sample if nb_sample > 0 else 0.0
 
     fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
 
@@ -145,8 +150,8 @@ def evaluation_vqvae_plus_mpjpe(val_loader, net, repeat_id, eval_wrapper, num_jo
     motion_annotation_list = []
     motion_pred_list = []
 
-    R_precision_real = 0
-    R_precision = 0
+    R_precision_real = np.zeros(3)
+    R_precision = np.zeros(3)
 
     nb_sample = 0
     matching_score_real = 0
@@ -199,19 +204,24 @@ def evaluation_vqvae_plus_mpjpe(val_loader, net, repeat_id, eval_wrapper, num_jo
 
         nb_sample += bs
 
-    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
-    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    # Safety check for empty motion lists (single sample debugging)
+    if motion_annotation_list and motion_pred_list:
+        motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+        motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    else:
+        print("Warning: No motion samples for evaluation, using dummy data")
+        motion_annotation_np = motion_pred_np = np.zeros((1, 512))
     gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
     mu, cov = calculate_activation_statistics(motion_pred_np)
 
     diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
     diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
 
-    R_precision_real = R_precision_real / nb_sample
-    R_precision = R_precision / nb_sample
+    R_precision_real = R_precision_real / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
+    R_precision = R_precision / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
 
-    matching_score_real = matching_score_real / nb_sample
-    matching_score_pred = matching_score_pred / nb_sample
+    matching_score_real = matching_score_real / nb_sample if nb_sample > 0 else 0.0
+    matching_score_pred = matching_score_pred / nb_sample if nb_sample > 0 else 0.0
     mpjpe = mpjpe / num_poses
 
     fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
@@ -230,8 +240,8 @@ def evaluation_vqvae_plus_l1(val_loader, net, repeat_id, eval_wrapper, num_joint
     motion_annotation_list = []
     motion_pred_list = []
 
-    R_precision_real = 0
-    R_precision = 0
+    R_precision_real = np.zeros(3)
+    R_precision = np.zeros(3)
 
     nb_sample = 0
     matching_score_real = 0
@@ -282,20 +292,25 @@ def evaluation_vqvae_plus_l1(val_loader, net, repeat_id, eval_wrapper, num_joint
 
         nb_sample += bs
 
-    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
-    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    # Safety check for empty motion lists (single sample debugging)
+    if motion_annotation_list and motion_pred_list:
+        motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+        motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    else:
+        print("Warning: No motion samples for evaluation, using dummy data")
+        motion_annotation_np = motion_pred_np = np.zeros((1, 512))
     gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
     mu, cov = calculate_activation_statistics(motion_pred_np)
 
     diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
     diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
 
-    R_precision_real = R_precision_real / nb_sample
-    R_precision = R_precision / nb_sample
+    R_precision_real = R_precision_real / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
+    R_precision = R_precision / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
 
-    matching_score_real = matching_score_real / nb_sample
-    matching_score_pred = matching_score_pred / nb_sample
-    l1_dist = l1_dist / num_poses
+    matching_score_real = matching_score_real / nb_sample if nb_sample > 0 else 0.0
+    matching_score_pred = matching_score_pred / nb_sample if nb_sample > 0 else 0.0
+    l1_dist = l1_dist / num_poses if num_poses > 0 else 0.0
 
     fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
 
@@ -315,8 +330,8 @@ def evaluation_res_plus_l1(val_loader, vq_model, res_model, repeat_id, eval_wrap
     motion_annotation_list = []
     motion_pred_list = []
 
-    R_precision_real = 0
-    R_precision = 0
+    R_precision_real = np.zeros(3)
+    R_precision = np.zeros(3)
 
     nb_sample = 0
     matching_score_real = 0
@@ -376,20 +391,25 @@ def evaluation_res_plus_l1(val_loader, vq_model, res_model, repeat_id, eval_wrap
 
         nb_sample += bs
 
-    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
-    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    # Safety check for empty motion lists (single sample debugging)
+    if motion_annotation_list and motion_pred_list:
+        motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+        motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    else:
+        print("Warning: No motion samples for evaluation, using dummy data")
+        motion_annotation_np = motion_pred_np = np.zeros((1, 512))
     gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
     mu, cov = calculate_activation_statistics(motion_pred_np)
 
     diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
     diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
 
-    R_precision_real = R_precision_real / nb_sample
-    R_precision = R_precision / nb_sample
+    R_precision_real = R_precision_real / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
+    R_precision = R_precision / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
 
-    matching_score_real = matching_score_real / nb_sample
-    matching_score_pred = matching_score_pred / nb_sample
-    l1_dist = l1_dist / num_poses
+    matching_score_real = matching_score_real / nb_sample if nb_sample > 0 else 0.0
+    matching_score_pred = matching_score_pred / nb_sample if nb_sample > 0 else 0.0
+    l1_dist = l1_dist / num_poses if num_poses > 0 else 0.0
 
     fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
 
@@ -423,8 +443,8 @@ def evaluation_mask_transformer(out_dir, val_loader, trans, vq_model, writer, ep
 
     motion_annotation_list = []
     motion_pred_list = []
-    R_precision_real = 0
-    R_precision = 0
+    R_precision_real = np.zeros(3)
+    R_precision = np.zeros(3)
     matching_score_real = 0
     matching_score_pred = 0
     time_steps = 18
@@ -473,19 +493,24 @@ def evaluation_mask_transformer(out_dir, val_loader, trans, vq_model, writer, ep
 
         nb_sample += bs
 
-    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
-    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    # Safety check for empty motion lists (single sample debugging)
+    if motion_annotation_list and motion_pred_list:
+        motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+        motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    else:
+        print("Warning: No motion samples for evaluation, using dummy data")
+        motion_annotation_np = motion_pred_np = np.zeros((1, 512))
     gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
     mu, cov = calculate_activation_statistics(motion_pred_np)
 
     diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
     diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
 
-    R_precision_real = R_precision_real / nb_sample
-    R_precision = R_precision / nb_sample
+    R_precision_real = R_precision_real / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
+    R_precision = R_precision / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
 
-    matching_score_real = matching_score_real / nb_sample
-    matching_score_pred = matching_score_pred / nb_sample
+    matching_score_real = matching_score_real / nb_sample if nb_sample > 0 else 0.0
+    matching_score_pred = matching_score_pred / nb_sample if nb_sample > 0 else 0.0
 
     fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
 
@@ -533,7 +558,7 @@ def evaluation_mask_transformer(out_dir, val_loader, trans, vq_model, writer, ep
         print(msg)
         best_top3 = R_precision[2]
 
-    if save_anim:
+    if save_anim and nb_sample > 0 and 'pred_motions' in locals():
         rand_idx = torch.randint(bs, (3,))
         data = pred_motions[rand_idx].detach().cpu().numpy()
         captions = [clip_text[k] for k in rand_idx]
@@ -542,6 +567,8 @@ def evaluation_mask_transformer(out_dir, val_loader, trans, vq_model, writer, ep
         os.makedirs(save_dir, exist_ok=True)
         # print(lengths)
         plot_func(data, save_dir, captions, lengths)
+    elif save_anim:
+        print(f"Warning: Skipping animation generation for epoch {ep} - no samples processed")
 
 
     return best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer
@@ -569,8 +596,8 @@ def evaluation_res_transformer(out_dir, val_loader, trans, vq_model, writer, ep,
 
     motion_annotation_list = []
     motion_pred_list = []
-    R_precision_real = 0
-    R_precision = 0
+    R_precision_real = np.zeros(3)
+    R_precision = np.zeros(3)
     matching_score_real = 0
     matching_score_pred = 0
 
@@ -619,19 +646,24 @@ def evaluation_res_transformer(out_dir, val_loader, trans, vq_model, writer, ep,
 
         nb_sample += bs
 
-    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
-    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    # Safety check for empty motion lists (single sample debugging)
+    if motion_annotation_list and motion_pred_list:
+        motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+        motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    else:
+        print("Warning: No motion samples for evaluation, using dummy data")
+        motion_annotation_np = motion_pred_np = np.zeros((1, 512))
     gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
     mu, cov = calculate_activation_statistics(motion_pred_np)
 
     diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
     diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
 
-    R_precision_real = R_precision_real / nb_sample
-    R_precision = R_precision / nb_sample
+    R_precision_real = R_precision_real / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
+    R_precision = R_precision / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
 
-    matching_score_real = matching_score_real / nb_sample
-    matching_score_pred = matching_score_pred / nb_sample
+    matching_score_real = matching_score_real / nb_sample if nb_sample > 0 else 0.0
+    matching_score_pred = matching_score_pred / nb_sample if nb_sample > 0 else 0.0
 
     fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
 
@@ -679,7 +711,7 @@ def evaluation_res_transformer(out_dir, val_loader, trans, vq_model, writer, ep,
         print(msg)
         best_top3 = R_precision[2]
 
-    if save_anim:
+    if save_anim and nb_sample > 0 and 'pred_motions' in locals():
         rand_idx = torch.randint(bs, (3,))
         data = pred_motions[rand_idx].detach().cpu().numpy()
         captions = [clip_text[k] for k in rand_idx]
@@ -688,6 +720,8 @@ def evaluation_res_transformer(out_dir, val_loader, trans, vq_model, writer, ep,
         os.makedirs(save_dir, exist_ok=True)
         # print(lengths)
         plot_func(data, save_dir, captions, lengths)
+    elif save_anim:
+        print(f"Warning: Skipping animation generation for epoch {ep} - no samples processed")
 
 
     return best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer
@@ -703,8 +737,8 @@ def evaluation_res_transformer_plus_l1(val_loader, vq_model, trans, repeat_id, e
 
     motion_annotation_list = []
     motion_pred_list = []
-    R_precision_real = 0
-    R_precision = 0
+    R_precision_real = np.zeros(3)
+    R_precision = np.zeros(3)
     matching_score_real = 0
     matching_score_pred = 0
 
@@ -765,20 +799,25 @@ def evaluation_res_transformer_plus_l1(val_loader, vq_model, trans, repeat_id, e
 
         nb_sample += bs
 
-    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
-    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    # Safety check for empty motion lists (single sample debugging)
+    if motion_annotation_list and motion_pred_list:
+        motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+        motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    else:
+        print("Warning: No motion samples for evaluation, using dummy data")
+        motion_annotation_np = motion_pred_np = np.zeros((1, 512))
     gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
     mu, cov = calculate_activation_statistics(motion_pred_np)
 
     diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
     diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
 
-    R_precision_real = R_precision_real / nb_sample
-    R_precision = R_precision / nb_sample
+    R_precision_real = R_precision_real / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
+    R_precision = R_precision / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
 
-    matching_score_real = matching_score_real / nb_sample
-    matching_score_pred = matching_score_pred / nb_sample
-    l1_dist = l1_dist / num_poses
+    matching_score_real = matching_score_real / nb_sample if nb_sample > 0 else 0.0
+    matching_score_pred = matching_score_pred / nb_sample if nb_sample > 0 else 0.0
+    l1_dist = l1_dist / num_poses if num_poses > 0 else 0.0
 
     fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
 
@@ -799,8 +838,8 @@ def evaluation_mask_transformer_test(val_loader, vq_model, trans, repeat_id, eva
     motion_annotation_list = []
     motion_pred_list = []
     motion_multimodality = []
-    R_precision_real = 0
-    R_precision = 0
+    R_precision_real = np.zeros(3)
+    R_precision = np.zeros(3)
     matching_score_real = 0
     matching_score_pred = 0
     multimodality = 0
@@ -869,8 +908,13 @@ def evaluation_mask_transformer_test(val_loader, vq_model, trans, repeat_id, eva
 
         nb_sample += bs
 
-    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
-    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    # Safety check for empty motion lists (single sample debugging)
+    if motion_annotation_list and motion_pred_list:
+        motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+        motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    else:
+        print("Warning: No motion samples for evaluation, using dummy data")
+        motion_annotation_np = motion_pred_np = np.zeros((1, 512))
     if not force_mask and cal_mm:
         motion_multimodality = torch.cat(motion_multimodality, dim=0).cpu().numpy()
         multimodality = calculate_multimodality(motion_multimodality, 10)
@@ -880,11 +924,11 @@ def evaluation_mask_transformer_test(val_loader, vq_model, trans, repeat_id, eva
     diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
     diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
 
-    R_precision_real = R_precision_real / nb_sample
-    R_precision = R_precision / nb_sample
+    R_precision_real = R_precision_real / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
+    R_precision = R_precision / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
 
-    matching_score_real = matching_score_real / nb_sample
-    matching_score_pred = matching_score_pred / nb_sample
+    matching_score_real = matching_score_real / nb_sample if nb_sample > 0 else 0.0
+    matching_score_pred = matching_score_pred / nb_sample if nb_sample > 0 else 0.0
 
     fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
 
@@ -908,8 +952,8 @@ def evaluation_mask_transformer_test_plus_res(val_loader, vq_model, res_model, t
     motion_annotation_list = []
     motion_pred_list = []
     motion_multimodality = []
-    R_precision_real = 0
-    R_precision = 0
+    R_precision_real = np.zeros(3)
+    R_precision = np.zeros(3)
     matching_score_real = 0
     matching_score_pred = 0
     multimodality = 0
@@ -989,8 +1033,13 @@ def evaluation_mask_transformer_test_plus_res(val_loader, vq_model, res_model, t
 
         nb_sample += bs
 
-    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
-    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    # Safety check for empty motion lists (single sample debugging)
+    if motion_annotation_list and motion_pred_list:
+        motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+        motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    else:
+        print("Warning: No motion samples for evaluation, using dummy data")
+        motion_annotation_np = motion_pred_np = np.zeros((1, 512))
     if not force_mask and cal_mm:
         motion_multimodality = torch.cat(motion_multimodality, dim=0).cpu().numpy()
         multimodality = calculate_multimodality(motion_multimodality, 10)
@@ -1000,11 +1049,11 @@ def evaluation_mask_transformer_test_plus_res(val_loader, vq_model, res_model, t
     diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
     diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
 
-    R_precision_real = R_precision_real / nb_sample
-    R_precision = R_precision / nb_sample
+    R_precision_real = R_precision_real / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
+    R_precision = R_precision / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
 
-    matching_score_real = matching_score_real / nb_sample
-    matching_score_pred = matching_score_pred / nb_sample
+    matching_score_real = matching_score_real / nb_sample if nb_sample > 0 else 0.0
+    matching_score_pred = matching_score_pred / nb_sample if nb_sample > 0 else 0.0
 
     fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
 

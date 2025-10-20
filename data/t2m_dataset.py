@@ -131,6 +131,18 @@ class MotionDataset(data.Dataset):
                 np.save(pjoin(opt.meta_dir, 'mean.npy'), mean)
                 np.save(pjoin(opt.meta_dir, 'std.npy'), std)
             assert mean.shape[-1] == 5, f"Expected 5 features for cam dataset, got {mean.shape[-1]}"
+        elif opt.dataset_name == "realestate10k_6":
+            if opt.is_train:
+                # Save updated mean and std to meta_dir for realestate10k_6
+                np.save(pjoin(opt.meta_dir, 'mean.npy'), mean)
+                np.save(pjoin(opt.meta_dir, 'std.npy'), std)
+            assert mean.shape[-1] == 6, f"Expected 6 features for realestate10k_6 dataset, got {mean.shape[-1]}"
+        elif opt.dataset_name == "realestate10k_12":
+            if opt.is_train:
+                # Save updated mean and std to meta_dir for realestate10k_12
+                np.save(pjoin(opt.meta_dir, 'mean.npy'), mean)
+                np.save(pjoin(opt.meta_dir, 'std.npy'), std)
+            assert mean.shape[-1] == 12, f"Expected 12 features for realestate10k_12 dataset, got {mean.shape[-1]}"
         else: 
             if opt.is_train:
                 # root_rot_velocity (B, seq_len, 1)
@@ -202,9 +214,10 @@ class Text2MotionDatasetEval(data.Dataset):
         
         new_name_list = []
         length_list = []
-        if opt.dataset_name == "cam":
+        if opt.dataset_name == "cam" or opt.dataset_name == "realestate10k_6" or opt.dataset_name == "realestate10k_12":
             for name in tqdm(id_list):
                 try:
+                    # import pdb; pdb.set_trace()
                     motion_path = pjoin(opt.motion_dir, name + '.npy')
                     text_path = pjoin(opt.text_dir, name + '.txt')
                     motion = np.load(motion_path)
@@ -355,7 +368,12 @@ class Text2MotionDatasetEval(data.Dataset):
         motion = motion[idx:idx+m_length]
 
         "Z Normalization"
+        # import pdb; pdb.set_trace()
+        # print(f"Motion shape: {motion.shape}")
+        # print(f"Mean shape: {self.mean.shape}")
+        # print(f"Std shape: {self.std.shape}")
         motion = (motion - self.mean) / self.std
+
 
         if m_length < self.max_motion_length:
             motion = np.concatenate([motion,
@@ -383,7 +401,7 @@ class Text2MotionDataset(data.Dataset):
 
         new_name_list = []
         length_list = []
-        if opt.dataset_name == "cam":
+        if opt.dataset_name == "cam" or opt.dataset_name == "realestate10k_6" or opt.dataset_name == "realestate10k_12":
             # Camera dataset: text files have format "caption#tokens" (2 fields)
             for name in tqdm(id_list):
                 try:

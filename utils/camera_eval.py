@@ -110,6 +110,8 @@ def evaluation_camera_vqvae(out_dir, val_loader, net, writer, ep, best_recon, be
     """
     net.eval()
     
+    print(f"Starting evaluation with {len(val_loader)} batches in val_loader")
+    
     # Camera-specific metrics
     total_recon_loss = 0
     total_position_error = 0
@@ -131,33 +133,50 @@ def evaluation_camera_vqvae(out_dir, val_loader, net, writer, ep, best_recon, be
     trajectory_log_count = 0
     max_trajectory_logs = 5  # Log first 5 trajectories per epoch
     
+    batch_count = 0
     for batch in val_loader:
-        word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token = batch
-        motion = motion.cuda()
+        batch_count += 1
+        print(f"Processing batch {batch_count}, batch type: {type(batch)}")
         
-        # Get co-embeddings for standard motion metrics
-        et, em = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, motion, m_length)
-        bs, seq = motion.shape[0], motion.shape[1]
+        # Handle different batch formats - VQ training vs text-to-motion evaluation
+        if isinstance(batch, torch.Tensor):
+            # VQ training format: just motion tensor
+            motion = batch.cuda()
+            bs, seq = motion.shape[0], motion.shape[1]
+            m_length = [seq] * bs  # All sequences have full length
+            
+            # Skip text-based evaluation metrics for VQ training
+            skip_text_metrics = True
+            word_embeddings = pos_one_hots = caption = sent_len = token = None
+        else:
+            # Text-to-motion format: full batch with text data
+            word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token = batch
+            motion = motion.cuda()
+            bs, seq = motion.shape[0], motion.shape[1]
+            skip_text_metrics = False
         
         # Forward pass
         pred_motion, loss_commit, perplexity = net(motion)
         
-        # Get co-embeddings for predictions
-        et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_motion, m_length)
+        if not skip_text_metrics:
+            # Get co-embeddings for standard motion metrics (only for text-to-motion)
+            et, em = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, motion, m_length)
+            et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_motion, m_length)
+            
+            # Add to motion lists for FID/diversity calculation
+            motion_pred_list.append(em_pred)
+            motion_annotation_list.append(em)
         
-        # Add to motion lists for FID/diversity calculation
-        motion_pred_list.append(em_pred)
-        motion_annotation_list.append(em)
-        
-        # Calculate R-precision and matching score
-        temp_R = calculate_R_precision(et.cpu().numpy(), em.cpu().numpy(), top_k=3, sum_all=True)
-        temp_match = euclidean_distance_matrix(et.cpu().numpy(), em.cpu().numpy()).trace()
-        R_precision_real += temp_R
-        matching_score_real += temp_match
-        temp_R = calculate_R_precision(et_pred.cpu().numpy(), em_pred.cpu().numpy(), top_k=3, sum_all=True)
-        temp_match = euclidean_distance_matrix(et_pred.cpu().numpy(), em_pred.cpu().numpy()).trace()
-        R_precision += temp_R
-        matching_score_pred += temp_match
+        if not skip_text_metrics:
+            # Calculate R-precision and matching score (only for text-to-motion)
+            temp_R = calculate_R_precision(et.cpu().numpy(), em.cpu().numpy(), top_k=3, sum_all=True)
+            temp_match = euclidean_distance_matrix(et.cpu().numpy(), em.cpu().numpy()).trace()
+            R_precision_real += temp_R
+            matching_score_real += temp_match
+            temp_R = calculate_R_precision(et_pred.cpu().numpy(), em_pred.cpu().numpy(), top_k=3, sum_all=True)
+            temp_match = euclidean_distance_matrix(et_pred.cpu().numpy(), em_pred.cpu().numpy()).trace()
+            R_precision += temp_R
+            matching_score_pred += temp_match
         
         # Convert to numpy for metric calculation
         pred_np = pred_motion.detach().cpu().numpy()
@@ -177,11 +196,12 @@ def evaluation_camera_vqvae(out_dir, val_loader, net, writer, ep, best_recon, be
             
             # Log trajectory to tensorboard (limit to first few per epoch)
             if trajectory_log_count < max_trajectory_logs and draw:
+                caption_text = "VQ Training Sample" if skip_text_metrics else (caption[i] if i < len(caption) else "No caption")
                 log_trajectory_to_tensorboard(
                     writer, 
                     gt_data, 
                     pred_data, 
-                    caption[i] if i < len(caption) else "No caption",
+                    caption_text,
                     ep, 
                     trajectory_log_count
                 )
@@ -193,28 +213,44 @@ def evaluation_camera_vqvae(out_dir, val_loader, net, writer, ep, best_recon, be
         
         nb_sample += bs
     
-    # Calculate standard motion metrics
-    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
-    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
-    gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
-    mu, cov = calculate_activation_statistics(motion_pred_np)
-    
-    diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
-    diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
-    
-    R_precision_real = R_precision_real / nb_sample
-    R_precision = R_precision / nb_sample
-    matching_score_real = matching_score_real / nb_sample
-    matching_score_pred = matching_score_pred / nb_sample
+    # Calculate standard motion metrics (only if we have text-based data)
+    if motion_annotation_list and motion_pred_list:
+        motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+        motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+        gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
+        mu, cov = calculate_activation_statistics(motion_pred_np)
+        
+        diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
+        diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
+        
+        R_precision_real = R_precision_real / nb_sample
+        R_precision = R_precision / nb_sample
+        matching_score_real = matching_score_real / nb_sample
+        matching_score_pred = matching_score_pred / nb_sample
+    else:
+        # For VQ training without text data, set default values
+        gt_mu = mu = np.zeros(512)  # Default embedding size
+        gt_cov = cov = np.eye(512)
+        diversity_real = diversity = 0.0
+        R_precision_real = R_precision = 0.0
+        matching_score_real = matching_score_pred = 0.0
     
     fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
     
-    # Average camera-specific metrics
-    avg_recon_loss = total_recon_loss / nb_sample
-    avg_position_error = total_position_error / nb_sample
-    avg_orientation_error = total_orientation_error / nb_sample
-    avg_smoothness = total_smoothness / nb_sample
-    avg_velocity_error = total_velocity_error / nb_sample
+    # Average camera-specific metrics (with safety check for division by zero)
+    if nb_sample > 0:
+        avg_recon_loss = total_recon_loss / nb_sample
+        avg_position_error = total_position_error / nb_sample
+        avg_orientation_error = total_orientation_error / nb_sample
+        avg_smoothness = total_smoothness / nb_sample
+        avg_velocity_error = total_velocity_error / nb_sample
+    else:
+        print("Warning: No samples processed in validation, setting metrics to 0")
+        avg_recon_loss = 0.0
+        avg_position_error = 0.0
+        avg_orientation_error = 0.0
+        avg_smoothness = 0.0
+        avg_velocity_error = 0.0
     
     # Ensure R_precision is an array
     if not isinstance(R_precision, np.ndarray):
