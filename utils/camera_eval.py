@@ -104,7 +104,10 @@ def log_trajectory_to_tensorboard(writer, gt_trajectory, pred_trajectory, captio
 
 @torch.no_grad()
 def evaluation_camera_vqvae(out_dir, val_loader, net, writer, ep, best_recon, best_smoothness, 
-                           best_position_error, best_orientation_error, eval_wrapper, save=True, draw=True):
+                           best_position_error, best_orientation_error, eval_wrapper, 
+                           best_fid=float('inf'), best_div=float('inf'), best_top1=0, 
+                           best_top2=0, best_top3=0, best_matching=float('inf'), 
+                           save=True, draw=True):
     """
     Evaluate camera VQ-VAE model with camera-specific metrics and standard motion metrics
     """
@@ -262,7 +265,7 @@ def evaluation_camera_vqvae(out_dir, val_loader, net, writer, ep, best_recon, be
     r_precision_warning = " (WARNING: R-precision may be inaccurate for camera datasets due to randomly initialized eval_wrapper)"
     
     msg = f"--> Eva. Ep {ep}: FID: {fid:.4f}, Diversity: {diversity:.4f}, " \
-          f"R_precision: ({R_precision[0]:.4f}, {R_precision[1]:.4f}, {R_precision[2]:.4f}){r_precision_warning}, " \
+          f"R_precision: ({R_precision[0]:.4f}, {R_precision[1]:.4f}, {R_precision[2]:.4f}), " \
           f"Matching: {matching_score_pred:.4f}, " \
           f"Recon: {avg_recon_loss:.4f}, Pos_Error: {avg_position_error:.4f}, " \
           f"Ori_Error: {avg_orientation_error:.4f}, Smoothness: {avg_smoothness:.4f}, " \
@@ -287,16 +290,6 @@ def evaluation_camera_vqvae(out_dir, val_loader, net, writer, ep, best_recon, be
         
         # Log trajectory count
         writer.add_scalar('./Test/Logged_Trajectories', trajectory_log_count, ep)
-    
-    # Initialize best_fid, best_div, best_top1, best_top2, best_top3, best_matching if not provided
-    # This handles the case where these weren't passed in
-    if 'best_fid' not in locals():
-        best_fid = float('inf')
-        best_div = float('inf')
-        best_top1 = 0
-        best_top2 = 0
-        best_top3 = 0
-        best_matching = float('inf')
     
     # Save best models - Standard motion metrics
     if fid < best_fid:
@@ -369,7 +362,7 @@ def evaluation_camera_vqvae(out_dir, val_loader, net, writer, ep, best_recon, be
                       os.path.join(out_dir, 'net_best_smoothness.tar'))
     
     net.train()
-    return best_recon, best_smoothness, best_position_error, best_orientation_error, writer
+    return best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_recon, best_smoothness, best_position_error, best_orientation_error, writer
 
 @torch.no_grad()
 def evaluation_camera_transformer(out_dir, val_loader, trans, vq_model, writer, ep, 

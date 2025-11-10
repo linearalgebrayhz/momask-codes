@@ -35,4 +35,11 @@ class EvalT2MOptions(BaseOptions):
         self.parser.add_argument('--source_motion', default='example_data/000612.npy', type=str, help="Source motion path for editing. (new_joint_vecs format .npy file)")
         self.parser.add_argument("--motion_length", default=0, type=int,
                                  help="Motion length for generation, only applicable with single text prompt.")
+        
+        '''Keyframe Conditioning (Inference)'''
+        self.parser.add_argument('--keyframe_dir', type=str, default=None, help='Directory containing keyframe images (jpg/png)')
+        self.parser.add_argument('--keyframe_indices', type=str, default=None, 
+                                help='Comma-separated frame indices for keyframes (e.g., "0,30,60,90"). Must match number of images in keyframe_dir')
+        self.parser.add_argument('--use_keyframes', action="store_true", help='Enable keyframe conditioning during inference')
+        
         self.is_train = False

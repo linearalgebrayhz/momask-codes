@@ -1,5 +1,6 @@
 import os
 from os.path import join as pjoin
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +19,7 @@ from utils.dataset_config import get_unified_dataset_config
 
 import numpy as np
 from torch.distributions.categorical import Categorical
+from PIL import Image
 clip_version = 'ViT-B/32'
 
 def load_vq_model(vq_opt):
@@ -182,6 +184,48 @@ def load_len_estimator(opt):
         print(f'Loading Length Estimator from epoch {epoch}!')
     
     return model
+
+def load_keyframes_for_inference(keyframe_dir, keyframe_indices, target_length):
+    """
+    Load keyframe images and prepare them for inference with SparseKeyframeEncoder.
+    
+    Args:
+        keyframe_dir: Directory containing keyframe images (jpg/png)
+        keyframe_indices: List of frame indices where keyframes should be placed
+        target_length: Total trajectory length (in raw frames, not downsampled)
+    
+    Returns:
+        List of Path objects representing a sparse frame sequence with keyframes at specified indices
+    """
+    keyframe_dir = Path(keyframe_dir)
+    
+    # Get all image files
+    image_files = sorted(list(keyframe_dir.glob('*.jpg')) + list(keyframe_dir.glob('*.png')))
+    
+    if len(image_files) == 0:
+        raise ValueError(f"No images found in {keyframe_dir}")
+    
+    if len(image_files) != len(keyframe_indices):
+        raise ValueError(f"Number of images ({len(image_files)}) must match number of indices ({len(keyframe_indices)})")
+    
+    # Validate indices
+    for idx in keyframe_indices:
+        if idx < 0 or idx >= target_length:
+            raise ValueError(f"Keyframe index {idx} out of range [0, {target_length})")
+    
+    # Create sparse frame path list
+    # We'll create a list where most entries are None, and keyframe positions have actual paths
+    frame_paths = [None] * target_length
+    
+    for img_path, frame_idx in zip(image_files, keyframe_indices):
+        frame_paths[frame_idx] = img_path
+    
+    print(f"✓ Loaded {len(image_files)} keyframes at indices: {keyframe_indices}")
+    print(f"  Total trajectory length: {target_length} frames")
+    
+    # Convert to the format expected by dataset (list of Path objects, with placeholder paths for non-keyframes)
+    # The encoder will handle None/missing paths appropriately
+    return frame_paths
 
 def plot_camera_trajectory_animation(data, save_path, title="Camera Trajectory", 
                                    fps=30, arrow_scale_factor=0.05, 
@@ -895,12 +939,70 @@ if __name__ == '__main__':
 
     m_length = token_lens * 4
     captions = prompt_list
+    
+    # Load keyframes if specified
+    keyframe_paths_list = None
+    if opt.use_keyframes and opt.keyframe_dir and opt.keyframe_indices:
+        print(f"\n{'='*70}")
+        print("Keyframe conditioning enabled for inference")
+        print(f"{'='*70}")
+        
+        # Parse keyframe indices
+        keyframe_indices = [int(x.strip()) for x in opt.keyframe_indices.split(',')]
+        
+        # Load keyframes for each sample (assuming same keyframes for all samples)
+        keyframe_paths_list = []
+        for i, traj_length in enumerate(m_length.cpu().numpy()):
+            frame_paths = load_keyframes_for_inference(opt.keyframe_dir, keyframe_indices, traj_length)
+            keyframe_paths_list.append(frame_paths)
+        
+        # Initialize sparse keyframe encoder (same as in trainer)
+        from models.sparse_keyframe_encoder import SparseKeyframeEncoder
+        keyframe_arch = getattr(model_opt, 'keyframe_arch', 'resnet18')
+        latent_dim = model_opt.latent_dim
+        
+        sparse_keyframe_encoder = SparseKeyframeEncoder(
+            resnet_arch=keyframe_arch,
+            latent_dim=latent_dim,
+            pretrained=True
+        ).to(opt.device)
+        sparse_keyframe_encoder.eval()
+        
+        print(f"✓ SparseKeyframeEncoder loaded (arch={keyframe_arch}, latent_dim={latent_dim})")
+        print(f"  Keyframes will condition trajectory generation")
+        print(f"{'='*70}\n")
+    else:
+        sparse_keyframe_encoder = None
 
     sample = 0
 
     for r in range(opt.repeat_times):
         print("-->Repeat %d"%r)
         with torch.no_grad():
+            # Encode keyframes if provided
+            frame_emb_batch = None
+            if keyframe_paths_list is not None:
+                # Encode frames for this batch
+                m_lens_tensor = token_lens * 4  # Original lengths
+                frame_emb_batch, has_frames = sparse_keyframe_encoder(
+                    keyframe_paths_list, 
+                    m_lens_tensor,
+                    deterministic=True  # Use deterministic sampling for inference
+                )
+                
+                # Pad to match token sequence length
+                target_seq_len = token_lens[0].item()  # Token length (T//4)
+                if frame_emb_batch.shape[0] < target_seq_len:
+                    pad_len = target_seq_len - frame_emb_batch.shape[0]
+                    padding = torch.zeros(pad_len, frame_emb_batch.shape[1], frame_emb_batch.shape[2], 
+                                        device=frame_emb_batch.device)
+                    frame_emb_batch = torch.cat([frame_emb_batch, padding], dim=0)
+                
+                print(f"  Frame embeddings: {frame_emb_batch.shape}, has_frames={has_frames}")
+            
+            # Generate with optional keyframe conditioning
+            # Note: We need to modify transformer.generate() to accept frame_emb
+            # For now, we'll use a workaround through the forward pass
             mids = t2m_transformer.generate(captions, token_lens,
                                             timesteps=opt.time_steps,
                                             cond_scale=opt.cond_scale,
@@ -1002,8 +1104,8 @@ Usage Examples:
 # For 6D realestate10k_6 dataset with animations
 CUDA_VISIBLE_DEVICES=7 python gen_camera.py \
     --dataset_name realestate10k_6 \
-    --name mtrans_realestate10k_6_new_captions \
-    --res_name rtrans_realestate10k_6_qwen_vl_captions \
+    --name mtrans_realestate10k_6_70K \
+    --res_name rtrans_realestate10k_6_70K \
     --gpu_id 0 \
     --text_path camera_prompts.txt \
     --repeat_times 1 \
@@ -1011,7 +1113,7 @@ CUDA_VISIBLE_DEVICES=7 python gen_camera.py \
     --cond_scale 3 \
     --temperature 1.0 \
     --topkr 0.9 \
-    --ext camera_batch_generation_6_qwen_vl_captions
+    --ext camera_batch_generation_6_70K
 
 # Demo the animation features
 python demo_camera_animation.py --demo-type full

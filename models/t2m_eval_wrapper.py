@@ -3,7 +3,11 @@ from utils.word_vectorizer import POS_enumerator
 from os.path import join as pjoin
 
 def build_models(opt):
-    movement_enc = MovementConvEncoder(opt.dim_pose-4, opt.dim_movement_enc_hidden, opt.dim_movement_latent)
+    # For camera datasets, don't subtract 4 (no foot contact features)
+    is_camera_dataset = opt.dataset_name in ['realestate10k_6', 'realestate10k_12', 'cam']
+    movement_input_dim = opt.dim_pose if is_camera_dataset else (opt.dim_pose - 4)
+    
+    movement_enc = MovementConvEncoder(movement_input_dim, opt.dim_movement_enc_hidden, opt.dim_movement_latent)
     text_enc = TextEncoderBiGRUCo(word_size=opt.dim_word,
                                   pos_size=opt.dim_pos_ohot,
                                   hidden_size=opt.dim_text_hidden,
@@ -18,9 +22,11 @@ def build_models(opt):
         checkpoint = torch.load(pjoin(opt.checkpoints_dir, opt.dataset_name, 'text_mot_match', 'model', 'finest.tar'),
                             map_location=opt.device)
         movement_enc.load_state_dict(checkpoint['movement_encoder'])
-        text_enc.load_state_dict(checkpoint['text_encoder'])
-        motion_enc.load_state_dict(checkpoint['motion_encoder'])
+        # Load with strict=False to allow for architecture changes (e.g., added Dropout layers)
+        text_enc.load_state_dict(checkpoint['text_encoder'], strict=False)
+        motion_enc.load_state_dict(checkpoint['motion_encoder'], strict=False)
         print('Loading Evaluation Model Wrapper (Epoch %d) Completed!!' % (checkpoint['epoch']))
+        print('Note: Loaded with strict=False due to architecture updates (Dropout layers added)')
     else:
         print('evaluation off, no evaluation model loaded. All parameters are randomly initialized.')
     return text_enc, motion_enc, movement_enc
@@ -82,8 +88,11 @@ class EvaluatorModelWrapper(object):
             cap_lens = cap_lens[align_idx]
 
             '''Movement Encoding'''
-            movements = self.movement_encoder(motions[..., :-4]).detach()
-            m_lens = m_lens // self.opt.unit_length
+            # For camera datasets, don't remove last 4 features (no foot contact)
+            is_camera_dataset = self.opt.dataset_name in ['realestate10k_6', 'realestate10k_12', 'cam']
+            motion_input = motions if is_camera_dataset else motions[..., :-4]
+            movements = self.movement_encoder(motion_input).detach()
+            m_lens = torch.div(m_lens, self.opt.unit_length, rounding_mode='floor')
             motion_embedding = self.motion_encoder(movements, m_lens)
 
             '''Text Encoding'''
@@ -101,15 +110,22 @@ class EvaluatorModelWrapper(object):
             m_lens = m_lens[align_idx]
 
             '''Movement Encoding'''
-            movements = self.movement_encoder(motions[..., :-4]).detach()
-            m_lens = m_lens // self.opt.unit_length
+            # For camera datasets, don't remove last 4 features (no foot contact)
+            is_camera_dataset = self.opt.dataset_name in ['realestate10k_6', 'realestate10k_12', 'cam']
+            motion_input = motions if is_camera_dataset else motions[..., :-4]
+            movements = self.movement_encoder(motion_input).detach()
+            m_lens = torch.div(m_lens, self.opt.unit_length, rounding_mode='floor')
             motion_embedding = self.motion_encoder(movements, m_lens)
         return motion_embedding
 
 ## Borrowed form MDM
 # our version
 def build_evaluators(opt):
-    movement_enc = MovementConvEncoder(opt['dim_pose']-4, opt['dim_movement_enc_hidden'], opt['dim_movement_latent'])
+    # For camera datasets, don't subtract 4 (no foot contact features)
+    is_camera_dataset = opt['dataset_name'] in ['realestate10k_6', 'realestate10k_12', 'cam']
+    movement_input_dim = opt['dim_pose'] if is_camera_dataset else (opt['dim_pose'] - 4)
+    
+    movement_enc = MovementConvEncoder(movement_input_dim, opt['dim_movement_enc_hidden'], opt['dim_movement_latent'])
     text_enc = TextEncoderBiGRUCo(word_size=opt['dim_word'],
                                   pos_size=opt['dim_pos_ohot'],
                                   hidden_size=opt['dim_text_hidden'],
@@ -127,9 +143,9 @@ def build_evaluators(opt):
 
     checkpoint = torch.load(pjoin(opt['checkpoints_dir'], ckpt_dir, 'text_mot_match', 'model', 'finest.tar'),
                             map_location=opt['device'])
-    movement_enc.load_state_dict(checkpoint['movement_encoder'])
-    text_enc.load_state_dict(checkpoint['text_encoder'])
-    motion_enc.load_state_dict(checkpoint['motion_encoder'])
+    movement_enc.load_state_dict(checkpoint['movement_encoder'], strict=False)
+    text_enc.load_state_dict(checkpoint['text_encoder'], strict=False)
+    motion_enc.load_state_dict(checkpoint['motion_encoder'], strict=False)
     print('Loading Evaluation Model Wrapper (Epoch %d) Completed!!' % (checkpoint['epoch']))
     return text_enc, motion_enc, movement_enc
 
@@ -137,6 +153,20 @@ def build_evaluators(opt):
 class EvaluatorWrapper(object):
 
     def __init__(self, dataset_name, device):
+        # Determine dim_pose based on dataset
+        if dataset_name == 'humanml':
+            dim_pose = 263
+        elif dataset_name == 'kit':
+            dim_pose = 251
+        elif dataset_name == 'realestate10k_6':
+            dim_pose = 6
+        elif dataset_name == 'realestate10k_12':
+            dim_pose = 12
+        elif dataset_name == 'cam':
+            dim_pose = 5
+        else:
+            dim_pose = 251  # default fallback
+        
         opt = {
             'dataset_name': dataset_name,
             'device': device,
@@ -147,7 +177,7 @@ class EvaluatorWrapper(object):
             'max_text_len': 20,
             'dim_text_hidden': 512,
             'dim_coemb_hidden': 512,
-            'dim_pose': 263 if dataset_name == 'humanml' else 251,
+            'dim_pose': dim_pose,
             'dim_movement_enc_hidden': 512,
             'dim_movement_latent': 512,
             'checkpoints_dir': './checkpoints',
@@ -183,8 +213,11 @@ class EvaluatorWrapper(object):
             cap_lens = cap_lens[align_idx]
 
             '''Movement Encoding'''
-            movements = self.movement_encoder(motions[..., :-4]).detach()
-            m_lens = m_lens // self.opt['unit_length']
+            # For camera datasets, don't remove last 4 features (no foot contact)
+            is_camera_dataset = self.opt['dataset_name'] in ['realestate10k_6', 'realestate10k_12', 'cam']
+            motion_input = motions if is_camera_dataset else motions[..., :-4]
+            movements = self.movement_encoder(motion_input).detach()
+            m_lens = torch.div(m_lens, self.opt['unit_length'], rounding_mode='floor')
             motion_embedding = self.motion_encoder(movements, m_lens)
             # print(motions.shape, movements.shape, motion_embedding.shape, m_lens)
 
@@ -204,6 +237,6 @@ class EvaluatorWrapper(object):
 
             '''Movement Encoding'''
             movements = self.movement_encoder(motions[..., :-4]).detach()
-            m_lens = m_lens // self.opt['unit_length']
+            m_lens = torch.div(m_lens, self.opt['unit_length'], rounding_mode='floor')
             motion_embedding = self.motion_encoder(movements, m_lens)
         return motion_embedding

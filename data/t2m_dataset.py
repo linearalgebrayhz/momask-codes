@@ -99,6 +99,52 @@ def collate_fn_text2motion_camera_train(batch):
     # Use default collate on the padded batch
     return default_collate(padded_batch)
 
+
+def collate_fn_text2motion_camera_train_frames(batch):
+    """
+    Custom collate function for Text2MotionDataset with camera trajectories and frames (training).
+    Pads all motions to the maximum length in the batch and handles frame paths.
+    Expected format: (caption, motion, m_length, frame_paths)
+    """
+    # Check if batch includes frames
+    has_frames = len(batch[0]) == 4
+    
+    if not has_frames:
+        # Fallback to original collate
+        return collate_fn_text2motion_camera_train(batch)
+    
+    # Sort by length (descending) to get the maximum length first
+    batch.sort(key=lambda x: x[2], reverse=True)  # m_length is at index 2
+    
+    # Get the maximum length in this batch
+    max_len = batch[0][2]  # motion length is at index 2
+    
+    # Separate components
+    captions = []
+    motions = []
+    m_lengths = []
+    frame_paths_list = []
+    
+    for item in batch:
+        caption, motion, m_length, frame_paths = item
+        
+        # Pad motion to max_len
+        if motion.shape[0] < max_len:
+            padding = np.zeros((max_len - motion.shape[0], motion.shape[1]))
+            motion = np.concatenate([motion, padding], axis=0)
+        
+        captions.append(caption)
+        motions.append(motion)
+        m_lengths.append(m_length)
+        frame_paths_list.append(frame_paths)
+    
+    # Convert to tensors
+    motions = torch.from_numpy(np.stack(motions, axis=0))
+    m_lengths = torch.tensor(m_lengths)
+    
+    return captions, motions, m_lengths, frame_paths_list
+
+
 class MotionDataset(data.Dataset):
     def __init__(self, opt, mean, std, split_file):
         self.opt = opt
@@ -385,12 +431,30 @@ class Text2MotionDatasetEval(data.Dataset):
 
 
 class Text2MotionDataset(data.Dataset):
-    def __init__(self, opt, mean, std, split_file):
+    def __init__(self, opt, mean, std, split_file, load_frames=False):
         self.opt = opt
         self.max_length = 20
         self.pointer = 0
         self.max_motion_length = opt.max_motion_length
         min_motion_len = 40 if self.opt.dataset_name =='t2m' else 24
+        
+        # Frame loading configuration
+        self.load_frames = load_frames
+        if load_frames:
+            import json
+            from pathlib import Path
+            
+            # Use configurable frame directory
+            frame_dir_str = getattr(opt, 'frame_dir', 
+                                    '/data4/haozhe/CamTraj/data/processed_estate/train_frames')
+            self.frame_dir = Path(frame_dir_str)
+            
+            scene_id_mapping_path = Path(opt.data_root) / 'scene_id_mapping.json'
+            with open(scene_id_mapping_path) as f:
+                self.scene_id_mapping = json.load(f)
+            
+            print(f"Frame loading enabled. Frame dir: {self.frame_dir}")
+            print(f"Scene ID mapping: {len(self.scene_id_mapping)} scenes")
 
         data_dict = {}
         id_list = []
@@ -398,12 +462,18 @@ class Text2MotionDataset(data.Dataset):
             for line in f.readlines():
                 id_list.append(line.strip())
         # id_list = id_list[:250]
+        
+        print(f"\n{'='*60}")
+        print(f"Loading dataset: {opt.dataset_name}")
+        print(f"Split file: {split_file}")
+        print(f"Total scenes to load: {len(id_list)}")
+        print(f"{'='*60}\n")
 
         new_name_list = []
         length_list = []
         if opt.dataset_name == "cam" or opt.dataset_name == "realestate10k_6" or opt.dataset_name == "realestate10k_12":
             # Camera dataset: text files have format "caption#tokens" (2 fields)
-            for name in tqdm(id_list):
+            for name in tqdm(id_list, desc="Loading motion & text data"):
                 try:
                     motion = np.load(pjoin(opt.motion_dir, name + '.npy'))
                     if (len(motion)) < min_motion_len or (len(motion) >= 300):
@@ -497,6 +567,41 @@ class Text2MotionDataset(data.Dataset):
 
     def inv_transform(self, data):
         return data * self.std + self.mean
+    
+    def load_scene_frames(self, scene_id, num_frames=None):
+        """
+        Load frame paths for a scene.
+        
+        Args:
+            scene_id: Sequential ID (e.g., '000000')
+            num_frames: Number of frames to return
+                - If None: return ALL frame paths (for sparse keyframe sampling)
+                - If int: uniformly sample that many frame paths
+        
+        Returns:
+            frame_paths: List of Path objects to frame files (NOT loaded images!)
+        """
+        # Map scene_id to hash_id
+        if scene_id not in self.scene_id_mapping:
+            return []
+        
+        hash_id = self.scene_id_mapping[scene_id]
+        scene_frame_dir = self.frame_dir / hash_id
+        
+        if not scene_frame_dir.exists():
+            return []
+        
+        # Get all frame files, sorted by name
+        frame_files = sorted(scene_frame_dir.glob('frame_*.jpg'))
+        
+        if num_frames is not None and len(frame_files) > num_frames:
+            # Uniformly sample num_frames indices
+            indices = np.linspace(0, len(frame_files) - 1, num_frames, dtype=int)
+            frame_files = [frame_files[i] for i in indices]
+        
+        # Return ALL frame paths for sparse keyframe sampling
+        # SparseKeyframeEncoder will randomly sample N∈[0,4] indices and load those images
+        return frame_files
 
     def __len__(self):
         return len(self.data_dict) - self.pointer
@@ -518,8 +623,10 @@ class Text2MotionDataset(data.Dataset):
             m_length = (m_length // self.opt.unit_length - 1) * self.opt.unit_length
         elif coin2 == 'single':
             m_length = (m_length // self.opt.unit_length) * self.opt.unit_length
-        idx = random.randint(0, len(motion) - m_length)
-        motion = motion[idx:idx+m_length]
+        
+        # Random temporal crop
+        motion_start_idx = random.randint(0, len(motion) - m_length)
+        motion = motion[motion_start_idx:motion_start_idx+m_length]
 
         "Z Normalization"
         motion = (motion - self.mean) / self.std
@@ -528,6 +635,20 @@ class Text2MotionDataset(data.Dataset):
             motion = np.concatenate([motion,
                                      np.zeros((self.max_motion_length - m_length, motion.shape[1]))
                                      ], axis=0)
+        
+        # Load frames if enabled
+        if self.load_frames:
+            scene_id = self.name_list[idx]  # Use original idx, not motion_start_idx
+            # Load ALL frames for sparse keyframe sampling
+            # SparseKeyframeEncoder will randomly sample N∈[1,4] frames
+            frame_paths = self.load_scene_frames(scene_id, num_frames=None)  # Load all
+            
+            # If frames not found, return empty list
+            if not frame_paths:
+                frame_paths = []
+            
+            return caption, motion, m_length, frame_paths
+        
         # print(word_embeddings.shape, motion.shape)
         # print(tokens)
         return caption, motion, m_length
