@@ -38,6 +38,16 @@ class TrainT2MOptions(BaseOptions):
         self.parser.add_argument('--num_keyframes', type=int, default=4, help='Number of keyframes to render for visual consistency')
         self.parser.add_argument('--keyframe_strategy', type=str, default='uniform', choices=['uniform', 'motion_based'], help='Keyframe selection strategy')
 
+        '''Frame Conditioning'''
+        self.parser.add_argument('--use_frames', action="store_true", help='Enable sparse keyframe conditioning with ResNet')
+        self.parser.add_argument('--keyframe_arch', type=str, default='resnet18', choices=['resnet18', 'resnet34'], 
+                                help='ResNet architecture for keyframe encoding')
+        
+        '''Logging & Experiment Tracking'''
+        self.parser.add_argument('--use_wandb', action="store_true", help='Enable Weights & Biases logging')
+        self.parser.add_argument('--wandb_project', type=str, default=None, help='W&B project name (default: momask-{dataset_name})')
+        self.parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity/username (optional)')
+
         self.is_train = True
 
 

@@ -1,8 +1,7 @@
 import torch
 from collections import defaultdict
 import torch.optim as optim
-# import tensorflow as tf
-from torch.utils.tensorboard import SummaryWriter
+from utils.logger import create_experiment_logger
 from collections import OrderedDict
 from utils.utils import *
 from os.path import join as pjoin
@@ -25,17 +24,57 @@ class MaskTransformerTrainer:
         self.vq_model.eval()
 
         if args.is_train:
-            self.logger = SummaryWriter(args.log_dir)
+            # Use enhanced logger with hyperparameter tracking
+            self.logger = create_experiment_logger(args)
 
-        # Initialize visual consistency module
-        try:
-            from utils.visual_consistency import create_visual_consistency_module
-            self.visual_consistency = create_visual_consistency_module(args)
-            print(f"Visual consistency module enabled: {self.visual_consistency.enabled}")
-        except ImportError:
-            print("Visual consistency module not available")
-            self.visual_consistency = None
-
+    def encode_frames(self, frame_paths_batch, m_lens, target_seq_len=None):
+        """
+        Encode frames using SparseKeyframeEncoder (ResNet + Temporal Conv).
+        
+        Args:
+            frame_paths_batch: List of lists of Path objects, length B
+                Each element is ALL frame paths for that scene (T_i frames, varies 100-280)
+            m_lens: Tensor of motion lengths (B,) ORIGINAL lengths (before VQ downsampling)
+            target_seq_len: Target sequence length to pad to (after //4). If None, uses max(m_lens)//4
+        
+        Returns:
+            frame_embeddings: Tensor (target_seq_len, B, latent_dim)
+                Padded to match VQ-encoded motion token sequence length
+        """
+        # Lazy load sparse keyframe encoder
+        if not hasattr(self, 'sparse_keyframe_encoder'):
+            from models.sparse_keyframe_encoder import SparseKeyframeEncoder
+            
+            resnet_arch = getattr(self.opt, 'keyframe_arch', 'resnet18')  # Default to resnet18
+            latent_dim = self.t2m_transformer.latent_dim
+            
+            print(f"Loading SparseKeyframeEncoder ({resnet_arch})...")
+            self.sparse_keyframe_encoder = SparseKeyframeEncoder(
+                resnet_arch=resnet_arch,
+                latent_dim=latent_dim,
+                pretrained=True
+            ).to(self.device)
+            
+            # Important: Enable training for ResNet fine-tuning
+            self.sparse_keyframe_encoder.train()
+            
+            print(f"✓ SparseKeyframeEncoder loaded (arch={resnet_arch}, latent_dim={latent_dim})")
+            print(f"  ResNet parameters will be fine-tuned during training")
+        
+        # Forward pass through sparse keyframe encoder
+        # Use deterministic sampling during validation (when encoder is in eval mode)
+        frame_embeddings, has_frames = self.sparse_keyframe_encoder(frame_paths_batch, m_lens, 
+                                                         deterministic=not self.sparse_keyframe_encoder.training)
+        
+        # Pad to target sequence length if needed (to match VQ-padded motion tokens)
+        if target_seq_len is not None and frame_embeddings.shape[0] < target_seq_len:
+            pad_len = target_seq_len - frame_embeddings.shape[0]
+            padding = torch.zeros(pad_len, frame_embeddings.shape[1], frame_embeddings.shape[2], 
+                                 device=frame_embeddings.device)
+            frame_embeddings = torch.cat([frame_embeddings, padding], dim=0)
+            # print(f"[TRAINER DEBUG] Padded frame_emb from {frame_embeddings.shape[0] - pad_len} to {target_seq_len}")
+        
+        return frame_embeddings, has_frames
 
     def update_lr_warm_up(self, nb_iter, warm_up_iter, lr):
 
@@ -48,75 +87,59 @@ class MaskTransformerTrainer:
 
     def forward(self, batch_data, step=None):
 
-        conds, motion, m_lens = batch_data
+        # Unpack batch - handle both with/without frames
+        if len(batch_data) == 4:
+            conds, motion, m_lens, frame_paths = batch_data
+            has_frames = True
+        else:
+            conds, motion, m_lens = batch_data
+            frame_paths = None
+            has_frames = False
+        
         motion = motion.detach().float().to(self.device)
         m_lens = m_lens.detach().long().to(self.device)
 
         # (b, n, q)
         code_idx, _ = self.vq_model.encode(motion)
-        m_lens = m_lens // 4
+        
+        # Encode frames BEFORE downsampling m_lens (need original lengths)
+        frame_emb = None
+        has_frames_flag = False
+        if has_frames and frame_paths is not None:
+            # Use ORIGINAL m_lens (motion lengths), not frame path counts
+            # m_lens represents the actual trajectory length
+            # Pass target_seq_len to match code_idx sequence length (after VQ padding)
+            target_seq_len = code_idx.shape[1]
+            frame_emb, has_frames_flag = self.encode_frames(frame_paths, m_lens, target_seq_len=target_seq_len)
+        
+        # Downsample m_lens for VQ tokens
+        m_lens = torch.div(m_lens, 4, rounding_mode='floor')
+            # frame_emb shape: (T//4, B, latent_dim) - matches motion token sequence
 
         conds = conds.to(self.device).float() if torch.is_tensor(conds) else conds
 
-        # loss_dict = {}
-        # self.pred_ids = []
-        # self.acc = []
+        # Pass frame_emb and has_frames flag to transformer
+        _loss, _pred_ids, _acc = self.t2m_transformer(code_idx[..., 0], conds, m_lens, 
+                                                       frame_emb=frame_emb, has_frames=has_frames_flag)
 
-        _loss, _pred_ids, _acc = self.t2m_transformer(code_idx[..., 0], conds, m_lens)
-
-        # Visual consistency loss for transformer training
-        loss_lpips = torch.tensor(0.0, device=self.device)
-        is_camera_dataset = any(name in self.opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
-        if (self.visual_consistency is not None and 
-            self.visual_consistency.enabled and 
-            step is not None and 
-            step % getattr(self.opt, 'visual_consistency_freq', 10) == 0 and
-            is_camera_dataset):
-            
-            # Generate motion from predicted tokens
-            with torch.no_grad():
-                pred_motion = self.vq_model.forward_decoder(_pred_ids.unsqueeze(-1))
-                pred_motion = pred_motion.permute(0, 2, 1)  # [B, T, D]
-            
-            batch_size = motion.shape[0]
-            total_lpips_loss = 0.0
-            num_valid_samples = 0
-            
-            for i in range(batch_size):
-                pred_traj = pred_motion[i][:m_lens[i] * 4]  # Adjust for downsampling
-                gt_traj = motion[i][:m_lens[i] * 4]
-                
-                # Compute visual consistency loss for this sample
-                try:
-                    visual_losses = self.visual_consistency.compute_visual_loss(
-                        pred_traj, gt_traj, data_id=None, step=step)
-                    total_lpips_loss += visual_losses['lpips_loss']
-                    num_valid_samples += 1
-                except Exception as e:
-                    # Handle any errors gracefully
-                    continue
-            
-            if num_valid_samples > 0:
-                loss_lpips = total_lpips_loss / num_valid_samples
-                _loss += getattr(self.opt, 'visual_consistency_weight', 0.01) * loss_lpips
-
-        return _loss, _acc, loss_lpips
+        return _loss, _acc
 
     def update(self, batch_data, step=None):
-        loss, acc, loss_lpips = self.forward(batch_data, step=step)
+        loss, acc = self.forward(batch_data, step=step)
 
         self.opt_t2m_transformer.zero_grad()
         loss.backward()
         self.opt_t2m_transformer.step()
         self.scheduler.step()
 
-        return loss.item(), acc, loss_lpips.item() if isinstance(loss_lpips, torch.Tensor) else loss_lpips
+        return loss.item(), acc
 
     def save(self, file_name, ep, total_it):
         t2m_trans_state_dict = self.t2m_transformer.state_dict()
         clip_weights = [e for e in t2m_trans_state_dict.keys() if e.startswith('clip_model.')]
         for e in clip_weights:
             del t2m_trans_state_dict[e]
+        
         state = {
             't2m_transformer': t2m_trans_state_dict,
             'opt_t2m_transformer': self.opt_t2m_transformer.state_dict(),
@@ -124,6 +147,12 @@ class MaskTransformerTrainer:
             'ep': ep,
             'total_it': total_it,
         }
+        
+        # Save SparseKeyframeEncoder if using frames
+        if hasattr(self, 'sparse_keyframe_encoder'):
+            state['sparse_keyframe_encoder'] = self.sparse_keyframe_encoder.state_dict()
+            print(f"💾 Saving checkpoint with SparseKeyframeEncoder (epoch {ep})")
+        
         torch.save(state, file_name)
 
     def resume(self, model_dir):
@@ -131,6 +160,22 @@ class MaskTransformerTrainer:
         missing_keys, unexpected_keys = self.t2m_transformer.load_state_dict(checkpoint['t2m_transformer'], strict=False)
         assert len(unexpected_keys) == 0
         assert all([k.startswith('clip_model.') for k in missing_keys])
+
+        # Resume SparseKeyframeEncoder if available
+        if 'sparse_keyframe_encoder' in checkpoint:
+            if not hasattr(self, 'sparse_keyframe_encoder'):
+                # Initialize encoder if not already created
+                from models.sparse_keyframe_encoder import SparseKeyframeEncoder
+                resnet_arch = getattr(self.opt, 'keyframe_arch', 'resnet18')
+                latent_dim = self.t2m_transformer.latent_dim
+                self.sparse_keyframe_encoder = SparseKeyframeEncoder(
+                    resnet_arch=resnet_arch,
+                    latent_dim=latent_dim,
+                    pretrained=False  # Will load from checkpoint
+                ).to(self.device)
+            
+            self.sparse_keyframe_encoder.load_state_dict(checkpoint['sparse_keyframe_encoder'])
+            print(f"✅ Resumed SparseKeyframeEncoder from checkpoint")
 
         try:
             self.opt_t2m_transformer.load_state_dict(checkpoint['opt_t2m_transformer']) # Optimizer
@@ -141,16 +186,21 @@ class MaskTransformerTrainer:
         return checkpoint['ep'], checkpoint['total_it']
 
 
-    # dataset
-    # train: 13963
-    # val:2992
-    # test: 2993
-    # total = 19948
     def train(self, train_loader, val_loader, eval_val_loader, eval_wrapper, plot_eval):
         self.t2m_transformer.to(self.device)
         self.vq_model.to(self.device)
 
-        self.opt_t2m_transformer = optim.AdamW(self.t2m_transformer.parameters(), betas=(0.9, 0.99), lr=self.opt.lr, weight_decay=1e-5)
+        # Collect parameters: transformer + sparse keyframe encoder (if using frames)
+        params_to_optimize = list(self.t2m_transformer.parameters())
+        
+        if hasattr(self, 'sparse_keyframe_encoder'):
+            # Add ResNet + Temporal Conv parameters for fine-tuning
+            params_to_optimize += list(self.sparse_keyframe_encoder.parameters())
+            print(f"Optimizer will update: transformer + SparseKeyframeEncoder ({self.opt.keyframe_arch})")
+        else:
+            print("Optimizer will update: transformer only")
+        
+        self.opt_t2m_transformer = optim.AdamW(params_to_optimize, betas=(0.9, 0.99), lr=self.opt.lr, weight_decay=1e-5)
         self.scheduler = optim.lr_scheduler.MultiStepLR(self.opt_t2m_transformer,
                                                         milestones=self.opt.milestones,
                                                         gamma=self.opt.gamma)
@@ -181,27 +231,27 @@ class MaskTransformerTrainer:
         while epoch < self.opt.max_epoch:
             self.t2m_transformer.train()
             self.vq_model.eval()
+            
+            # Set frame encoder to train mode if it exists
+            if hasattr(self, 'sparse_keyframe_encoder'):
+                self.sparse_keyframe_encoder.train()
 
             for i, batch in enumerate(tqdm(train_loader, desc=f"Train Epoch {epoch+1}/{self.opt.max_epoch}")):
                 it += 1
                 if it < self.opt.warm_up_iter:
                     self.update_lr_warm_up(it, self.opt.warm_up_iter, self.opt.lr)
-                # where does clip encoding happen?
-                loss, acc, loss_lpips = self.update(batch_data=batch)
+                # where does clip encoding happen? in transformer.py. Batch contains text.
+                # import pdb; pdb.set_trace()
+
+                loss, acc = self.update(batch_data=batch)
                 logs['loss'] += loss
                 logs['acc'] += acc
-                if loss_lpips is not None:
-                    if 'lpips' not in logs:
-                        logs['lpips'] = 0.0
-                    logs['lpips'] += loss_lpips
                 logs['lr'] += self.opt_t2m_transformer.param_groups[0]['lr']
 
                 if it % self.opt.log_every == 0:
                     mean_loss = OrderedDict()
-                    # self.logger.add_scalar('val_loss', val_loss, it)
-                    # self.l
                     for tag, value in logs.items():
-                        self.logger.add_scalar('Train/%s'%tag, value / self.opt.log_every, it)
+                        self.logger.log_scalar('Train/%s'%tag, value / self.opt.log_every, it)
                         mean_loss[tag] = value / self.opt.log_every
                     logs = defaultdict(def_value, OrderedDict())
                     print_current_loss(start_time, it, total_iters, mean_loss, epoch=epoch, inner_iter=i)
@@ -214,26 +264,23 @@ class MaskTransformerTrainer:
             print('Validation time:')
             self.vq_model.eval()
             self.t2m_transformer.eval()
+            
+            # Set frame encoder to eval mode if it exists
+            if hasattr(self, 'sparse_keyframe_encoder'):
+                self.sparse_keyframe_encoder.eval()
 
             val_loss = []
             val_acc = []
-            val_lpips = []
             with torch.no_grad():
                 for i, batch_data in enumerate(val_loader):
-                    loss, acc, loss_lpips = self.forward(batch_data)
+                    loss, acc = self.forward(batch_data)
                     val_loss.append(loss.item())
                     val_acc.append(acc)
-                    if loss_lpips is not None:
-                        val_lpips.append(loss_lpips.item() if isinstance(loss_lpips, torch.Tensor) else loss_lpips)
 
             print(f"Validation loss:{np.mean(val_loss):.3f}, accuracy:{np.mean(val_acc):.3f}")
-            if val_lpips:
-                print(f"Validation LPIPS loss:{np.mean(val_lpips):.3f}")
 
-            self.logger.add_scalar('Val/loss', np.mean(val_loss), epoch)
-            self.logger.add_scalar('Val/acc', np.mean(val_acc), epoch)
-            if val_lpips:
-                self.logger.add_scalar('Val/lpips', np.mean(val_lpips), epoch)
+            self.logger.log_scalar('Val/loss', np.mean(val_loss), epoch)
+            self.logger.log_scalar('Val/acc', np.mean(val_acc), epoch)
 
             if np.mean(val_acc) > best_acc:
                 print(f"Improved accuracy from {best_acc:.02f} to {np.mean(val_acc)}!!!")
@@ -257,8 +304,57 @@ class ResidualTransformerTrainer:
         self.vq_model.eval()
 
         if args.is_train:
-            self.logger = SummaryWriter(args.log_dir)
+            # Use enhanced logger with hyperparameter tracking
+            self.logger = create_experiment_logger(args)
             # self.l1_criterion = torch.nn.SmoothL1Loss()
+
+    def encode_frames(self, frame_paths_batch, m_lens, target_seq_len=None):
+        """
+        Encode frames using SparseKeyframeEncoder (ResNet + Temporal Conv).
+        Reuses the same encoder instance as MaskTransformerTrainer if available.
+        
+        Args:
+            frame_paths_batch: List of lists of Path objects, length B
+                Each element is ALL frame paths for that scene (T_i frames, varies 100-280)
+            m_lens: Tensor of motion lengths (B,) ORIGINAL lengths (before VQ downsampling)
+            target_seq_len: Target sequence length to pad to (after //4). If None, uses max(m_lens)//4
+        
+        Returns:
+            frame_embeddings: Tensor (target_seq_len, B, latent_dim)
+                Padded to match VQ-encoded motion token sequence length
+        """
+        # Lazy load sparse keyframe encoder
+        if not hasattr(self, 'sparse_keyframe_encoder'):
+            from models.sparse_keyframe_encoder import SparseKeyframeEncoder
+            
+            resnet_arch = getattr(self.opt, 'keyframe_arch', 'resnet18')
+            latent_dim = self.res_transformer.latent_dim
+            
+            print(f"Loading SparseKeyframeEncoder for ResidualTransformer ({resnet_arch})...")
+            self.sparse_keyframe_encoder = SparseKeyframeEncoder(
+                resnet_arch=resnet_arch,
+                latent_dim=latent_dim,
+                pretrained=True
+            ).to(self.device)
+            
+            # Enable training for ResNet fine-tuning
+            self.sparse_keyframe_encoder.train()
+            
+            print(f"✓ SparseKeyframeEncoder loaded (arch={resnet_arch}, latent_dim={latent_dim})")
+        
+        # Forward pass through sparse keyframe encoder
+        # Use deterministic sampling during validation (when encoder is in eval mode)
+        frame_embeddings = self.sparse_keyframe_encoder(frame_paths_batch, m_lens,
+                                                         deterministic=not self.sparse_keyframe_encoder.training)
+        
+        # Pad to target sequence length if needed (to match VQ-padded motion tokens)
+        if target_seq_len is not None and frame_embeddings.shape[0] < target_seq_len:
+            pad_len = target_seq_len - frame_embeddings.shape[0]
+            padding = torch.zeros(pad_len, frame_embeddings.shape[1], frame_embeddings.shape[2], 
+                                 device=frame_embeddings.device)
+            frame_embeddings = torch.cat([frame_embeddings, padding], dim=0)
+        
+        return frame_embeddings
 
 
     def update_lr_warm_up(self, nb_iter, warm_up_iter, lr):
@@ -271,18 +367,36 @@ class ResidualTransformerTrainer:
 
 
     def forward(self, batch_data):
+        # Unpack batch - handle both with/without frames
+        if len(batch_data) == 4:
+            conds, motion, m_lens, frame_paths = batch_data
+            has_frames = True
+        else:
+            conds, motion, m_lens = batch_data
+            frame_paths = None
+            has_frames = False
 
-        conds, motion, m_lens = batch_data
         motion = motion.detach().float().to(self.device)
         m_lens = m_lens.detach().long().to(self.device)
 
         # (b, n, q), (q, b, n ,d)
         code_idx, all_codes = self.vq_model.encode(motion)
-        m_lens = m_lens // 4
+        
+        # Encode frames BEFORE downsampling m_lens (need original lengths)
+        frame_emb = None
+        has_frames_flag = False
+        if has_frames and frame_paths is not None:
+            # Use ORIGINAL m_lens (motion lengths), not frame path counts
+            # Pass target_seq_len to match code_idx sequence length (after VQ padding)
+            target_seq_len = code_idx.shape[1]
+            frame_emb, has_frames_flag = self.encode_frames(frame_paths, m_lens, target_seq_len=target_seq_len)
+        
+        # Now downsample m_lens to match VQ token length
+        m_lens = torch.div(m_lens, 4, rounding_mode='floor')
 
         conds = conds.to(self.device).float() if torch.is_tensor(conds) else conds
 
-        ce_loss, pred_ids, acc = self.res_transformer(code_idx, conds, m_lens)
+        ce_loss, pred_ids, acc = self.res_transformer(code_idx, conds, m_lens, frame_emb=frame_emb, has_frames=has_frames_flag)
 
         return ce_loss, acc
 
@@ -301,6 +415,7 @@ class ResidualTransformerTrainer:
         clip_weights = [e for e in res_trans_state_dict.keys() if e.startswith('clip_model.')]
         for e in clip_weights:
             del res_trans_state_dict[e]
+        
         state = {
             'res_transformer': res_trans_state_dict,
             'opt_res_transformer': self.opt_res_transformer.state_dict(),
@@ -308,6 +423,12 @@ class ResidualTransformerTrainer:
             'ep': ep,
             'total_it': total_it,
         }
+        
+        # Save SparseKeyframeEncoder if using frames
+        if hasattr(self, 'sparse_keyframe_encoder'):
+            state['sparse_keyframe_encoder'] = self.sparse_keyframe_encoder.state_dict()
+            print(f"💾 Saving ResidualTransformer checkpoint with SparseKeyframeEncoder (epoch {ep})")
+        
         torch.save(state, file_name)
 
     def resume(self, model_dir):
@@ -315,6 +436,22 @@ class ResidualTransformerTrainer:
         missing_keys, unexpected_keys = self.res_transformer.load_state_dict(checkpoint['res_transformer'], strict=False)
         assert len(unexpected_keys) == 0
         assert all([k.startswith('clip_model.') for k in missing_keys])
+
+        # Resume SparseKeyframeEncoder if available
+        if 'sparse_keyframe_encoder' in checkpoint:
+            if not hasattr(self, 'sparse_keyframe_encoder'):
+                # Initialize encoder if not already created
+                from models.sparse_keyframe_encoder import SparseKeyframeEncoder
+                resnet_arch = getattr(self.opt, 'keyframe_arch', 'resnet18')
+                latent_dim = self.res_transformer.latent_dim
+                self.sparse_keyframe_encoder = SparseKeyframeEncoder(
+                    resnet_arch=resnet_arch,
+                    latent_dim=latent_dim,
+                    pretrained=False  # Will load from checkpoint
+                ).to(self.device)
+            
+            self.sparse_keyframe_encoder.load_state_dict(checkpoint['sparse_keyframe_encoder'])
+            print(f"✅ Resumed SparseKeyframeEncoder for ResidualTransformer from checkpoint")
 
         try:
             self.opt_res_transformer.load_state_dict(checkpoint['opt_res_transformer']) # Optimizer
@@ -328,7 +465,16 @@ class ResidualTransformerTrainer:
         self.res_transformer.to(self.device)
         self.vq_model.to(self.device)
 
-        self.opt_res_transformer = optim.AdamW(self.res_transformer.parameters(), betas=(0.9, 0.99), lr=self.opt.lr, weight_decay=1e-5)
+        # Collect parameters: residual transformer + sparse keyframe encoder (if using frames)
+        params_to_optimize = list(self.res_transformer.parameters())
+        
+        if hasattr(self, 'sparse_keyframe_encoder'):
+            params_to_optimize += list(self.sparse_keyframe_encoder.parameters())
+            print(f"ResidualTransformer optimizer: transformer + SparseKeyframeEncoder ({self.opt.keyframe_arch})")
+        else:
+            print("ResidualTransformer optimizer: transformer only")
+
+        self.opt_res_transformer = optim.AdamW(params_to_optimize, betas=(0.9, 0.99), lr=self.opt.lr, weight_decay=1e-5)
         self.scheduler = optim.lr_scheduler.MultiStepLR(self.opt_res_transformer,
                                                         milestones=self.opt.milestones,
                                                         gamma=self.opt.gamma)
@@ -360,6 +506,10 @@ class ResidualTransformerTrainer:
         while epoch < self.opt.max_epoch:
             self.res_transformer.train()
             self.vq_model.eval()
+            
+            # Set frame encoder to train mode if it exists
+            if hasattr(self, 'sparse_keyframe_encoder'):
+                self.sparse_keyframe_encoder.train()
 
             for i, batch in enumerate(tqdm(train_loader, desc=f"Train Epoch {epoch+1}/{self.opt.max_epoch}")):
                 it += 1
@@ -373,10 +523,8 @@ class ResidualTransformerTrainer:
 
                 if it % self.opt.log_every == 0:
                     mean_loss = OrderedDict()
-                    # self.logger.add_scalar('val_loss', val_loss, it)
-                    # self.l
                     for tag, value in logs.items():
-                        self.logger.add_scalar('Train/%s'%tag, value / self.opt.log_every, it)
+                        self.logger.log_scalar('Train/%s'%tag, value / self.opt.log_every, it)
                         mean_loss[tag] = value / self.opt.log_every
                     logs = defaultdict(def_value, OrderedDict())
                     print_current_loss(start_time, it, total_iters, mean_loss, epoch=epoch, inner_iter=i)
@@ -401,8 +549,8 @@ class ResidualTransformerTrainer:
 
             print(f"Validation loss:{np.mean(val_loss):.3f}, Accuracy:{np.mean(val_acc):.3f}")
 
-            self.logger.add_scalar('Val/loss', np.mean(val_loss), epoch)
-            self.logger.add_scalar('Val/acc', np.mean(val_acc), epoch)
+            self.logger.log_scalar('Val/loss', np.mean(val_loss), epoch)
+            self.logger.log_scalar('Val/acc', np.mean(val_acc), epoch)
 
             if np.mean(val_loss) < best_loss:
                 print(f"Improved loss from {best_loss:.02f} to {np.mean(val_loss)}!!!")

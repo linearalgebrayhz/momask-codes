@@ -255,10 +255,12 @@ class RVQTokenizerTrainer:
         is_camera_dataset = any(name in self.opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
         if is_camera_dataset:
             # Use camera-specific evaluation (now includes FID and other motion metrics)
-            best_recon, best_smoothness, best_position_error, best_orientation_error, writer = evaluation_camera_vqvae(
+            best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_recon, best_smoothness, best_position_error, best_orientation_error, writer = evaluation_camera_vqvae(
                 self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, 
                 best_recon=best_recon, best_smoothness=best_smoothness,
                 best_position_error=best_position_error, best_orientation_error=best_orientation_error,
+                best_fid=best_fid, best_div=best_div, best_top1=best_top1,
+                best_top2=best_top2, best_top3=best_top3, best_matching=best_matching,
                 eval_wrapper=eval_wrapper, save=False)
         else:
             # Use original evaluation for human motion
@@ -381,10 +383,12 @@ class RVQTokenizerTrainer:
             is_camera_dataset = any(name in self.opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
             if is_camera_dataset:
                 # Use camera-specific evaluation (now includes FID and other motion metrics)
-                best_recon, best_smoothness, best_position_error, best_orientation_error, writer = evaluation_camera_vqvae(
+                best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_recon, best_smoothness, best_position_error, best_orientation_error, writer = evaluation_camera_vqvae(
                     self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, 
                     best_recon=best_recon, best_smoothness=best_smoothness,
                     best_position_error=best_position_error, best_orientation_error=best_orientation_error,
+                    best_fid=best_fid, best_div=best_div, best_top1=best_top1,
+                    best_top2=best_top2, best_top3=best_top3, best_matching=best_matching,
                     eval_wrapper=eval_wrapper)
             else:
                 # Use original evaluation for human motion

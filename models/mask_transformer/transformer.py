@@ -84,7 +84,7 @@ class OutputProcess(nn.Module):
 class MaskTransformer(nn.Module):
     def __init__(self, code_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8,
                  num_heads=4, dropout=0.1, clip_dim=512, cond_drop_prob=0.1,
-                 clip_version=None, opt=None, **kargs):
+                 clip_version=None, opt=None, use_frames=False, frame_dim=512, **kargs):
         super(MaskTransformer, self).__init__()
         print(f'latent_dim: {latent_dim}, ff_size: {ff_size}, nlayers: {num_layers}, nheads: {num_heads}, dropout: {dropout}')
 
@@ -93,9 +93,14 @@ class MaskTransformer(nn.Module):
         self.clip_dim = clip_dim
         self.dropout = dropout
         self.opt = opt
+        self.use_frames = use_frames
 
         self.cond_mode = cond_mode
         self.cond_drop_prob = cond_drop_prob
+        
+        print(f'Frame conditioning: {use_frames}')
+        if use_frames:
+            print(f'  Frame dim: {frame_dim} -> latent_dim: {latent_dim}')
 
         if self.cond_mode == 'action':
             assert 'num_actions' in kargs
@@ -128,6 +133,12 @@ class MaskTransformer(nn.Module):
         else:
             raise KeyError("Unsupported condition mode!!!")
 
+        # Sparse keyframe conditioning (NEW: replaces TC-CLIP)
+        if self.use_frames:
+            # Modality embedding to distinguish motion vs frame tokens
+            self.modality_emb_frame = nn.Parameter(torch.randn(1, 1, self.latent_dim))
+            print(f'  Sparse keyframe fusion: enabled')
+            print(f'  Note: SparseKeyframeEncoder loaded separately in trainer')
 
         _num_tokens = opt.num_tokens + 2  # two dummy tokens, one for masking, one for padding
         self.mask_id = opt.num_tokens
@@ -207,43 +218,63 @@ class MaskTransformer(nn.Module):
         else:
             return cond
 
-    def trans_forward(self, motion_ids, cond, padding_mask, force_mask=False):
+    def trans_forward(self, motion_ids, cond, padding_mask, force_mask=False, frame_emb=None, has_frames=False):
         '''
         :param motion_ids: (b, seqlen)
-        :padding_mask: (b, seqlen), all pad positions are TRUE else FALSE
+        :param padding_mask: (b, seqlen), all pad positions are TRUE else FALSE
         :param cond: (b, embed_dim) for text, (b, num_actions) for action
         :param force_mask: boolean
+        :param frame_emb: (seqlen, b, latent_dim) optional frame embeddings from SparseKeyframeEncoder
+        :param has_frames: bool flag indicating if any sample in batch has actual frames
         :return:
             -logits: (b, num_token, seqlen)
         '''
 
         cond = self.mask_cond(cond, force_mask=force_mask)
 
-        # print(motion_ids.shape)
-        x = self.token_emb(motion_ids)
-        # print(x.shape)
-        # (b, seqlen, d) -> (seqlen, b, latent_dim)
-        x = self.input_process(x)
+        # Process motion tokens
+        x = self.token_emb(motion_ids)  # (b, seqlen, code_dim)
 
-        cond = self.cond_emb(cond).unsqueeze(0) #(1, b, latent_dim)
+        x = self.input_process(x)  # (seqlen, b, latent_dim)
 
-        x = self.position_enc(x)
-        xseq = torch.cat([cond, x], dim=0) #(seqlen+1, b, latent_dim)
+        # Process text condition
+        cond = self.cond_emb(cond).unsqueeze(0)  # (1, b, latent_dim)
 
-        padding_mask = torch.cat([torch.zeros_like(padding_mask[:, 0:1]), padding_mask], dim=1) #(b, seqlen+1)
-        # print(xseq.shape, padding_mask.shape)
+        # Add positional encoding to motion
+        x = self.position_enc(x)  # (seqlen, b, latent_dim)
+        
+        # Conditional fusion: only fuse if frames contain actual features
+        if self.use_frames and frame_emb is not None and has_frames:
+            # frame_emb: (seqlen, b, latent_dim) - already downsampled to match motion length
+            # Add modality embedding to frames
+            f = frame_emb + self.modality_emb_frame  # (seqlen, b, latent_dim)
+            
+            # Add positional encoding to frames
+            f = self.position_enc(f)  # (seqlen, b, latent_dim)
+            
+            # Element-wise addition fusion
+            x = x + f  # (seqlen, b, latent_dim)
+        
+        # Concatenate text token with fused motion+frame tokens
+        xseq = torch.cat([cond, x], dim=0)  # (seqlen+1, b, latent_dim)
 
-        # print(padding_mask.shape, xseq.shape)
+        # Update padding mask to include text token
+        padding_mask = torch.cat([torch.zeros_like(padding_mask[:, 0:1]), padding_mask], dim=1)  # (b, seqlen+1)
 
-        output = self.seqTransEncoder(xseq, src_key_padding_mask=padding_mask)[1:] #(seqlen, b, e)
-        logits = self.output_process(output) #(seqlen, b, e) -> (b, ntoken, seqlen)
+        # Transformer encoding
+        output = self.seqTransEncoder(xseq, src_key_padding_mask=padding_mask)[1:]  # (seqlen, b, e)
+        
+        # Output projection (only for motion tokens)
+        logits = self.output_process(output)  # (seqlen, b, e) -> (b, ntoken, seqlen)
         return logits
 
-    def forward(self, ids, y, m_lens):
+    def forward(self, ids, y, m_lens, frame_emb=None, has_frames=False):
         '''
         :param ids: (b, n)
         :param y: raw text for cond_mode=text, (b, ) for cond_mode=action
-        :m_lens: (b,)
+        :param m_lens: (b,)
+        :param frame_emb: (seqlen, b, latent_dim) optional frame embeddings from SparseKeyframeEncoder
+        :param has_frames: bool flag indicating if any sample in batch has actual frames
         :return:
         '''
 
@@ -265,7 +296,6 @@ class MaskTransformer(nn.Module):
             force_mask = True
         else:
             raise NotImplementedError("Unsupported condition mode!!!")
-
 
         '''
         Prepare mask
@@ -298,7 +328,8 @@ class MaskTransformer(nn.Module):
 
         x_ids = torch.where(mask_mid, self.mask_id, x_ids)
 
-        logits = self.trans_forward(x_ids, cond_vector, ~non_pad_mask, force_mask)
+        logits = self.trans_forward(x_ids, cond_vector, ~non_pad_mask, force_mask, 
+                                     frame_emb=frame_emb, has_frames=has_frames)
         ce_loss, pred_id, acc = cal_performance(logits, labels, ignore_index=self.mask_id)
 
         return ce_loss, pred_id, acc
@@ -611,7 +642,7 @@ class MaskTransformer(nn.Module):
 class ResidualTransformer(nn.Module):
     def __init__(self, code_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8, cond_drop_prob=0.1,
                  num_heads=4, dropout=0.1, clip_dim=512, shared_codebook=False, share_weight=False,
-                 clip_version=None, opt=None, **kargs):
+                 clip_version=None, opt=None, use_frames=False, **kargs):
         super(ResidualTransformer, self).__init__()
         print(f'latent_dim: {latent_dim}, ff_size: {ff_size}, nlayers: {num_layers}, nheads: {num_heads}, dropout: {dropout}')
 
@@ -622,6 +653,7 @@ class ResidualTransformer(nn.Module):
         self.clip_dim = clip_dim
         self.dropout = dropout
         self.opt = opt
+        self.use_frames = use_frames
 
         self.cond_mode = cond_mode
         # self.cond_drop_prob = cond_drop_prob
@@ -657,6 +689,11 @@ class ResidualTransformer(nn.Module):
             self.cond_emb = nn.Linear(self.num_actions, self.latent_dim)
         else:
             raise KeyError("Unsupported condition mode!!!")
+
+        # Sparse keyframe conditioning (same as base transformer)
+        if self.use_frames:
+            self.modality_emb_frame = nn.Parameter(torch.randn(1, 1, self.latent_dim))
+            print(f'  ResidualTransformer: Sparse keyframe fusion enabled')
 
 
         _num_tokens = opt.num_tokens + 1  # one dummy tokens for padding
@@ -783,12 +820,14 @@ class ResidualTransformer(nn.Module):
 
 
 
-    def trans_forward(self, motion_codes, qids, cond, padding_mask, force_mask=False):
+    def trans_forward(self, motion_codes, qids, cond, padding_mask, force_mask=False, frame_emb=None, has_frames=False):
         '''
         :param motion_codes: (b, seqlen, d)
         :padding_mask: (b, seqlen), all pad positions are TRUE else FALSE
         :param qids: (b), quantizer layer ids
         :param cond: (b, embed_dim) for text, (b, num_actions) for action
+        :param frame_emb: (seqlen, b, latent_dim) optional sparse keyframe embeddings
+        :param has_frames: bool flag indicating if any sample in batch has actual frames
         :return:
             -logits: (b, num_token, seqlen)
         '''
@@ -804,6 +843,13 @@ class ResidualTransformer(nn.Module):
         cond = self.cond_emb(cond).unsqueeze(0)  # (1, b, latent_dim)
 
         x = self.position_enc(x)
+        
+        # Conditional fusion: only fuse if frames contain actual features
+        if self.use_frames and frame_emb is not None and has_frames:
+            f = frame_emb + self.modality_emb_frame
+            f = self.position_enc(f)
+            x = x + f
+        
         xseq = torch.cat([cond, q_emb, x], dim=0)  # (seqlen+2, b, latent_dim)
 
         padding_mask = torch.cat([torch.zeros_like(padding_mask[:, 0:2]), padding_mask], dim=1)  # (b, seqlen+2)
@@ -837,11 +883,13 @@ class ResidualTransformer(nn.Module):
         scaled_logits = aux_logits + (logits - aux_logits) * cond_scale
         return scaled_logits
 
-    def forward(self, all_indices, y, m_lens):
+    def forward(self, all_indices, y, m_lens, frame_emb=None, has_frames=False):
         '''
         :param all_indices: (b, n, q)
         :param y: raw text for cond_mode=text, (b, ) for cond_mode=action
         :m_lens: (b,)
+        :param frame_emb: (n, b, latent_dim) optional sparse keyframe embeddings
+        :param has_frames: bool flag indicating if any sample in batch has actual frames
         :return:
         '''
 
@@ -882,7 +930,7 @@ class ResidualTransformer(nn.Module):
         else:
             raise NotImplementedError("Unsupported condition mode!!!")
 
-        logits = self.trans_forward(history_sum, active_q_layers, cond_vector, ~non_pad_mask, force_mask)
+        logits = self.trans_forward(history_sum, active_q_layers, cond_vector, ~non_pad_mask, force_mask, frame_emb=frame_emb, has_frames=has_frames)
         logits = self.output_project(logits, active_q_layers-1)
         ce_loss, pred_id, acc = cal_performance(logits, active_indices, ignore_index=self.pad_id)
 

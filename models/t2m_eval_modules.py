@@ -111,11 +111,12 @@ class TextEncoderBiGRUCo(nn.Module):
 
         self.pos_emb = nn.Linear(pos_size, word_size)
         self.input_emb = nn.Linear(word_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True, bidirectional=True)
+        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True, bidirectional=True, dropout=0.1)
         self.output_net = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
-            nn.LayerNorm(hidden_size),
+            nn.BatchNorm1d(hidden_size),
             nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.2),
             nn.Linear(hidden_size, output_size)
         )
 
@@ -152,11 +153,12 @@ class MotionEncoderBiGRUCo(nn.Module):
         self.device = device
 
         self.input_emb = nn.Linear(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True, bidirectional=True)
+        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True, bidirectional=True, dropout=0.1)
         self.output_net = nn.Sequential(
             nn.Linear(hidden_size*2, hidden_size),
-            nn.LayerNorm(hidden_size),
+            nn.BatchNorm1d(hidden_size),
             nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.2),
             nn.Linear(hidden_size, output_size)
         )
 

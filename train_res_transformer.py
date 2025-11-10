@@ -19,7 +19,7 @@ from utils.fixseed import fixseed
 from utils.paramUtil import t2m_kinematic_chain, kit_kinematic_chain
 from utils.dataset_config import get_unified_dataset_config
 
-from data.t2m_dataset import Text2MotionDataset, collate_fn_text2motion_camera_train
+from data.t2m_dataset import Text2MotionDataset, collate_fn_text2motion_camera_train, collate_fn_text2motion_camera_train_frames
 from motion_loaders.dataset_motion_loader import get_dataset_motion_loader
 from models.t2m_eval_wrapper import EvaluatorModelWrapper
 
@@ -157,6 +157,7 @@ if __name__ == '__main__':
                                           # codebook=vq_model.quantizer.codebooks[0] if opt.fix_token_emb else None,
                                             share_weight=opt.share_weight,
                                           clip_version=clip_version,
+                                          use_frames=opt.use_frames,
                                           opt=opt)
     # else:
     #     res_transformer = ResidualTransformer(code_dim=vq_opt.code_dim,
@@ -189,15 +190,19 @@ if __name__ == '__main__':
     train_split_file = pjoin(opt.data_root, 'train.txt')
     val_split_file = pjoin(opt.data_root, 'val.txt')
 
-    train_dataset = Text2MotionDataset(opt, mean, std, train_split_file)
-    val_dataset = Text2MotionDataset(opt, mean, std, val_split_file)
+    # Pass load_frames=True if --use_frames flag is set
+    load_frames = getattr(opt, 'use_frames', False)
+    train_dataset = Text2MotionDataset(opt, mean, std, train_split_file, load_frames=load_frames)
+    val_dataset = Text2MotionDataset(opt, mean, std, val_split_file, load_frames=load_frames)
 
     # Use camera-specific collate function for camera datasets
     is_camera_dataset = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
     
     if is_camera_dataset:
-        train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, collate_fn=collate_fn_text2motion_camera_train)
-        val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, collate_fn=collate_fn_text2motion_camera_train)
+        # Use frame-aware collate function if --use_frames flag is set
+        collate_fn = collate_fn_text2motion_camera_train_frames if getattr(opt, 'use_frames', False) else collate_fn_text2motion_camera_train
+        train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, collate_fn=collate_fn)
+        val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, collate_fn=collate_fn)
     else:
         train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True)
         val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True)

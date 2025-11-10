@@ -6,7 +6,7 @@ echo "Starting Camera RVQ Training..."
 # nvidia-smi
 
 # overfitting experiment on one sample
-EXPERIMENT_NAME="rvq_realestate10k_6_qwen_vl_captions"
+EXPERIMENT_NAME="rvq_realestate10k_6_eval"
 TENSORBOARD_DIR="./log/vq/realestate10k_6/${EXPERIMENT_NAME}"
 CHECKPOINT_DIR="./checkpoints/realestate10k_6/${EXPERIMENT_NAME}"
 
@@ -25,13 +25,13 @@ echo "  # Then access via browser at: http://localhost:6006"
 echo ""
 
 # overfitting experiment on one sample
-CUDA_VISIBLE_DEVICES=6 python train_vq.py \
+CUDA_VISIBLE_DEVICES=2 python train_vq.py \
     --name ${EXPERIMENT_NAME} \
     --gpu_id 0 \
     --dataset_name realestate10k_6 \
     --batch_size 256 \
     --num_quantizers 8 \
-    --max_epoch 100 \
+    --max_epoch 20 \
     --quantize_dropout_prob 0.1 \
     --gamma 0.8 \
     --lr 5e-5 \
@@ -43,6 +43,7 @@ CUDA_VISIBLE_DEVICES=6 python train_vq.py \
     --log_codebook_usage \
     --log_gradients \
     --window_size 64 \
+    --eval_on \
     # --is_continue
 
 echo "RVQ Training completed!"

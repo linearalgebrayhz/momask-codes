@@ -467,7 +467,7 @@ def evaluation_mask_transformer(out_dir, val_loader, trans, vq_model, writer, ep
         # num_joints = 21 if pose.shape[-1] == 251 else 22
 
         # (b, seqlen)
-        mids = trans.generate(clip_text, m_length//4, time_steps, cond_scale, temperature=1)
+        mids = trans.generate(clip_text, torch.div(m_length, 4, rounding_mode='floor'), time_steps, cond_scale, temperature=1)
 
         # motion_codes = motion_codes.permute(0, 2, 1)
         mids.unsqueeze_(-1)
@@ -620,9 +620,9 @@ def evaluation_res_transformer(out_dir, val_loader, trans, vq_model, writer, ep,
         if ep == 0:
             pred_ids = code_indices[..., 0:1]
         else:
-            pred_ids = trans.generate(code_indices[..., 0], clip_text, m_length//4,
+            pred_ids = trans.generate(code_indices[..., 0], clip_text, torch.div(m_length, 4, rounding_mode='floor'),
                                       temperature=temperature, cond_scale=cond_scale)
-            # pred_codes = trans(code_indices[..., 0], clip_text, m_length//4, force_mask=force_mask)
+            # pred_codes = trans(code_indices[..., 0], clip_text, torch.div(m_length, 4, rounding_mode='floor'), force_mask=force_mask)
 
         pred_motions = vq_model.forward_decoder(pred_ids)
 
@@ -761,9 +761,9 @@ def evaluation_res_transformer_plus_l1(val_loader, vq_model, trans, repeat_id, e
         code_indices, all_codes = vq_model.encode(pose)
         # print(code_indices[0:2, :, 1])
 
-        pred_ids = trans.generate(code_indices[..., 0], clip_text, m_length//4, topk_filter_thres=topkr,
+        pred_ids = trans.generate(code_indices[..., 0], clip_text, torch.div(m_length, 4, rounding_mode='floor'), topk_filter_thres=topkr,
                                   temperature=temperature, cond_scale=cond_scale)
-            # pred_codes = trans(code_indices[..., 0], clip_text, m_length//4, force_mask=force_mask)
+            # pred_codes = trans(code_indices[..., 0], clip_text, torch.div(m_length, 4, rounding_mode='floor'), force_mask=force_mask)
 
         pred_motions = vq_model.forward_decoder(pred_ids)
 
@@ -863,7 +863,7 @@ def evaluation_mask_transformer_test(val_loader, vq_model, trans, repeat_id, eva
         # (b, seqlen, c)
             motion_multimodality_batch = []
             for _ in range(30):
-                mids = trans.generate(clip_text, m_length // 4, time_steps, cond_scale,
+                mids = trans.generate(clip_text, torch.div(m_length, 4, rounding_mode='floor'), time_steps, cond_scale,
                                       temperature=temperature, topk_filter_thres=topkr,
                                       gsample=gsample, force_mask=force_mask)
 
@@ -878,7 +878,7 @@ def evaluation_mask_transformer_test(val_loader, vq_model, trans, repeat_id, eva
             motion_multimodality_batch = torch.cat(motion_multimodality_batch, dim=1) #(bs, 30, d)
             motion_multimodality.append(motion_multimodality_batch)
         else:
-            mids = trans.generate(clip_text, m_length // 4, time_steps, cond_scale,
+            mids = trans.generate(clip_text, torch.div(m_length, 4, rounding_mode='floor'), time_steps, cond_scale,
                                   temperature=temperature, topk_filter_thres=topkr,
                                   force_mask=force_mask)
 
@@ -976,14 +976,14 @@ def evaluation_mask_transformer_test_plus_res(val_loader, vq_model, res_model, t
         # (b, seqlen, c)
             motion_multimodality_batch = []
             for _ in range(30):
-                mids = trans.generate(clip_text, m_length // 4, time_steps, cond_scale,
+                mids = trans.generate(clip_text, torch.div(m_length, 4, rounding_mode='floor'), time_steps, cond_scale,
                                       temperature=temperature, topk_filter_thres=topkr,
                                       gsample=gsample, force_mask=force_mask)
 
                 # motion_codes = motion_codes.permute(0, 2, 1)
                 # mids.unsqueeze_(-1)
-                pred_ids = res_model.generate(mids, clip_text, m_length // 4, temperature=1, cond_scale=res_cond_scale)
-                # pred_codes = trans(code_indices[..., 0], clip_text, m_length//4, force_mask=force_mask)
+                pred_ids = res_model.generate(mids, clip_text, torch.div(m_length, 4, rounding_mode='floor'), temperature=1, cond_scale=res_cond_scale)
+                # pred_codes = trans(code_indices[..., 0], clip_text, torch.div(m_length, 4, rounding_mode='floor'), force_mask=force_mask)
                 # pred_ids = torch.where(pred_ids==-1, 0, pred_ids)
 
                 pred_motions = vq_model.forward_decoder(pred_ids)
@@ -998,14 +998,14 @@ def evaluation_mask_transformer_test_plus_res(val_loader, vq_model, res_model, t
             motion_multimodality_batch = torch.cat(motion_multimodality_batch, dim=1) #(bs, 30, d)
             motion_multimodality.append(motion_multimodality_batch)
         else:
-            mids = trans.generate(clip_text, m_length // 4, time_steps, cond_scale,
+            mids = trans.generate(clip_text, torch.div(m_length, 4, rounding_mode='floor'), time_steps, cond_scale,
                                   temperature=temperature, topk_filter_thres=topkr,
                                   force_mask=force_mask)
 
             # motion_codes = motion_codes.permute(0, 2, 1)
             # mids.unsqueeze_(-1)
-            pred_ids = res_model.generate(mids, clip_text, m_length // 4, temperature=1, cond_scale=res_cond_scale)
-            # pred_codes = trans(code_indices[..., 0], clip_text, m_length//4, force_mask=force_mask)
+            pred_ids = res_model.generate(mids, clip_text, torch.div(m_length, 4, rounding_mode='floor'), temperature=1, cond_scale=res_cond_scale)
+            # pred_codes = trans(code_indices[..., 0], clip_text, torch.div(m_length, 4, rounding_mode='floor'), force_mask=force_mask)
             # pred_ids = torch.where(pred_ids == -1, 0, pred_ids)
 
             pred_motions = vq_model.forward_decoder(pred_ids)

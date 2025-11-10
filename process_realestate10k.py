@@ -116,7 +116,7 @@ def main():
         "--ai-max-frames",
         type=int,
         default=32,
-        help="Maximum number of frames to use for AI caption generation (default: 32)"
+        help="Maximum number of frames to use for AI caption generation (default: 32, images auto-resized to 720p)"
     )
     parser.add_argument(
         "--video-frames-dir",
@@ -139,7 +139,7 @@ def main():
         "--ai-batch-size",
         type=int,
         default=2,
-        help="Number of scenes to process per inference batch (default: 2, recommended: 2-4)"
+        help="Number of scenes to process per inference batch (default: 2, images auto-resized to 720p)"
     )
     parser.add_argument(
         "--resume-captioning",
@@ -171,6 +171,18 @@ def main():
     if args.use_ai_captioning and not args.video_frames_dir:
         print("Warning: --use-ai-captioning enabled but --video-frames-dir not specified.")
         print("AI captioning will fall back to deterministic captions if frames are not found.")
+    
+    # Info: Validate batch_size × max_frames (images auto-resized to 720p)
+    if args.use_ai_captioning:
+        total_images = args.ai_batch_size * args.ai_max_frames
+        if total_images > 128:
+            print("=" * 60)
+            print("⚠️  Large batch detected")
+            print("=" * 60)
+            print(f"batch_size × max_frames = {args.ai_batch_size} × {args.ai_max_frames} = {total_images} images/batch")
+            print(f"Note: Images are auto-resized to 720p (1280×720) to prevent OOM")
+            print(f"Recommended: Keep batch_size × max_frames < 128 for best performance")
+            print("=" * 60)
     
     # Initialize processor
     processor = RealEstate10KProcessor(
