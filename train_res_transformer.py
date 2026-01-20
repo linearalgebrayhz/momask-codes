@@ -80,8 +80,8 @@ def load_vq_model():
         if not checkpoint_loaded:
             raise FileNotFoundError(f"No checkpoint found in {pjoin(vq_opt.checkpoints_dir, vq_opt.dataset_name, vq_opt.name, 'model')}")
     else:
-        # For human motion datasets, use the original logic
-        ckpt = torch.load(pjoin(vq_opt.checkpoints_dir, vq_opt.dataset_name, vq_opt.name, 'model', 'net_best_fid.tar'),
+        # For human motion datasets, use best reconstruction checkpoint
+        ckpt = torch.load(pjoin(vq_opt.checkpoints_dir, vq_opt.dataset_name, vq_opt.name, 'model', 'net_best_recon.tar'),
                                 map_location=opt.device)
         model_key = 'vq_model' if 'vq_model' in ckpt else 'net'
         vq_model.load_state_dict(ckpt[model_key])
@@ -201,11 +201,15 @@ if __name__ == '__main__':
     if is_camera_dataset:
         # Use frame-aware collate function if --use_frames flag is set
         collate_fn = collate_fn_text2motion_camera_train_frames if getattr(opt, 'use_frames', False) else collate_fn_text2motion_camera_train
-        train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, collate_fn=collate_fn)
-        val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, collate_fn=collate_fn)
+        train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, 
+                                   collate_fn=collate_fn, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, 
+                                 collate_fn=collate_fn, pin_memory=True)
     else:
-        train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True)
-        val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True)
+        train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, 
+                                   pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, 
+                                 pin_memory=True)
 
     eval_val_loader, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device)
 

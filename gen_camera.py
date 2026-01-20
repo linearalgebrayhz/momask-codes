@@ -1104,16 +1104,16 @@ Usage Examples:
 # For 6D realestate10k_6 dataset with animations
 CUDA_VISIBLE_DEVICES=7 python gen_camera.py \
     --dataset_name realestate10k_6 \
-    --name mtrans_realestate10k_6_70K \
-    --res_name rtrans_realestate10k_6_70K \
+    --name mtrans_noframe_baseline2 \
+    --res_name rtrans_baseline_noframe2 \
     --gpu_id 0 \
     --text_path camera_prompts.txt \
-    --repeat_times 1 \
+    --repeat_times 3 \
     --time_steps 10 \
     --cond_scale 3 \
     --temperature 1.0 \
     --topkr 0.9 \
-    --ext camera_batch_generation_6_70K
+    --ext camera_baseline_noframe
 
 # Demo the animation features
 python demo_camera_animation.py --demo-type full

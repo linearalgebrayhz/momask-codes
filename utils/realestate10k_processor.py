@@ -696,7 +696,7 @@ class RealEstate10KProcessor:
         Initialize processor
         
         Args:
-            output_format: "6" for 6-feature or "12" for 12-feature output
+            output_format: "6" for 6-feature or "12" for 12-feature output. Also support new 'quat' representation.
             min_sequence_length: Minimum sequence length to keep
             max_sequence_length: Maximum sequence length to keep
             existing_captions_path: Path to existing processed_estate captions directory
@@ -776,6 +776,9 @@ class RealEstate10KProcessor:
             self.target_format = CameraDataFormat.POSITION_ORIENTATION_6
         elif output_format == "12":
             self.target_format = CameraDataFormat.FULL_12
+        elif output_format == "quat":
+            pass
+            # self.target_format = CameraDataFormat.QUATERNION_10
         else:
             raise ValueError(f"Unsupported output format: {output_format}. Use '6' or '12'")
     
@@ -950,6 +953,29 @@ class RealEstate10KProcessor:
         
         return trajectory
     
+    def _rotation_matrices_to_quat(self, rotation_matrices: np.ndarray) -> np.ndarray:
+        """
+        Convert rotation matrices to quaternions [qx, qy, qz, qw].
+        
+        Args:
+            rotation_matrices: Array of shape (seq_len, 3, 3)
+            
+        Returns:
+            quaternions: Array of shape (seq_len, 4)
+        """
+        from scipy.spatial.transform import Rotation as R
+        
+        seq_len = rotation_matrices.shape[0]
+        quaternions = np.zeros((seq_len, 4))
+        
+        for i in range(seq_len):
+            rotation_matrix = rotation_matrices[i]
+            rot = R.from_matrix(rotation_matrix)
+            quat = rot.as_quat()  # Returns [qx, qy, qz, qw], should be normlized
+            quaternions[i] = quat
+        
+        return quaternions
+
     def _rotation_matrices_to_euler(self, rotation_matrices: np.ndarray) -> np.ndarray:
         """
         Convert rotation matrices to Euler angles (pitch, yaw, roll).

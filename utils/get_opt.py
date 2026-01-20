@@ -103,6 +103,8 @@ def get_opt(opt_path, device, **kwargs):
         raise KeyError('Dataset not recognized')
     if not hasattr(opt, 'unit_length'):
         opt.unit_length = 4
+    if not hasattr(opt, 'max_text_len'):
+        opt.max_text_len = 20  # Default max text length
     opt.dim_word = 300
     opt.num_classes = 200 // opt.unit_length
     opt.dim_pos_ohot = len(POS_enumerator)

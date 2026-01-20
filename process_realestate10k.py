@@ -14,6 +14,11 @@ Usage:
 
     # Process only specific scenes
     python process_realestate10k.py /path/to/camera/files ./dataset/RealEstate10K --scene-list scene_list.txt
+
+
+New:
+Considering create a new representation: [x,y,z,dx,dy,dz,a,b,c,d] rotation represented in quaternion instead of using Euler Angles
+
 """
 
 import argparse
@@ -43,9 +48,9 @@ def main():
     )
     parser.add_argument(
         "--format", 
-        choices=["6", "12"], 
+        choices=["6", "12", "quat"], 
         default="6",
-        help="Output format: '6' for [x,y,z,pitch,yaw,roll] or '12' for full dynamics (default: 6)"
+        help="Output format: '6' for [x,y,z,pitch,yaw,roll] or '12' for full dynamics (default: 6). Also support new representation 'quat' for [x,y,z,dx,dy,dz,qw,qx,qy,qz]"
     )
     parser.add_argument(
         "--scene-list", 
@@ -320,9 +325,9 @@ python process_realestate10k.py \
     --existing-captions /data5/haozhe/CamTraj/data/processed_estate/train_video_captions \
     --caption-only
 
-CUDA_VISIBLE_DEVICES=7 python process_realestate10k.py \0
+CUDA_VISIBLE_DEVICES=7 python process_realestate10k.py \
     /data5/haozhe/CamTraj/data/real-state-10k/RealEstate10K/train \
-    ./dataset/RealEstate10K_6feat_qwen \
+    ./dataset/RealEstate10K_6feat_baseline \
     --format 6 \
     --transform relative \
     --caption-motion \
@@ -331,4 +336,11 @@ CUDA_VISIBLE_DEVICES=7 python process_realestate10k.py \0
     --ai-model Qwen/Qwen3-VL-4B-Instruct \
     --ai-batch-size 4 \
     --max-scenes 45000
+
+python process_realestate10k.py \
+    /data5/haozhe/CamTraj/data/real-state-10k/RealEstate10K/train \
+    ./dataset/RealEstate10K_6feat_baseline \
+    --format 6 \
+    --transform relative \
+    --max-scenes 1000
 """
