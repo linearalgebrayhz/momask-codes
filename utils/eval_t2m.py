@@ -427,9 +427,11 @@ def evaluation_mask_transformer(out_dir, val_loader, trans, vq_model, writer, ep
 
     def save(file_name, ep):
         t2m_trans_state_dict = trans.state_dict()
-        clip_weights = [e for e in t2m_trans_state_dict.keys() if e.startswith('clip_model.')]
-        for e in clip_weights:
-            del t2m_trans_state_dict[e]
+        # Only exclude CLIP weights if NOT fine-tuning
+        if not trans.finetune_clip:
+            clip_weights = [e for e in t2m_trans_state_dict.keys() if e.startswith('clip_model.')]
+            for e in clip_weights:
+                del t2m_trans_state_dict[e]
         state = {
             't2m_transformer': t2m_trans_state_dict,
             # 'opt_t2m_transformer': self.opt_t2m_transformer.state_dict(),
@@ -580,9 +582,11 @@ def evaluation_res_transformer(out_dir, val_loader, trans, vq_model, writer, ep,
 
     def save(file_name, ep):
         res_trans_state_dict = trans.state_dict()
-        clip_weights = [e for e in res_trans_state_dict.keys() if e.startswith('clip_model.')]
-        for e in clip_weights:
-            del res_trans_state_dict[e]
+        # Only exclude CLIP weights if NOT fine-tuning
+        if not trans.finetune_clip:
+            clip_weights = [e for e in res_trans_state_dict.keys() if e.startswith('clip_model.')]
+            for e in clip_weights:
+                del res_trans_state_dict[e]
         state = {
             'res_transformer': res_trans_state_dict,
             # 'opt_t2m_transformer': self.opt_t2m_transformer.state_dict(),

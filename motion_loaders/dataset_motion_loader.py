@@ -5,7 +5,7 @@ from os.path import join as pjoin
 from torch.utils.data import DataLoader
 from utils.get_opt import get_opt
 
-def get_dataset_motion_loader(opt_path, batch_size, fname, device):
+def get_dataset_motion_loader(opt_path, batch_size, fname, device, load_frames=False):
     opt = get_opt(opt_path, device)
 
     # Configurations of T2M dataset and KIT dataset is almost the same
@@ -17,7 +17,7 @@ def get_dataset_motion_loader(opt_path, batch_size, fname, device):
 
         w_vectorizer = WordVectorizer('./glove', 'our_vab')
         split_file = pjoin(opt.data_root, '%s.txt'%fname)
-        dataset = Text2MotionDatasetEval(opt, mean, std, split_file, w_vectorizer)
+        dataset = Text2MotionDatasetEval(opt, mean, std, split_file, w_vectorizer, load_frames=load_frames)
         # Use camera-specific collate function for camera datasets
         if opt.dataset_name == 'cam':
             dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=4, drop_last=True,
@@ -33,7 +33,7 @@ def get_dataset_motion_loader(opt_path, batch_size, fname, device):
         split_file = pjoin(opt.data_root, '%s.txt'%fname)
         # print(f"opt.data_root: {opt.data_root}")
         # exit()
-        dataset = Text2MotionDatasetEval(opt, mean, std, split_file, w_vectorizer)
+        dataset = Text2MotionDatasetEval(opt, mean, std, split_file, w_vectorizer, load_frames=load_frames)
         dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=4, drop_last=True,collate_fn=collate_fn_text2motion_camera, shuffle=True) # collate fn for realestate10k_6 and realestate10k_6?
     else:
         raise KeyError('Dataset not Recognized !!')

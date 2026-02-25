@@ -17,3 +17,14 @@ dataset_structure.txt
 camera_prompts.txt
 dataset_vis/
 rvq_dataset_comparison/
+
+# dataset split
+scene_partitions*
+merge_dataset_splits.py
+partition_scenes.py
+dataset_config.md
+dataset_stats.json
+sample_scenes.py
+
+# AI doc
+claude_summary/

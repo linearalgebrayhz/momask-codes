@@ -59,6 +59,14 @@ class SparseKeyframeEncoder(nn.Module):
             nn.ReLU(inplace=True)
         )
         
+        # Pre-create image transform (avoid recreating every forward pass)
+        import torchvision.transforms as transforms
+        self.image_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
         print(f"SparseKeyframeEncoder: {resnet_arch} (trainable) + Temporal Conv → {latent_dim}D")
     
     def encode_frames(self, images):
@@ -76,59 +84,47 @@ class SparseKeyframeEncoder(nn.Module):
         features = features.squeeze(-1).squeeze(-1)  # (N_total, resnet_dim)
         return features
     
-    def forward(self, frame_paths_batch, m_lens, deterministic=False):
+    def forward(self, frames_batch, m_lens, deterministic=False):
         """
-        Main forward pass: load frames → ResNet → sparse tensor → temporal downsample.
+        OPTIMIZED forward pass with GPU-native image decoding and batch processing.
         
         Args:
-            frame_paths_batch: List of List[Path], length B
-                Each element is a list of ALL frame paths for that scene (T_i frames, varies 100-280)
+            frames_batch: List of frame paths, length B
+                Each element is List[Path] - paths to ALL available frames for that scene
             m_lens: Tensor (B,) - original motion lengths (before VQ downsampling)
             deterministic: If True, always sample N=2 frames at fixed positions (for validation)
         
         Returns:
             frame_embeddings: Tensor (T_motion, B, latent_dim)
                 Where T_motion = T_original // 4 (matches motion token sequence length)
+            has_frames: bool - Whether any sample in batch has actual frames
         """
-        from PIL import Image
-        import torchvision.transforms as transforms
         import random
         import numpy as np
         
         device = next(self.parameters()).device
-        batch_size = len(frame_paths_batch)
+        batch_size = len(frames_batch)
         
-        # Image preprocessing (ImageNet normalization)
-        transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        # ===== PHASE 1: Sample keyframe INDICES for entire batch =====
+        batch_metadata = []
+        total_sampled_frames = 0
         
-        # ===== PHASE 1: Collect all images to batch encode =====
-        all_images_list = []  # Will collect all sampled images
-        batch_metadata = []   # Track which images belong to which sample
-        
-        for b_idx, frame_paths in enumerate(frame_paths_batch):
-            # Use the actual motion length, not frame path count
-            T = int(m_lens[b_idx].item())  # Motion trajectory length (100-280)
-            num_available_frames = len(frame_paths)  # Available frame images
+        for b_idx, frame_paths in enumerate(frames_batch):
+            T = int(m_lens[b_idx].item())
+            num_available_frames = len(frame_paths) if frame_paths else 0
             
             if num_available_frames == 0 or T == 0:
-                # No frames available - will create dummy zeros later
                 batch_metadata.append({
                     'b_idx': b_idx,
                     'T': T,
                     'N': 0,
                     'sampled_indices': [],
-                    'image_start_idx': len(all_images_list),
-                    'image_end_idx': len(all_images_list)
+                    'sampled_paths': []
                 })
                 continue
             
-            # Sample keyframes
+            # Sample keyframe indices
             if deterministic:
-                # Validation mode: fixed N=2 frames at 1/3 and 2/3 positions
                 N = 2
                 max_frame_idx = min(num_available_frames, T) - 1
                 if max_frame_idx < 1:
@@ -139,103 +135,145 @@ class SparseKeyframeEncoder(nn.Module):
                     idx2 = (max_frame_idx * 2) // 3
                     sampled_indices = sorted([idx1, idx2])
             else:
-                # Training mode: random N ∈ [0, 1, 2, 3, 4]
                 N = random.randint(0, 4)
                 
                 if N == 0:
-                    # No keyframes - will create all-zeros sparse tensor later
                     batch_metadata.append({
                         'b_idx': b_idx,
                         'T': T,
                         'N': 0,
                         'sampled_indices': [],
-                        'image_start_idx': len(all_images_list),
-                        'image_end_idx': len(all_images_list)
+                        'sampled_paths': []
                     })
                     continue
                 
-                # Sample from available frames, but respect motion length T
                 max_frame_idx = min(num_available_frames, T) - 1
                 if max_frame_idx < 0:
                     max_frame_idx = 0
                 
-                # Non-uniformly sample N unique indices from [0, max_frame_idx]
                 perm = torch.randperm(max_frame_idx + 1)[:N]
                 sampled_indices = sorted(perm.tolist())
             
-            # Load sampled frames
-            image_start_idx = len(all_images_list)
-            for idx in sampled_indices:
-                img = Image.open(frame_paths[idx]).convert('RGB')
-                all_images_list.append(transform(img))
+            # Collect sampled frame paths
+            sampled_paths = [frame_paths[idx] for idx in sampled_indices]
             
             batch_metadata.append({
                 'b_idx': b_idx,
                 'T': T,
                 'N': N,
                 'sampled_indices': sampled_indices,
-                'image_start_idx': image_start_idx,
-                'image_end_idx': len(all_images_list)
+                'sampled_paths': sampled_paths
             })
+            total_sampled_frames += N
         
-        # ===== PHASE 2: Batch encode all images with ResNet =====
-        if len(all_images_list) > 0:
-            # Stack all images into single batch
-            all_images_tensor = torch.stack(all_images_list).to(device)  # (total_N, 3, 224, 224)
-            
-            # Single ResNet forward pass for ALL images
-            with torch.set_grad_enabled(self.training):
-                all_features = self.encode_frames(all_images_tensor)  # (total_N, resnet_dim)
+        # ===== PHASE 2: Batch load and process ALL sampled frames at once =====
+        if total_sampled_frames > 0:
+            try:
+                # Try GPU-native decoding with torchvision.io (fastest)
+                import torchvision.io as tvio
+                
+                # Read all images as byte streams and decode on GPU
+                all_images_list = []
+                for meta in batch_metadata:
+                    for path in meta['sampled_paths']:
+                        try:
+                            # Read image file as bytes
+                            img_bytes = tvio.read_file(str(path))
+                            # Decode directly to GPU tensor (RGB, uint8)
+                            img_tensor = tvio.decode_jpeg(img_bytes, device=device)  # (H, W, 3)
+                            all_images_list.append(img_tensor)
+                        except Exception as e:
+                            # Fallback: create dummy tensor on GPU
+                            all_images_list.append(torch.zeros(224, 224, 3, dtype=torch.uint8, device=device))
+                
+                if len(all_images_list) > 0:
+                    # Stack all images: (total_N, H, W, 3)
+                    all_images_tensor = torch.stack(all_images_list)
+                    
+                    # Batch resize and normalize on GPU
+                    # Convert to float and permute to (total_N, 3, H, W)
+                    all_images_tensor = all_images_tensor.permute(0, 3, 1, 2).float() / 255.0
+                    
+                    # Batch resize
+                    all_images_tensor = torch.nn.functional.interpolate(
+                        all_images_tensor, 
+                        size=(224, 224), 
+                        mode='bilinear', 
+                        align_corners=False
+                    )
+                    
+                    # Normalize (ImageNet stats)
+                    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+                    all_images_tensor = (all_images_tensor - mean) / std
+                    
+                    # Single ResNet forward pass for ALL images
+                    with torch.set_grad_enabled(self.training):
+                        all_features = self.encode_frames(all_images_tensor)  # (total_N, resnet_dim)
+                else:
+                    all_features = None
+                    
+            except (ImportError, AttributeError, RuntimeError) as e:
+                # Fallback to CPU PIL processing if GPU decode fails
+                print(f"Warning: GPU image decoding failed ({e}), falling back to CPU PIL")
+                from PIL import Image
+                
+                all_images_list = []
+                for meta in batch_metadata:
+                    for path in meta['sampled_paths']:
+                        try:
+                            img = Image.open(path).convert('RGB')
+                            img_tensor = self.image_transform(img)
+                            all_images_list.append(img_tensor)
+                        except Exception:
+                            all_images_list.append(torch.zeros(3, 224, 224))
+                
+                if len(all_images_list) > 0:
+                    all_images_tensor = torch.stack(all_images_list).to(device)
+                    with torch.set_grad_enabled(self.training):
+                        all_features = self.encode_frames(all_images_tensor)
+                else:
+                    all_features = None
         else:
             all_features = None
         
-        # ===== PHASE 3: Reconstruct sparse tensors per sample =====
+        # ===== PHASE 3: Reconstruct sparse tensors (optimized with scatter) =====
         sparse_features_list = []
-        has_any_frames = False  # Track if any sample in batch has frames
+        has_any_frames = total_sampled_frames > 0
+        
+        feature_offset = 0
+        max_T = max(meta['T'] for meta in batch_metadata)
         
         for meta in batch_metadata:
             T = meta['T']
             N = meta['N']
             
-            if N > 0:
-                has_any_frames = True
-            
-            if N == 0:
-                # No frames - create zeros
+            if N == 0 or all_features is None:
                 sparse_features = torch.zeros(T, self.resnet_dim, device=device)
             else:
-                # Extract this sample's features from batched output
-                sample_features = all_features[meta['image_start_idx']:meta['image_end_idx']]
+                # Extract this sample's features
+                sample_features = all_features[feature_offset:feature_offset + N]
+                feature_offset += N
                 
-                # Create sparse tensor: (T, resnet_dim) with zeros everywhere except sampled positions
+                # Create sparse tensor using scatter (faster than loop)
                 sparse_features = torch.zeros(T, self.resnet_dim, device=device)
-                for i, idx in enumerate(meta['sampled_indices']):
-                    sparse_features[idx] = sample_features[i]
+                indices_tensor = torch.tensor(meta['sampled_indices'], device=device, dtype=torch.long)
+                sparse_features.index_copy_(0, indices_tensor, sample_features)
+            
+            # Pad to max_T
+            if T < max_T:
+                padding = torch.zeros(max_T - T, self.resnet_dim, device=device)
+                sparse_features = torch.cat([sparse_features, padding], dim=0)
             
             sparse_features_list.append(sparse_features)
         
-        # Pad to same length (max T in batch)
-        max_T = max(sf.shape[0] for sf in sparse_features_list)
+        # Stack: (B, max_T, resnet_dim)
+        sparse_batch = torch.stack(sparse_features_list)
         
-        padded_features = []
-        for sf in sparse_features_list:
-            T = sf.shape[0]
-            if T < max_T:
-                padding = torch.zeros(max_T - T, self.resnet_dim, device=device)
-                sf = torch.cat([sf, padding], dim=0)
-            padded_features.append(sf)
-        
-        # Stack: (B, T, resnet_dim)
-        sparse_batch = torch.stack(padded_features)
-        
-        # Temporal downsampling: (B, T, resnet_dim) → (B, T//4, latent_dim)
-        # Conv1d expects (B, C, T), so permute
-        sparse_batch = sparse_batch.permute(0, 2, 1)  # (B, resnet_dim, T)
-        
-        downsampled = self.temporal_downsample(sparse_batch)  # (B, latent_dim, T//4)
-        
-        # Permute back to (T//4, B, latent_dim) for transformer
-        downsampled = downsampled.permute(2, 0, 1)
+        # Temporal downsampling: (B, max_T, resnet_dim) → (B, max_T//4, latent_dim)
+        sparse_batch = sparse_batch.permute(0, 2, 1)  # (B, resnet_dim, max_T)
+        downsampled = self.temporal_downsample(sparse_batch)  # (B, latent_dim, max_T//4)
+        downsampled = downsampled.permute(2, 0, 1)  # (max_T//4, B, latent_dim)
         
         return downsampled, has_any_frames
 

@@ -155,6 +155,23 @@ class ExperimentLogger:
         if self.use_wandb and self.wandb_run is not None:
             self.wandb.watch(model, log='all', log_freq=log_freq)
     
+    # Backward compatibility aliases for TensorBoard API
+    def add_scalar(self, tag, value, step):
+        """Alias for log_scalar() - TensorBoard API compatibility."""
+        self.log_scalar(tag, value, step)
+    
+    def add_image(self, tag, image, step):
+        """Alias for log_image() - TensorBoard API compatibility."""
+        self.log_image(tag, image, step)
+    
+    def add_histogram(self, tag, values, step):
+        """Alias for log_histogram() - TensorBoard API compatibility."""
+        self.log_histogram(tag, values, step)
+    
+    def add_text(self, tag, text, step):
+        """Alias for log_text() - TensorBoard API compatibility."""
+        self.log_text(tag, text, step)
+    
     def finish(self):
         """Close loggers."""
         self.tb_writer.close()

@@ -84,7 +84,8 @@ class OutputProcess(nn.Module):
 class MaskTransformer(nn.Module):
     def __init__(self, code_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8,
                  num_heads=4, dropout=0.1, clip_dim=512, cond_drop_prob=0.1,
-                 clip_version=None, opt=None, use_frames=False, frame_dim=512, **kargs):
+                 clip_version=None, opt=None, use_frames=False, frame_dim=512, finetune_clip=False, 
+                 finetune_clip_layers=2, **kargs):
         super(MaskTransformer, self).__init__()
         print(f'latent_dim: {latent_dim}, ff_size: {ff_size}, nlayers: {num_layers}, nheads: {num_heads}, dropout: {dropout}')
 
@@ -94,6 +95,8 @@ class MaskTransformer(nn.Module):
         self.dropout = dropout
         self.opt = opt
         self.use_frames = use_frames
+        self.finetune_clip = finetune_clip
+        self.finetune_clip_layers = finetune_clip_layers
 
         self.cond_mode = cond_mode
         self.cond_drop_prob = cond_drop_prob
@@ -158,6 +161,10 @@ class MaskTransformer(nn.Module):
             print('Loading CLIP...')
             self.clip_version = clip_version
             self.clip_model = self.load_and_freeze_clip(clip_version)
+            if self.finetune_clip:
+                print(f'CLIP Fine-tuning: ENABLED (last {self.finetune_clip_layers} layers)')
+            else:
+                print('CLIP Fine-tuning: DISABLED (fully frozen)')
 
         self.noise_schedule = cosine_schedule
 
@@ -184,21 +191,47 @@ class MaskTransformer(nn.Module):
             module.weight.data.fill_(1.0)
 
     def parameters_wo_clip(self):
-        return [p for name, p in self.named_parameters() if not name.startswith('clip_model.')]
+        """Return parameters excluding CLIP (unless fine-tuning CLIP)"""
+        if self.finetune_clip:
+            # When fine-tuning, include all parameters (including CLIP)
+            return list(self.parameters())
+        else:
+            # When CLIP is frozen, exclude CLIP parameters
+            return [p for name, p in self.named_parameters() if not name.startswith('clip_model.')]
 
     def load_and_freeze_clip(self, clip_version):
         clip_model, clip_preprocess = clip.load(clip_version, device='cpu',
                                                 jit=False)  # Must set jit=False for training
-        # Added support for cpu
-        if str(self.opt.device) != "cpu":
-            clip.model.convert_weights(
-                clip_model)  # Actually this line is unnecessary since clip by default already on float16
-            # Date 0707: It's necessary, only unecessary when load directly to gpu. Disable if need to run on cpu
+        # Convert to FP16 only if NOT fine-tuning (fine-tuning requires FP32 for stability)
+        if str(self.opt.device) != "cpu" and not self.finetune_clip:
+            clip.model.convert_weights(clip_model)  # Convert to FP16 for inference only
 
-        # Freeze CLIP weights
-        clip_model.eval()
-        for p in clip_model.parameters():
-            p.requires_grad = False
+        # Conditionally freeze CLIP weights
+        if self.finetune_clip:
+            # Unfreeze last N transformer layers
+            clip_model.eval()  # Keep in eval mode for stability
+            # Freeze all parameters first
+            for p in clip_model.parameters():
+                p.requires_grad = False
+            
+            # Unfreeze last N transformer layers (resblocks)
+            total_layers = len(clip_model.transformer.resblocks)
+            for i in range(total_layers - self.finetune_clip_layers, total_layers):
+                for p in clip_model.transformer.resblocks[i].parameters():
+                    p.requires_grad = True
+            
+            # Unfreeze final layer norm and projection
+            for p in clip_model.ln_final.parameters():
+                p.requires_grad = True
+            if hasattr(clip_model, 'text_projection') and clip_model.text_projection is not None:
+                clip_model.text_projection.requires_grad = True
+            
+            print(f'Unfroze last {self.finetune_clip_layers} transformer layers + final LN + projection')
+        else:
+            # Freeze all CLIP weights
+            clip_model.eval()
+            for p in clip_model.parameters():
+                p.requires_grad = False
 
         return clip_model
 
@@ -287,8 +320,12 @@ class MaskTransformer(nn.Module):
 
         force_mask = False
         if self.cond_mode == 'text':
-            with torch.no_grad():
+            # Only disable gradients if CLIP is frozen
+            if self.finetune_clip:
                 cond_vector = self.encode_text(y)
+            else:
+                with torch.no_grad():
+                    cond_vector = self.encode_text(y)
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(y).to(device).float()
         elif self.cond_mode == 'uncond':
@@ -334,6 +371,70 @@ class MaskTransformer(nn.Module):
 
         return ce_loss, pred_id, acc
 
+    def forward_with_logits(self, ids, y, m_lens, frame_emb=None, has_frames=False):
+        '''
+        Same as forward() but also returns logits for Gumbel-softmax smoothness loss.
+        This allows gradient flow through soft token predictions.
+        '''
+        bs, ntokens = ids.shape
+        device = ids.device
+
+        # Positions that are PADDED are ALL FALSE
+        non_pad_mask = lengths_to_mask(m_lens, ntokens) #(b, n)
+        ids = torch.where(non_pad_mask, ids, self.pad_id)
+
+        force_mask = False
+        if self.cond_mode == 'text':
+            # Only disable gradients if CLIP is frozen
+            if self.finetune_clip:
+                cond_vector = self.encode_text(y)
+            else:
+                with torch.no_grad():
+                    cond_vector = self.encode_text(y)
+        elif self.cond_mode == 'action':
+            cond_vector = self.enc_action(y).to(device).float()
+        elif self.cond_mode == 'uncond':
+            cond_vector = torch.zeros(bs, self.latent_dim).float().to(device)
+            force_mask = True
+        else:
+            raise NotImplementedError("Unsupported condition mode!!!")
+
+        '''
+        Prepare mask
+        '''
+        rand_time = uniform((bs,), device=device)
+        rand_mask_probs = self.noise_schedule(rand_time)
+        num_token_masked = (ntokens * rand_mask_probs).round().clamp(min=1)
+
+        batch_randperm = torch.rand((bs, ntokens), device=device).argsort(dim=-1)
+        # Positions to be MASKED are ALL TRUE
+        mask = batch_randperm < num_token_masked.unsqueeze(-1)
+
+        # Positions to be MASKED must also be NON-PADDED
+        mask &= non_pad_mask
+
+        # Note this is our training target, not input
+        labels = torch.where(mask, ids, self.mask_id)
+
+        x_ids = ids.clone()
+
+        # Further Apply Bert Masking Scheme
+        # Step 1: 10% replace with an incorrect token
+        mask_rid = get_mask_subset_prob(mask, 0.1)
+        rand_id = torch.randint_like(x_ids, high=self.opt.num_tokens)
+        x_ids = torch.where(mask_rid, rand_id, x_ids)
+        # Step 2: 90% x 10% replace with correct token, and 90% x 88% replace with mask token
+        mask_mid = get_mask_subset_prob(mask & ~mask_rid, 0.88)
+
+        x_ids = torch.where(mask_mid, self.mask_id, x_ids)
+
+        logits = self.trans_forward(x_ids, cond_vector, ~non_pad_mask, force_mask, 
+                                     frame_emb=frame_emb, has_frames=has_frames)
+        ce_loss, pred_id, acc = cal_performance(logits, labels, ignore_index=self.mask_id)
+
+        # Return logits as well for Gumbel-softmax
+        return ce_loss, pred_id, acc, logits
+
     def forward_with_cond_scale(self,
                                 motion_ids,
                                 cond_vector,
@@ -374,8 +475,12 @@ class MaskTransformer(nn.Module):
         batch_size = len(m_lens)
 
         if self.cond_mode == 'text':
-            with torch.no_grad():
+            # Only disable gradients if CLIP is frozen
+            if self.finetune_clip:
                 cond_vector = self.encode_text(conds)
+            else:
+                with torch.no_grad():
+                    cond_vector = self.encode_text(conds)
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(conds).to(device)
         elif self.cond_mode == 'uncond':
@@ -482,8 +587,12 @@ class MaskTransformer(nn.Module):
         seq_len = tokens.shape[1]
 
         if self.cond_mode == 'text':
-            with torch.no_grad():
+            # Only disable gradients if CLIP is frozen (inference always uses no_grad anyway)
+            if self.finetune_clip:
                 cond_vector = self.encode_text(conds)
+            else:
+                with torch.no_grad():
+                    cond_vector = self.encode_text(conds)
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(conds).to(device)
         elif self.cond_mode == 'uncond':
@@ -595,12 +704,20 @@ class MaskTransformer(nn.Module):
         seq_len = tokens.shape[1]
 
         if self.cond_mode == 'text':
-            with torch.no_grad():
+            # Only disable gradients if CLIP is frozen
+            if self.finetune_clip:
                 cond_vector = self.encode_text(conds)
                 if conds_og is not None:
                     cond_vector_og = self.encode_text(conds_og)
                 else:
                     cond_vector_og = None
+            else:
+                with torch.no_grad():
+                    cond_vector = self.encode_text(conds)
+                    if conds_og is not None:
+                        cond_vector_og = self.encode_text(conds_og)
+                    else:
+                        cond_vector_og = None
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(conds).to(device)
             if conds_og is not None:
@@ -642,7 +759,8 @@ class MaskTransformer(nn.Module):
 class ResidualTransformer(nn.Module):
     def __init__(self, code_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8, cond_drop_prob=0.1,
                  num_heads=4, dropout=0.1, clip_dim=512, shared_codebook=False, share_weight=False,
-                 clip_version=None, opt=None, use_frames=False, **kargs):
+                 clip_version=None, opt=None, use_frames=False, finetune_clip=False, 
+                 finetune_clip_layers=2, **kargs):
         super(ResidualTransformer, self).__init__()
         print(f'latent_dim: {latent_dim}, ff_size: {ff_size}, nlayers: {num_layers}, nheads: {num_heads}, dropout: {dropout}')
 
@@ -654,6 +772,8 @@ class ResidualTransformer(nn.Module):
         self.dropout = dropout
         self.opt = opt
         self.use_frames = use_frames
+        self.finetune_clip = finetune_clip
+        self.finetune_clip_layers = finetune_clip_layers
 
         self.cond_mode = cond_mode
         # self.cond_drop_prob = cond_drop_prob
@@ -740,6 +860,10 @@ class ResidualTransformer(nn.Module):
             print('Loading CLIP...')
             self.clip_version = clip_version
             self.clip_model = self.load_and_freeze_clip(clip_version)
+            if self.finetune_clip:
+                print(f'CLIP Fine-tuning: ENABLED (last {self.finetune_clip_layers} layers)')
+            else:
+                print('CLIP Fine-tuning: DISABLED (fully frozen)')
 
     # def
 
@@ -763,21 +887,47 @@ class ResidualTransformer(nn.Module):
             module.weight.data.fill_(1.0)
 
     def parameters_wo_clip(self):
-        return [p for name, p in self.named_parameters() if not name.startswith('clip_model.')]
+        """Return parameters excluding CLIP (unless fine-tuning CLIP)"""
+        if self.finetune_clip:
+            # When fine-tuning, include all parameters (including CLIP)
+            return list(self.parameters())
+        else:
+            # When CLIP is frozen, exclude CLIP parameters
+            return [p for name, p in self.named_parameters() if not name.startswith('clip_model.')]
 
     def load_and_freeze_clip(self, clip_version):
         clip_model, clip_preprocess = clip.load(clip_version, device='cpu',
                                                 jit=False)  # Must set jit=False for training
-        # Added support for cpu
-        if str(self.opt.device) != "cpu":
-            clip.model.convert_weights(
-                clip_model)  # Actually this line is unnecessary since clip by default already on float16
-            # Date 0707: It's necessary, only unecessary when load directly to gpu. Disable if need to run on cpu
+        # Convert to FP16 only if NOT fine-tuning (fine-tuning requires FP32 for stability)
+        if str(self.opt.device) != "cpu" and not self.finetune_clip:
+            clip.model.convert_weights(clip_model)  # Convert to FP16 for inference only
 
-        # Freeze CLIP weights
-        clip_model.eval()
-        for p in clip_model.parameters():
-            p.requires_grad = False
+        # Conditionally freeze CLIP weights
+        if self.finetune_clip:
+            # Unfreeze last N transformer layers
+            clip_model.eval()  # Keep in eval mode for stability
+            # Freeze all parameters first
+            for p in clip_model.parameters():
+                p.requires_grad = False
+            
+            # Unfreeze last N transformer layers (resblocks)
+            total_layers = len(clip_model.transformer.resblocks)
+            for i in range(total_layers - self.finetune_clip_layers, total_layers):
+                for p in clip_model.transformer.resblocks[i].parameters():
+                    p.requires_grad = True
+            
+            # Unfreeze final layer norm and projection
+            for p in clip_model.ln_final.parameters():
+                p.requires_grad = True
+            if hasattr(clip_model, 'text_projection') and clip_model.text_projection is not None:
+                clip_model.text_projection.requires_grad = True
+            
+            print(f'Unfroze last {self.finetune_clip_layers} transformer layers + final LN + projection')
+        else:
+            # Freeze all CLIP weights
+            clip_model.eval()
+            for p in clip_model.parameters():
+                p.requires_grad = False
 
         return clip_model
 
@@ -796,8 +946,9 @@ class ResidualTransformer(nn.Module):
     def process_embed_proj_weight(self):
         if self.share_weight and (not self.shared_codebook):
             # if not self.registered:
-            self.output_proj_weight = torch.cat([self.embed_proj_shared_weight, self.output_proj_weight_], dim=0)
-            self.token_embed_weight = torch.cat([self.token_embed_weight_, self.embed_proj_shared_weight], dim=0)
+            device = next(self.parameters()).device
+            self.output_proj_weight = torch.cat([self.embed_proj_shared_weight, self.output_proj_weight_], dim=0).to(device)
+            self.token_embed_weight = torch.cat([self.token_embed_weight_, self.embed_proj_shared_weight], dim=0).to(device)
                 # self.registered = True
 
     def output_project(self, logits, qids):
@@ -920,8 +1071,12 @@ class ResidualTransformer(nn.Module):
 
         force_mask = False
         if self.cond_mode == 'text':
-            with torch.no_grad():
+            # Only disable gradients if CLIP is frozen
+            if self.finetune_clip:
                 cond_vector = self.encode_text(y)
+            else:
+                with torch.no_grad():
+                    cond_vector = self.encode_text(y)
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(y).to(device).float()
         elif self.cond_mode == 'uncond':
@@ -957,8 +1112,12 @@ class ResidualTransformer(nn.Module):
         batch_size = len(conds)
 
         if self.cond_mode == 'text':
-            with torch.no_grad():
+            # Only disable gradients if CLIP is frozen
+            if self.finetune_clip:
                 cond_vector = self.encode_text(conds)
+            else:
+                with torch.no_grad():
+                    cond_vector = self.encode_text(conds)
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(conds).to(device)
         elif self.cond_mode == 'uncond':
@@ -982,7 +1141,7 @@ class ResidualTransformer(nn.Module):
             # print(f"--> Working on {i}-th quantizer")
             # Start from all tokens being masked
             # qids = torch.full((batch_size,), i, dtype=torch.long, device=motion_ids.device)
-            token_embed = self.token_embed_weight[i-1]
+            token_embed = self.token_embed_weight[i-1].to(device)
             token_embed = repeat(token_embed, 'c d -> b c d', b=batch_size)
             gathered_ids = repeat(motion_ids, 'b n -> b n d', d=token_embed.shape[-1])
             history_sum += token_embed.gather(1, gathered_ids)
@@ -1033,8 +1192,12 @@ class ResidualTransformer(nn.Module):
         batch_size = len(conds)
 
         if self.cond_mode == 'text':
-            with torch.no_grad():
+            # Only disable gradients if CLIP is frozen
+            if self.finetune_clip:
                 cond_vector = self.encode_text(conds)
+            else:
+                with torch.no_grad():
+                    cond_vector = self.encode_text(conds)
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(conds).to(device)
         elif self.cond_mode == 'uncond':

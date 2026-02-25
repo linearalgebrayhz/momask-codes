@@ -43,9 +43,16 @@ def collate_fn_text2motion_camera(batch):
     Custom collate function for Text2MotionDatasetEval with camera trajectories.
     Pads all motions to the maximum length in the batch.
     Expected format: (word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token)
+    or with frames: (word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token, keyframes)
     """
+    # Check if batch includes frames
+    has_frames = len(batch[0]) == 8
+    
     # Sort by length (descending) to get the maximum length first
-    batch.sort(key=lambda x: x[5], reverse=True)  # m_length is at index 5 for Text2MotionDatasetEval
+    if has_frames:
+        batch.sort(key=lambda x: x[5], reverse=True)  # m_length is at index 5
+    else:
+        batch.sort(key=lambda x: x[5], reverse=True)  # m_length is at index 5
     
     # Get the maximum length in this batch
     max_len = batch[0][5]  # motion length is at index 5
@@ -53,7 +60,11 @@ def collate_fn_text2motion_camera(batch):
     # Pad all motions to the same length
     padded_batch = []
     for item in batch:
-        word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token = item
+        if has_frames:
+            word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token, keyframes = item
+        else:
+            word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token = item
+            keyframes = None
         
         # Pad motion to max_len
         if motion.shape[0] < max_len:
@@ -62,7 +73,10 @@ def collate_fn_text2motion_camera(batch):
             motion = np.concatenate([motion, padding], axis=0)
         
         # Update the item with padded motion
-        padded_item = (word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token)
+        if has_frames:
+            padded_item = (word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token, keyframes)
+        else:
+            padded_item = (word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token)
         padded_batch.append(padded_item)
     
     # Use default collate on the padded batch
@@ -103,8 +117,9 @@ def collate_fn_text2motion_camera_train(batch):
 def collate_fn_text2motion_camera_train_frames(batch):
     """
     Custom collate function for Text2MotionDataset with camera trajectories and frames (training).
-    Pads all motions to the maximum length in the batch and handles frame paths.
+    Pads all motions to the maximum length in the batch and handles frame PATHS (not loaded tensors).
     Expected format: (caption, motion, m_length, frame_paths)
+    where frame_paths is a list of Path objects
     """
     # Check if batch includes frames
     has_frames = len(batch[0]) == 4
@@ -126,7 +141,7 @@ def collate_fn_text2motion_camera_train_frames(batch):
     frame_paths_list = []
     
     for item in batch:
-        caption, motion, m_length, frame_paths = item
+        caption, motion, m_length, frame_paths = item  # frame_paths is list of Path objects
         
         # Pad motion to max_len
         if motion.shape[0] < max_len:
@@ -136,13 +151,13 @@ def collate_fn_text2motion_camera_train_frames(batch):
         captions.append(caption)
         motions.append(motion)
         m_lengths.append(m_length)
-        frame_paths_list.append(frame_paths)
+        frame_paths_list.append(frame_paths)  # Keep as list of paths
     
     # Convert to tensors
     motions = torch.from_numpy(np.stack(motions, axis=0))
     m_lengths = torch.tensor(m_lengths)
     
-    return captions, motions, m_lengths, frame_paths_list
+    return captions, motions, m_lengths, frame_paths_list  # frame_paths_list is List[List[Path]]
 
 
 class MotionDataset(data.Dataset):
@@ -240,13 +255,52 @@ class MotionDataset(data.Dataset):
 
 
 class Text2MotionDatasetEval(data.Dataset):
-    def __init__(self, opt, mean, std, split_file, w_vectorizer):
+    def __init__(self, opt, mean, std, split_file, w_vectorizer, load_frames=False):
         self.opt = opt
         self.w_vectorizer = w_vectorizer
         self.max_length = 20 #?
         self.pointer = 0
         self.max_motion_length = opt.max_motion_length
         min_motion_len = 40 if self.opt.dataset_name =='t2m' else 24
+        
+        # Frame loading configuration for evaluation
+        self.load_frames = load_frames
+        if load_frames:
+            from pathlib import Path
+            import json
+            from PIL import Image
+            import torchvision.transforms as transforms
+            
+            # Frame preprocessing transforms (matching CLaTr)
+            self.frame_transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.48145466, 0.4578275, 0.40821073],
+                    std=[0.26862954, 0.26130258, 0.27577711]
+                ),
+            ])
+            
+            # Load scene_id_mapping
+            mapping_path = Path(opt.data_root) / 'scene_id_mapping.json'
+            if mapping_path.exists():
+                with open(mapping_path) as f:
+                    self.scene_id_mapping = json.load(f)
+                print(f"✅ Loaded scene ID mapping: {len(self.scene_id_mapping)} entries")
+            else:
+                print(f"⚠️  Warning: scene_id_mapping.json not found at {mapping_path}")
+                self.scene_id_mapping = {}
+            
+            # Frame directory
+            frame_dir_str = getattr(opt, 'frame_dir', 
+                                    '/data4/haozhe/CamTraj/data/processed_estate/train_frames')
+            self.frame_dir = Path(frame_dir_str)
+            self.max_frames = getattr(opt, 'max_frames', 8)
+            
+            print(f"✅ Frame loading enabled:")
+            print(f"   - Frame dir: {self.frame_dir}")
+            print(f"   - Max frames: {self.max_frames}")
+            print(f"   - Frame size: 224x224")
 
         data_dict = {}
         id_list = []
@@ -370,6 +424,63 @@ class Text2MotionDatasetEval(data.Dataset):
 
     def inv_transform(self, data):
         return data * self.std + self.mean
+    
+    def load_and_process_frames(self, scene_id):
+        """
+        Load and preprocess frames for a scene (for evaluation).
+        
+        Args:
+            scene_id: Sequential scene ID (e.g., '000000')
+        
+        Returns:
+            frames: Tensor of shape (max_frames, 3, 224, 224)
+        """
+        from pathlib import Path
+        from PIL import Image
+        import torch
+        
+        # Map sequential ID to hash ID
+        hash_id = self.scene_id_mapping.get(scene_id, scene_id)
+        scene_frame_dir = self.frame_dir / hash_id
+        
+        if not scene_frame_dir.exists():
+            # Return dummy black frames
+            return torch.zeros((self.max_frames, 3, 224, 224))
+        
+        # Get all frame files (sorted by name)
+        frame_files = sorted(scene_frame_dir.glob('frame_*.jpg'))
+        
+        if len(frame_files) == 0:
+            return torch.zeros((self.max_frames, 3, 224, 224))
+        
+        # Uniform sampling to get max_frames
+        if len(frame_files) > self.max_frames:
+            indices = np.linspace(0, len(frame_files) - 1, self.max_frames, dtype=int)
+            frame_files = [frame_files[i] for i in indices]
+        
+        # Load and transform frames
+        frames = []
+        for frame_file in frame_files:
+            try:
+                img = Image.open(frame_file).convert("RGB")
+                frame_tensor = self.frame_transform(img)
+                frames.append(frame_tensor)
+            except Exception as e:
+                print(f"Warning: failed to load {frame_file}: {e}")
+                continue
+        
+        if len(frames) == 0:
+            return torch.zeros((self.max_frames, 3, 224, 224))
+        
+        # Stack frames
+        frames_tensor = torch.stack(frames)  # (num_frames, 3, 224, 224)
+        
+        # Pad to max_frames if needed
+        if frames_tensor.shape[0] < self.max_frames:
+            padding = torch.zeros((self.max_frames - frames_tensor.shape[0], 3, 224, 224))
+            frames_tensor = torch.cat([frames_tensor, padding], dim=0)
+        
+        return frames_tensor  # (max_frames, 3, 224, 224)
 
     def __len__(self):
         return len(self.data_dict) - self.pointer
@@ -425,6 +536,13 @@ class Text2MotionDatasetEval(data.Dataset):
             motion = np.concatenate([motion,
                                      np.zeros((self.max_motion_length - m_length, motion.shape[1]))
                                      ], axis=0)
+        
+        # Load frames if enabled (for evaluation)
+        if self.load_frames:
+            scene_id = self.name_list[idx]
+            keyframes = self.load_and_process_frames(scene_id)
+            return word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, '_'.join(tokens), keyframes
+        
         # print(word_embeddings.shape, motion.shape)
         # print(tokens)
         return word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, '_'.join(tokens)
@@ -637,17 +755,12 @@ class Text2MotionDataset(data.Dataset):
                                      np.zeros((self.max_motion_length - m_length, motion.shape[1]))
                                      ], axis=0)
         
-        # Load frames if enabled
+        # Load frames if enabled - OPTIMIZED: Only return paths, not loaded images
         if self.load_frames:
-            scene_id = self.name_list[idx]  # Use original idx, not motion_start_idx
-            # Load ALL frames for sparse keyframe sampling
-            # SparseKeyframeEncoder will randomly sample N∈[1,4] frames
-            frame_paths = self.load_scene_frames(scene_id, num_frames=None)  # Load all
+            scene_id = self.name_list[idx]
+            frame_paths = self.load_scene_frames(scene_id, num_frames=None)
             
-            # If frames not found, return empty list
-            if not frame_paths:
-                frame_paths = []
-            
+            # Return frame paths as list (will be loaded in SparseKeyframeEncoder after sampling)
             return caption, motion, m_length, frame_paths
         
         # print(word_embeddings.shape, motion.shape)

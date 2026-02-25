@@ -25,7 +25,7 @@ class TrainT2MOptions(BaseOptions):
 
         self.parser.add_argument('--log_every', type=int, default=50, help='Frequency of printing training progress, (iteration)')
         # self.parser.add_argument('--save_every_e', type=int, default=100, help='Frequency of printing training progress')
-        self.parser.add_argument('--eval_every_e', type=int, default=10, help='Frequency of animating eval results, (epoch)')
+        self.parser.add_argument('--eval_every_e', type=int, default=5, help='Frequency of animating eval results, (epoch)')
         self.parser.add_argument('--save_latest', type=int, default=500, help='Frequency of saving checkpoint, (iteration)')
 
         '''Visual Consistency Module'''
@@ -43,10 +43,22 @@ class TrainT2MOptions(BaseOptions):
         self.parser.add_argument('--keyframe_arch', type=str, default='resnet18', choices=['resnet18', 'resnet34'], 
                                 help='ResNet architecture for keyframe encoding')
         
+        '''CLIP Fine-tuning'''
+        self.parser.add_argument('--finetune_clip', action="store_true", help='Fine-tune CLIP last layers for camera direction understanding')
+        self.parser.add_argument('--finetune_clip_layers', type=int, default=2, help='Number of CLIP transformer layers to unfreeze (default: 2)')
+        self.parser.add_argument('--direction_loss_weight', type=float, default=0.1, help='Weight for direction contrastive loss (default: 0.1)')
+        self.parser.add_argument('--smooth_loss_weight', type=float, default=0.0, help='Weight for trajectory smoothness regularization (default: 0.0 = disabled)')
+        
+        '''Mixed Precision Training'''
+        self.parser.add_argument('--use_amp', action="store_true", help='Enable automatic mixed precision (FP16) training for 2x speedup')
+        
         '''Logging & Experiment Tracking'''
         self.parser.add_argument('--use_wandb', action="store_true", help='Enable Weights & Biases logging')
         self.parser.add_argument('--wandb_project', type=str, default=None, help='W&B project name (default: momask-{dataset_name})')
         self.parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity/username (optional)')
+
+        """Dataset"""
+        # self.parser.add_argument('--data_suffix', type=str, default='', help='Suffix for dataset folder, e.g. _cam for camera datasets')
 
         self.is_train = True
 
