@@ -12,10 +12,12 @@ from options.eval_option import EvalT2MOptions
 from utils.get_opt import get_opt
 
 from utils.fixseed import fixseed
-from utils.camera_process import recover_from_camera_data, denormalize_camera_data
 from utils.plot_script import plot_3d_motion
 from utils.unified_data_format import UnifiedCameraData, CameraDataFormat
 from utils.dataset_config import get_unified_dataset_config
+from utils.camera_geometry import (
+    sixd_to_matrix, forward_from_sixd, to_mpl, matrix_to_sixd,
+)
 
 import numpy as np
 from torch.distributions.categorical import Categorical
@@ -37,7 +39,8 @@ def load_vq_model(vq_opt):
                 vq_opt.vq_norm)
     
     # Choose checkpoint file based on dataset type
-    if vq_opt.dataset_name == "cam" or vq_opt.dataset_name == "realestate10k_6" or vq_opt.dataset_name == "realestate10k_12":
+    is_camera_dataset = any(name in vq_opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+    if is_camera_dataset:
         # For camera datasets, try different checkpoint files in order of preference
         checkpoint_files = [
             'net_best_recon.tar',      # Best reconstruction loss
@@ -70,6 +73,7 @@ def load_vq_model(vq_opt):
     return vq_model, vq_opt
 
 def load_trans_model(model_opt, opt, which_model):
+    conditioning_mode = getattr(opt, 'conditioning_mode', 'clip')
     t2m_transformer = MaskTransformer(code_dim=model_opt.code_dim,
                                       cond_mode='text',
                                       latent_dim=model_opt.latent_dim,
@@ -80,6 +84,9 @@ def load_trans_model(model_opt, opt, which_model):
                                       clip_dim=512,
                                       cond_drop_prob=model_opt.cond_drop_prob,
                                       clip_version=clip_version,
+                                      conditioning_mode=conditioning_mode,
+                                      num_id_samples=getattr(opt, 'num_id_samples', 50),
+                                      t5_model_name=getattr(opt, 't5_model_name', 't5-base'),
                                       opt=model_opt)
     ckpt = torch.load(pjoin(model_opt.checkpoints_dir, model_opt.dataset_name, model_opt.name, 'model', which_model),
                       map_location='cpu')
@@ -93,6 +100,7 @@ def load_trans_model(model_opt, opt, which_model):
 def load_res_model(res_opt, vq_opt, opt):
     res_opt.num_quantizers = vq_opt.num_quantizers
     res_opt.num_tokens = vq_opt.nb_code
+    conditioning_mode = getattr(opt, 'conditioning_mode', 'clip')
     res_transformer = ResidualTransformer(code_dim=vq_opt.code_dim,
                                             cond_mode='text',
                                             latent_dim=res_opt.latent_dim,
@@ -105,10 +113,14 @@ def load_res_model(res_opt, vq_opt, opt):
                                             cond_drop_prob=res_opt.cond_drop_prob,
                                             share_weight=res_opt.share_weight,
                                             clip_version=clip_version,
+                                            conditioning_mode=conditioning_mode,
+                                            num_id_samples=getattr(opt, 'num_id_samples', 50),
+                                            t5_model_name=getattr(opt, 't5_model_name', 't5-base'),
                                             opt=res_opt)
 
     # Choose checkpoint file based on dataset type
-    if res_opt.dataset_name == "cam" or res_opt.dataset_name == "realestate10k_6" or res_opt.dataset_name == "realestate10k_12":
+    is_camera_dataset = any(name in res_opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+    if is_camera_dataset:
         # For camera datasets, try different checkpoint files in order of preference
         checkpoint_files = [
             'net_best_acc.tar',        # Best accuracy
@@ -146,7 +158,8 @@ def load_len_estimator(opt):
     checkpoint_files = ['finest.tar', 'latest.tar']
     
     # For camera dataset, also try fallback to t2m length estimator
-    if opt.dataset_name == 'cam' or opt.dataset_name == 'realestate10k_6' or opt.dataset_name == 'realestate10k_12':
+    is_camera_dataset = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+    if is_camera_dataset:
         t2m_estimator_dir = pjoin(opt.checkpoints_dir, 't2m', 'length_estimator', 'model')
         checkpoint_files.extend([
             pjoin(t2m_estimator_dir, 'finest.tar'),
@@ -178,7 +191,8 @@ def load_len_estimator(opt):
     model.load_state_dict(ckpt['estimator'])
     epoch = ckpt.get('epoch', 'unknown')
     
-    if loaded_file and 't2m' in loaded_file and opt.dataset_name == 'cam' or opt.dataset_name == 'realestate10k_6' or opt.dataset_name == 'realestate10k_12':
+    is_camera_fallback = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+    if loaded_file and 't2m' in loaded_file and is_camera_fallback:
         print(f'Loading Length Estimator from t2m dataset (epoch {epoch}) as fallback for camera dataset!')
     else:
         print(f'Loading Length Estimator from epoch {epoch}!')
@@ -230,7 +244,8 @@ def load_keyframes_for_inference(keyframe_dir, keyframe_indices, target_length):
 def plot_camera_trajectory_animation(data, save_path, title="Camera Trajectory", 
                                    fps=30, arrow_scale_factor=0.05, 
                                    min_arrow_length=0.01, max_arrow_length=0.2,
-                                   show_trail=True, trail_length=30, figsize=(12, 10)):
+                                   show_trail=True, trail_length=30, figsize=(12, 10),
+                                   format_type=None, stride=1, rotate_view=True):
     """
     Create an animated 3D visualization of camera trajectory with smooth movement
     Supports multiple camera data formats (5D, 6D, 12D) with automatic detection
@@ -246,6 +261,9 @@ def plot_camera_trajectory_animation(data, save_path, title="Camera Trajectory",
         show_trail: Whether to show a trail behind the camera
         trail_length: Number of previous positions to show in trail
         figsize: Figure size tuple
+        format_type: Explicit format type (CameraDataFormat), if None will auto-detect
+        stride: Render every Nth frame (stride=2 halves render time, stride=3 thirds it, etc.)
+        rotate_view: Whether to rotate camera view each frame (False = fixed view, much faster)
     """
     from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
     import matplotlib.pyplot as plt
@@ -253,19 +271,14 @@ def plot_camera_trajectory_animation(data, save_path, title="Camera Trajectory",
     import numpy as np
     
     # Use unified data format for automatic handling of different dimensions
-    unified_data = UnifiedCameraData(data)
+    unified_data = UnifiedCameraData(data, format_type=format_type)
     raw_positions = unified_data.positions.numpy()  # Always [x, y, z]
     orientations = unified_data.orientations.numpy()  # Depends on format
     
-    # Remap coordinates for proper visualization:
-    # Raw data: [x, y, z] where x=right, y=up, z=forward (negative z = forward motion)
-    # Matplotlib 3D: expects [x, y, z] where x=right, y=depth, z=up
-    # So we remap: [x, y, z] -> [x, -z, y] to get proper camera coordinate visualization
-    positions = np.column_stack([
-        raw_positions[:, 0],   # X stays the same (right)
-        -raw_positions[:, 2],  # Z becomes Y (forward becomes depth, with sign flip)
-        raw_positions[:, 1]    # Y becomes Z (up becomes up)
-    ])
+    # OpenGL convention: X=right, Y=up, -Z=forward
+    # Visualization: X=right, Y=depth, Z=up
+    # Transform via camera_geometry.to_mpl: [x, y, z] -> [x, -z, y]
+    positions = to_mpl(raw_positions)
     
     # Create figure and 3D axis
     fig = plt.figure(figsize=figsize)
@@ -308,7 +321,17 @@ def plot_camera_trajectory_animation(data, save_path, title="Camera Trajectory",
     
     import textwrap
     wrapped_title = '\n'.join(textwrap.wrap(title, width=title_wrap_width))
-    format_info = f"[{unified_data.format_type.name}: {unified_data.num_features}D]"
+    
+    # Format info with descriptive names
+    format_display_names = {
+        "LEGACY_5": "5D Legacy",
+        "POSITION_ORIENTATION_6": "6D Euler",
+        "QUATERNION_10": "10D Quat",
+        "FULL_12_EULER": "12D Euler",
+        "FULL_12_ROTMAT": "12D RotMat"
+    }
+    format_name = format_display_names.get(unified_data.format_type.name, unified_data.format_type.name)
+    format_info = f"[{format_name}: {unified_data.num_features}D]"
     display_title = f"{wrapped_title}\n{format_info}"
     
     ax.set_title(display_title, fontsize=title_fontsize, pad=20)
@@ -321,6 +344,42 @@ def plot_camera_trajectory_animation(data, save_path, title="Camera Trajectory",
     trail_line, = ax.plot([], [], [], 'orange', linewidth=3, alpha=0.8, label='Recent Trail')
     current_point = ax.scatter([], [], [], c='red', s=200, label='Current Position')
     orientation_arrow = None
+    
+    # Pre-compute all orientation vectors (expensive operations done once)
+    orientation_vectors = []
+    for frame_idx in range(len(positions)):
+        ori = orientations[frame_idx]
+        
+        # Compute forward vector in OpenGL world space, then map to MPL
+        if unified_data.format_type == CameraDataFormat.QUATERNION_10:
+            from common.quaternion import qrot
+            quat = torch.tensor(ori, dtype=torch.float32)
+            forward_local = torch.tensor([0.0, 0.0, -1.0])
+            fwd_gl = qrot(quat.unsqueeze(0), forward_local.unsqueeze(0)).squeeze(0).numpy()
+        elif unified_data.format_type == CameraDataFormat.FULL_12_ROTMAT:
+            # Use camera_geometry: forward = -(col0 x col1)
+            fwd_gl = forward_from_sixd(ori.reshape(1, 6)).squeeze(0)
+        else:
+            # Euler-based formats (5D, 6D, 12D Euler)
+            pitch, yaw = ori[0], ori[1]
+            # OpenGL forward from Euler: direction camera looks
+            fwd_gl = np.array([
+                np.cos(pitch) * np.sin(yaw),   # X
+                -np.sin(pitch),                  # Y
+                -np.cos(pitch) * np.cos(yaw)     # -Z (forward)
+            ])
+
+        # Deprecated. This may not be correct now.
+        
+        # Apply to_mpl mapping identically to position transform: [x,y,z] -> [x,-z,y]
+        fwd_mpl = to_mpl(fwd_gl.reshape(1, 3)).squeeze(0)
+        
+        # Normalize
+        norm = np.linalg.norm(fwd_mpl)
+        if norm > 1e-6:
+            fwd_mpl = fwd_mpl / norm
+        
+        orientation_vectors.append(tuple(fwd_mpl))
     
     # Add start and end markers
     ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2], 
@@ -356,54 +415,32 @@ def plot_camera_trajectory_animation(data, save_path, title="Camera Trajectory",
         current_pos = positions[frame]
         current_point._offsets3d = ([current_pos[0]], [current_pos[1]], [current_pos[2]])
         
-        # Update orientation arrow
-        ori = orientations[frame]
+        # Get pre-computed orientation
+        dx, dy, dz = orientation_vectors[frame]
         
-        # Handle different orientation formats
-        if unified_data.format_type == CameraDataFormat.LEGACY_5:
-            pitch, yaw = ori[0], ori[1]
-            # Original camera direction in camera coordinates
-            dx_orig = np.cos(pitch) * np.sin(yaw)   # Right
-            dy_orig = -np.sin(pitch)                # Up (negative because of camera convention)
-            dz_orig = np.cos(pitch) * np.cos(yaw)   # Forward
-        else:
-            pitch, yaw = ori[0], ori[1]
-            # Original camera direction in camera coordinates
-            dx_orig = np.cos(pitch) * np.sin(yaw)   # Right
-            dy_orig = -np.sin(pitch)                # Up (negative because of camera convention)
-            dz_orig = np.cos(pitch) * np.cos(yaw)   # Forward
-        
-        # Remap orientation to match the coordinate transformation
-        # [dx, dy, dz] -> [dx, dz, dy] to match position remapping
-        # Note: For positions we used [x, -z, y], but for directions we want [x, z, y]
-        # because camera "forward" (+z) should map to visualization "forward" (+y)
-        dx = dx_orig      # X stays the same (right)
-        dy = dz_orig      # Z becomes Y (forward becomes depth, no sign flip for direction)
-        dz = dy_orig      # Y becomes Z (up becomes up)
-        
-        # Normalize direction vector
-        direction_magnitude = np.sqrt(dx**2 + dy**2 + dz**2)
-        if direction_magnitude > 1e-6:
-            dx /= direction_magnitude
-            dy /= direction_magnitude
-            dz /= direction_magnitude
-        
-        # Draw orientation arrow
+        # Draw camera forward direction arrow (where camera looks)
         orientation_arrow = ax.quiver(current_pos[0], current_pos[1], current_pos[2], 
                                      dx, dy, dz, 
                                      length=1.5*base_arrow_length, 
                                      color='purple', alpha=0.8, 
                                      arrow_length_ratio=0.3,
-                                     linewidth=2)
+                                     linewidth=2,
+                                     label='Camera Forward' if frame == 0 else '')
         
-        # Update view angle for dynamic perspective (optional)
-        ax.view_init(elev=20, azim=frame * 0.5 % 360)
+        # Update view angle for dynamic perspective (optional, expensive)
+        if rotate_view:
+            ax.view_init(elev=20, azim=frame * 0.5 % 360)
         
         return trajectory_line, trail_line, current_point, orientation_arrow
     
-    # Create animation
+    # Create animation with optional frame subsampling
+    frame_indices = list(range(0, len(positions), stride))
+    # Always include last frame
+    if frame_indices[-1] != len(positions) - 1:
+        frame_indices.append(len(positions) - 1)
+    
     interval = 1000 / fps  # Convert fps to interval in milliseconds
-    anim = FuncAnimation(fig, animate, frames=len(positions), 
+    anim = FuncAnimation(fig, animate, frames=frame_indices, 
                         interval=interval, blit=False, repeat=True)
     
     # Save animation
@@ -426,7 +463,8 @@ def plot_camera_trajectory_animation(data, save_path, title="Camera Trajectory",
 
 def plot_camera_trajectory_debug(data, save_path, title="Camera Trajectory Debug", 
                                 fps=20, show_velocity=True, show_topdown=True,
-                                show_statistics=True, figsize=(15, 12), text_prompt=None):
+                                show_statistics=True, figsize=(15, 12), text_prompt=None,
+                                format_type=None, stride=1):
     """
     Create comprehensive debugging visualization with multiple views and analysis
     
@@ -440,6 +478,8 @@ def plot_camera_trajectory_debug(data, save_path, title="Camera Trajectory Debug
         show_statistics: Whether to show statistical information
         figsize: Figure size tuple
         text_prompt: Optional text prompt to display in statistics panel for comparison
+        format_type: Explicit format type (CameraDataFormat), if None will auto-detect
+        stride: Render every Nth frame (stride=2 halves render time, etc.)
     """
     from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
     import matplotlib.pyplot as plt
@@ -447,18 +487,13 @@ def plot_camera_trajectory_debug(data, save_path, title="Camera Trajectory Debug
     import numpy as np
     
     # Use unified data format
-    unified_data = UnifiedCameraData(data)
+    unified_data = UnifiedCameraData(data, format_type=format_type)
     raw_positions = unified_data.positions.numpy()
     orientations = unified_data.orientations.numpy()
     
-    # Apply coordinate remapping for visualization consistency
-    # Raw data: [x, y, z] where x=right, y=up, z=forward (negative z = forward motion)
-    # Remap: [x, y, z] -> [x, -z, y] for proper visualization
-    positions = np.column_stack([
-        raw_positions[:, 0],   # X stays the same (right)
-        -raw_positions[:, 2],  # Z becomes Y (forward becomes depth, with sign flip)
-        raw_positions[:, 1]    # Y becomes Z (up becomes up)
-    ])
+    # OpenGL convention: X=right, Y=up, -Z=forward
+    # Transform via camera_geometry.to_mpl: [x, y, z] -> [x, -z, y]
+    positions = to_mpl(raw_positions)
     
     # Calculate derivatives for analysis
     velocities = np.zeros_like(positions)
@@ -467,6 +502,37 @@ def plot_camera_trajectory_debug(data, save_path, title="Camera Trajectory Debug
     
     # Calculate statistics
     velocity_magnitudes = np.linalg.norm(velocities, axis=1)
+    
+    # Pre-compute all orientation vectors to avoid repeated calculations
+    orientation_vectors_debug = []
+    for frame_idx in range(len(positions)):
+        ori = orientations[frame_idx]
+        
+        # Compute forward vector in OpenGL world space
+        if unified_data.format_type == CameraDataFormat.QUATERNION_10:
+            from common.quaternion import qrot
+            quat = torch.tensor(ori, dtype=torch.float32)
+            forward_local = torch.tensor([0.0, 0.0, -1.0])
+            fwd_gl = qrot(quat.unsqueeze(0), forward_local.unsqueeze(0)).squeeze(0).numpy()
+        elif unified_data.format_type == CameraDataFormat.FULL_12_ROTMAT:
+            fwd_gl = forward_from_sixd(ori.reshape(1, 6)).squeeze(0)
+        else:
+            # Euler-based formats
+            pitch, yaw = ori[0], ori[1]
+            fwd_gl = np.array([
+                np.cos(pitch) * np.sin(yaw),
+                -np.sin(pitch),
+                -np.cos(pitch) * np.cos(yaw)
+            ])
+        
+        # Apply to_mpl mapping: [x,y,z] -> [x,-z,y]
+        fwd_mpl = to_mpl(fwd_gl.reshape(1, 3)).squeeze(0)
+        
+        norm = np.linalg.norm(fwd_mpl)
+        if norm > 1e-6:
+            fwd_mpl = fwd_mpl / norm
+        
+        orientation_vectors_debug.append((fwd_mpl[0], fwd_mpl[1], fwd_mpl[2], ori))
     
     # Create figure with subplots
     fig = plt.figure(figsize=figsize)
@@ -500,123 +566,85 @@ def plot_camera_trajectory_debug(data, save_path, title="Camera Trajectory Debug
     ax_vel.set_ylabel('Velocity')
     ax_vel.grid(True)
     
-    # Set up top-down view
-    ax_topdown.set_title('Top-Down View (X-Depth Plane)')
-    ax_topdown.set_xlabel('X (Right)')
-    ax_topdown.set_ylabel('Depth (Forward)')
-    ax_topdown.grid(True)
-    ax_topdown.set_aspect('equal', adjustable='box')
+    # Set up top-down view (calculate limits once)
+    x_range = positions[:, 0].max() - positions[:, 0].min()
+    y_range = positions[:, 1].max() - positions[:, 1].min()
+    max_range = max(x_range, y_range)
+    center_x = (positions[:, 0].max() + positions[:, 0].min()) / 2
+    center_y = (positions[:, 1].max() + positions[:, 1].min()) / 2
+    margin = max_range * 0.1
+    topdown_xlim = (center_x - max_range/2 - margin, center_x + max_range/2 + margin)
+    topdown_ylim = (center_y - max_range/2 - margin, center_y + max_range/2 + margin)
+    arrow_scale_3d = np.max(np.ptp(positions, axis=0)) * 0.1
+    arrow_scale_2d = np.max(np.ptp(positions[:, :2], axis=0)) * 0.1
+    
+    # Initialize plot artists (create once, update data in animation)
+    traj_3d_line, = ax_3d.plot([], [], [], 'b-', linewidth=2, alpha=0.7)
+    curr_3d_point = ax_3d.scatter([], [], [], c='red', s=100)
+    
+    vel_line, = ax_vel.plot([], [], 'g-', linewidth=2)
+    vel_point = ax_vel.scatter([], [], c='red', s=50, zorder=5)
+    
+    traj_topdown_line, = ax_topdown.plot([], [], 'b-', linewidth=2, alpha=0.7)
+    curr_topdown_point = ax_topdown.scatter([], [], c='red', s=100, zorder=5)
+    ax_topdown.set_xlim(topdown_xlim)
+    ax_topdown.set_ylim(topdown_ylim)
     
     def animate_debug(frame):
-        # Clear all plots
-        ax_3d.clear()
-        ax_vel.clear()
-        ax_topdown.clear()
-        ax_stats.clear()
-        ax_stats.axis('off')
-        
-        # Re-setup 3D plot
-        ax_3d.set_xlim(positions[:, 0].min() - padding, positions[:, 0].max() + padding)
-        ax_3d.set_ylim(positions[:, 1].min() - padding, positions[:, 1].max() + padding)
-        ax_3d.set_zlim(positions[:, 2].min() - padding, positions[:, 2].max() + padding)
-        ax_3d.set_title('3D Camera Trajectory')
-        ax_3d.set_xlabel('X (Right)')
-        ax_3d.set_ylabel('Depth (Forward)')
-        ax_3d.set_zlabel('Y (Up)')
-        
-        # Plot trajectory up to current frame
-        if frame > 0:
-            ax_3d.plot(positions[:frame+1, 0], positions[:frame+1, 1], positions[:frame+1, 2], 
-                      'b-', linewidth=2, alpha=0.7)
-        
-        # Current position
+        # Get current data
         current_pos = positions[frame]
-        ax_3d.scatter(*current_pos, c='red', s=100)
+        dx, dy, dz, ori = orientation_vectors_debug[frame]
         
-        # Orientation arrow (with coordinate remapping)
-        ori = orientations[frame]
-        if unified_data.format_type == CameraDataFormat.LEGACY_5:
-            pitch, yaw = ori[0], ori[1]
-            # Original camera direction in camera coordinates
-            dx_orig = np.cos(pitch) * np.sin(yaw)   # Right
-            dy_orig = -np.sin(pitch)                # Up (negative because of camera convention)
-            dz_orig = np.cos(pitch) * np.cos(yaw)   # Forward
-        else:
-            pitch, yaw = ori[0], ori[1]
-            # Original camera direction in camera coordinates
-            dx_orig = np.cos(pitch) * np.sin(yaw)   # Right
-            dy_orig = -np.sin(pitch)                # Up (negative because of camera convention)
-            dz_orig = np.cos(pitch) * np.cos(yaw)   # Forward
+        # Update 3D trajectory
+        if frame > 0:
+            traj_3d_line.set_data_3d(positions[:frame+1, 0], positions[:frame+1, 1], positions[:frame+1, 2])
+        curr_3d_point._offsets3d = ([current_pos[0]], [current_pos[1]], [current_pos[2]])
         
-        # Remap orientation to match the coordinate transformation
-        dx = dx_orig      # X stays the same (right)
-        dy = dz_orig      # Z becomes Y (forward becomes depth)
-        dz = dy_orig      # Y becomes Z (up becomes up)
+        # Remove previous arrows if they exist (cannot reuse quiver/arrow objects)
+        for artist in list(ax_3d.collections) + list(ax_topdown.patches):
+            if artist not in [curr_3d_point, curr_topdown_point]:
+                artist.remove()
         
-        # Normalize and draw orientation
-        norm = np.sqrt(dx**2 + dy**2 + dz**2)
-        if norm > 1e-6:
-            dx, dy, dz = dx/norm, dy/norm, dz/norm
-            arrow_length = np.max(np.ptp(positions, axis=0)) * 0.1
+        # Draw orientation arrow in 3D
+        if np.sqrt(dx**2 + dy**2 + dz**2) > 1e-6:
             ax_3d.quiver(current_pos[0], current_pos[1], current_pos[2], 
-                        dx, dy, dz, length=arrow_length, color='purple', alpha=0.8)
+                        dx, dy, dz, length=arrow_scale_3d, color='purple', alpha=0.8)
         
-        # Velocity vector
+        # Draw velocity vector in 3D
         if show_velocity and frame > 0:
             vel = velocities[frame]
             vel_norm = np.linalg.norm(vel)
             if vel_norm > 1e-6:
                 vel_normalized = vel / vel_norm
-                vel_length = min(vel_norm * 10, arrow_length)
+                vel_length = min(vel_norm * 10, arrow_scale_3d)
                 ax_3d.quiver(current_pos[0], current_pos[1], current_pos[2], 
                            vel_normalized[0], vel_normalized[1], vel_normalized[2], 
                            length=vel_length, color='green', alpha=0.6)
         
-        # Plot velocity over time
-        ax_vel.set_title('Velocity Magnitude Over Time')
-        ax_vel.set_xlabel('Frame')
-        ax_vel.set_ylabel('Velocity')
-        ax_vel.grid(True)
-        frames_so_far = range(frame + 1)
-        ax_vel.plot(frames_so_far, velocity_magnitudes[:frame+1], 'g-', linewidth=2)
-        ax_vel.scatter(frame, velocity_magnitudes[frame], c='red', s=50, zorder=5)
+        # Update velocity plot
+        vel_line.set_data(range(frame + 1), velocity_magnitudes[:frame+1])
+        vel_point.set_offsets([[frame, velocity_magnitudes[frame]]])
         if frame > 0:
             ax_vel.set_xlim(0, max(10, frame + 1))
-            ax_vel.set_ylim(0, max(velocity_magnitudes[:frame+1]) * 1.1 if max(velocity_magnitudes[:frame+1]) > 0 else 1)
+            max_vel = max(velocity_magnitudes[:frame+1])
+            ax_vel.set_ylim(0, max_vel * 1.1 if max_vel > 0 else 1)
         
-        # Plot top-down view (X-Depth plane)
-        ax_topdown.set_title('Top-Down View (X-Depth Plane)')
-        ax_topdown.set_xlabel('X (Right)')
-        ax_topdown.set_ylabel('Depth (Forward)')
-        ax_topdown.grid(True)
-        ax_topdown.set_aspect('equal', adjustable='box')
-        
-        # Plot trajectory in top-down view
+        # Update top-down view
         if frame > 0:
-            ax_topdown.plot(positions[:frame+1, 0], positions[:frame+1, 1], 'b-', linewidth=2, alpha=0.7)
+            traj_topdown_line.set_data(positions[:frame+1, 0], positions[:frame+1, 1])
+        curr_topdown_point.set_offsets([[current_pos[0], current_pos[1]]])
         
-        # Current position in top-down view
-        ax_topdown.scatter(current_pos[0], current_pos[1], c='red', s=100, zorder=5)
-        
-        # Orientation arrow in top-down view
-        if norm > 1e-6:
-            arrow_scale = np.max(np.ptp(positions[:, :2], axis=0)) * 0.1
+        # Draw orientation arrow in top-down view
+        if np.sqrt(dx**2 + dy**2 + dz**2) > 1e-6:
             ax_topdown.arrow(current_pos[0], current_pos[1], 
-                           dx * arrow_scale, dy * arrow_scale,
-                           head_width=arrow_scale*0.3, head_length=arrow_scale*0.2,
+                           dx * arrow_scale_2d, dy * arrow_scale_2d,
+                           head_width=arrow_scale_2d*0.3, head_length=arrow_scale_2d*0.2,
                            fc='purple', ec='purple', alpha=0.8)
         
-        # Set limits for top-down view
-        x_range = positions[:, 0].max() - positions[:, 0].min()
-        y_range = positions[:, 1].max() - positions[:, 1].min()
-        max_range = max(x_range, y_range)
-        center_x = (positions[:, 0].max() + positions[:, 0].min()) / 2
-        center_y = (positions[:, 1].max() + positions[:, 1].min()) / 2
-        margin = max_range * 0.1
-        ax_topdown.set_xlim(center_x - max_range/2 - margin, center_x + max_range/2 + margin)
-        ax_topdown.set_ylim(center_y - max_range/2 - margin, center_y + max_range/2 + margin)
+        # Update statistics text
+        ax_stats.clear()
+        ax_stats.axis('off')
         
-        # Statistics text
         if show_statistics:
             stats_text = f"""Frame: {frame}/{len(positions)-1}
 
@@ -630,9 +658,7 @@ Pitch: {ori[0]:.3f}
 Yaw: {ori[1]:.3f}
 """
             
-            # Add text prompt for comparison if provided
             if text_prompt:
-                # Wrap long text prompts
                 import textwrap
                 wrapped_prompt = textwrap.fill(text_prompt, width=35)
                 stats_text = f"""TEXT PROMPT:
@@ -649,7 +675,6 @@ Current Velocity: {velocity_magnitudes[frame]:.3f}
 Avg Velocity: {np.mean(velocity_magnitudes[1:frame+1]):.3f}
 """
             
-            # Add orientation information
             stats_text += f"""
 Orientation Vector:
 X-component: {dx:.3f}
@@ -657,13 +682,11 @@ Y-component: {dy:.3f}
 Z-component: {dz:.3f}
 """
             
-            # Add trajectory statistics and motion analysis
             if frame > 5:
                 recent_positions = positions[max(0, frame-5):frame+1]
                 path_length = np.sum(np.linalg.norm(np.diff(recent_positions, axis=0), axis=1))
                 smoothness = 1.0 / (1.0 + np.std(velocity_magnitudes[max(1, frame-5):frame+1]))
                 
-                # Analyze dominant motion direction
                 recent_displacement = recent_positions[-1] - recent_positions[0]
                 dominant_axis = np.argmax(np.abs(recent_displacement))
                 axis_names = ['X (Right)', 'Depth (Forward)', 'Y (Up)']
@@ -683,9 +706,13 @@ Speed: {velocity_magnitudes[frame]:.3f}
     
     plt.tight_layout()
     
-    # Create animation
+    # Create animation with optional frame subsampling
+    frame_indices = list(range(0, len(positions), stride))
+    if frame_indices[-1] != len(positions) - 1:
+        frame_indices.append(len(positions) - 1)
+    
     interval = 1000 / fps
-    anim = FuncAnimation(fig, animate_debug, frames=len(positions), 
+    anim = FuncAnimation(fig, animate_debug, frames=frame_indices, 
                         interval=interval, blit=False, repeat=True)
     
     # Save animation
@@ -694,7 +721,7 @@ Speed: {velocity_magnitudes[frame]:.3f}
         anim.save(save_path, writer=writer, dpi=80)
     elif save_path.endswith('.mp4'):
         writer = FFMpegWriter(fps=fps, metadata=dict(artist='CamTraj'), bitrate=1800)
-        anim.save(save_path, writer=writer, dpi=100)
+        anim.save(save_path, writer=writer, dpi=80)
     else:
         # Default to mp4 for better quality
         writer = FFMpegWriter(fps=fps, metadata=dict(artist='CamTraj'), bitrate=1800)
@@ -704,7 +731,7 @@ Speed: {velocity_magnitudes[frame]:.3f}
     print(f"Debug animation saved to {save_path}")
 
 def plot_camera_trajectory(data, save_path, title="Camera Trajectory", arrow_scale_factor=0.05, 
-                          min_arrow_length=0.01, max_arrow_length=0.2):
+                          min_arrow_length=0.01, max_arrow_length=0.2, format_type=None):
     """
     Plot camera trajectory as a 3D path with dynamically scaled orientation arrows
     Supports multiple camera data formats (5D, 6D, 12D) with automatic detection
@@ -716,11 +743,16 @@ def plot_camera_trajectory(data, save_path, title="Camera Trajectory", arrow_sca
         arrow_scale_factor: Factor to scale arrows relative to trajectory extent (default: 0.05 = 5%)
         min_arrow_length: Minimum arrow length to ensure visibility (default: 0.01)
         max_arrow_length: Maximum arrow length to prevent overly long arrows (default: 0.2)
+        format_type: Explicit format type (CameraDataFormat), if None will auto-detect
     """
     # Use unified data format for automatic handling of different dimensions
-    unified_data = UnifiedCameraData(data)
-    positions = unified_data.positions.numpy()  # Always [x, y, z]
-    orientations = unified_data.orientations.numpy()  # Depends on format
+    unified_data = UnifiedCameraData(data, format_type=format_type)
+    raw_positions = unified_data.positions.numpy()
+    orientations = unified_data.orientations.numpy()
+    
+    # OpenGL: X=right, Y=up, -Z=forward -> Viz: X=right, Y=depth, Z=up
+    # Transform via camera_geometry.to_mpl: [x, y, z] -> [x, -z, y]
+    positions = to_mpl(raw_positions)
     
     # Create a simple 3D plot
     import matplotlib.pyplot as plt
@@ -748,8 +780,16 @@ def plot_camera_trajectory(data, save_path, title="Camera Trajectory", arrow_sca
     import textwrap
     wrapped_title = '\n'.join(textwrap.wrap(title, width=title_wrap_width))
     
-    # Add format information to title
-    format_info = f"[{unified_data.format_type.name}: {unified_data.num_features}D]"
+    # Add format information to title with friendly display names
+    format_display_names = {
+        "LEGACY_5": "5D Legacy",
+        "POSITION_ORIENTATION_6": "6D Euler",
+        "QUATERNION_10": "10D Quat",
+        "FULL_12_EULER": "12D Euler",
+        "FULL_12_ROTMAT": "12D RotMat"
+    }
+    format_name = format_display_names.get(unified_data.format_type.name, unified_data.format_type.name)
+    format_info = f"[{format_name}: {unified_data.num_features}D]"
     display_title = f"{wrapped_title}\n{format_info}"
     
     # Plot camera positions
@@ -776,35 +816,39 @@ def plot_camera_trajectory(data, save_path, title="Camera Trajectory", arrow_sca
     base_arrow_length = min(base_arrow_length, max_arrow_length)
     
     # Plot camera orientations as arrows at key points
-    step = max(1, len(positions) // 10)  # Show every 10th orientation
+    step = max(1, len(positions) // 10)
     for i in range(0, len(positions), step):
         pos = positions[i]
         ori = orientations[i]
         
-        # Handle different orientation formats
-        if unified_data.format_type == CameraDataFormat.LEGACY_5:
-            # 5D format: [pitch, yaw]
-            pitch, yaw = ori[0], ori[1]
-            # Convert pitch, yaw to direction vector (normalized to unit length)
-            dx = np.cos(pitch) * np.sin(yaw)
-            dy = -np.sin(pitch)
-            dz = np.cos(pitch) * np.cos(yaw)
+        # Compute forward vector in OpenGL world space
+        if unified_data.format_type == CameraDataFormat.QUATERNION_10:
+            from common.quaternion import qrot
+            quat = torch.tensor(ori, dtype=torch.float32)
+            forward_local = torch.tensor([0.0, 0.0, -1.0])
+            fwd_gl = qrot(quat.unsqueeze(0), forward_local.unsqueeze(0)).squeeze(0).numpy()
+        elif unified_data.format_type == CameraDataFormat.FULL_12_ROTMAT:
+            fwd_gl = forward_from_sixd(ori.reshape(1, 6)).squeeze(0)
         else:
-            # 6D and 12D formats: [pitch, yaw, roll] (roll not used for direction)
+            # Euler-based formats (5D, 6D, 12D Euler)
             pitch, yaw = ori[0], ori[1]
-            # Convert pitch, yaw to direction vector (same as 5D)
-            dx = np.cos(pitch) * np.sin(yaw)
-            dy = -np.sin(pitch)
-            dz = np.cos(pitch) * np.cos(yaw)
+            fwd_gl = np.array([
+                np.cos(pitch) * np.sin(yaw),
+                -np.sin(pitch),
+                -np.cos(pitch) * np.cos(yaw)
+            ])
         
-        # Normalize direction vector to ensure unit length
-        direction_magnitude = np.sqrt(dx**2 + dy**2 + dz**2)
-        if direction_magnitude > 1e-6:  # Avoid division by zero
-            dx /= direction_magnitude
-            dy /= direction_magnitude
-            dz /= direction_magnitude
+        # Apply to_mpl mapping: [x,y,z] -> [x,-z,y]
+        fwd_mpl = to_mpl(fwd_gl.reshape(1, 3)).squeeze(0)
         
-        # Draw arrow with adaptive length
+        # Normalize
+        norm = np.linalg.norm(fwd_mpl)
+        if norm > 1e-6:
+            fwd_mpl = fwd_mpl / norm
+        
+        dx, dy, dz = fwd_mpl[0], fwd_mpl[1], fwd_mpl[2]
+        
+        # Draw arrow with adaptive length (orange for camera forward direction)
         ax.quiver(pos[0], pos[1], pos[2], dx, dy, dz, 
                  length=1.5*base_arrow_length, color='orange', alpha=0.7, 
                  arrow_length_ratio=0.3)  # Make arrowhead proportional
@@ -839,9 +883,14 @@ if __name__ == '__main__':
     dim_pose = dataset_config['dim_pose']
     detected_format = dataset_config.get('detected_format', 'Unknown')
     
+    # Get format type for correct visualization
+    from utils.unified_data_format import detect_format_from_dataset_name
+    viz_format_type = detect_format_from_dataset_name(opt.dataset_name)
+    
     print(f"Dataset: {opt.dataset_name}")
     print(f"Detected camera format: {detected_format}")
     print(f"Feature dimensions: {dim_pose}")
+    print(f"Visualization format: {viz_format_type}")
 
     root_dir = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.name)
     model_dir = pjoin(root_dir, 'model')
@@ -883,17 +932,28 @@ if __name__ == '__main__':
     ##################################
     #####Loading Length Predictor#####
     ##################################
-    length_estimator = load_len_estimator(model_opt)
+    is_camera_dataset = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+    if is_camera_dataset:
+        length_estimator = None
+        print("Camera dataset: skipping length estimator (not trained on camera data, uses fixed length).")
+    else:
+        try:
+            length_estimator = load_len_estimator(model_opt)
+            length_estimator.eval()
+            length_estimator.to(opt.device)
+        except:
+            length_estimator = None
+            print("Length estimator not found, length prediction disabled.")
+
 
     t2m_transformer.eval()
     vq_model.eval()
     res_model.eval()
-    length_estimator.eval()
+
 
     res_model.to(opt.device)
     t2m_transformer.to(opt.device)
     vq_model.to(opt.device)
-    length_estimator.to(opt.device)
 
     ##### ---- Dataloader ---- #####
     opt.nb_joints = 1  # Camera has no joints
@@ -905,40 +965,122 @@ if __name__ == '__main__':
 
     prompt_list = []
     length_list = []
+    conditioning_mode = getattr(opt, 'conditioning_mode', 'clip')
 
-    est_length = False
-    if opt.text_prompt != "":
-        prompt_list.append(opt.text_prompt)
-        if opt.motion_length == 0:
-            est_length = True
+    # ── id_embedding mode: conditions are sample IDs, not text ──
+    if conditioning_mode == 'id_embedding':
+        sample_ids_str = getattr(opt, 'sample_ids', '')
+        num_id_samples = getattr(opt, 'num_id_samples', 50)
+        
+        if sample_ids_str:
+            sample_id_list = [int(x.strip()) for x in sample_ids_str.split(',')]
         else:
-            length_list.append(opt.motion_length)
-    elif opt.text_path != "":
-        with open(opt.text_path, 'r') as f:
-            lines = f.readlines()
-            for line in lines:
-                infos = line.split('#')
-                prompt_list.append(infos[0])
-                if len(infos) == 1 or (not infos[1].isdigit()):
-                    est_length = True
-                    length_list = []
+            # Generate all IDs
+            sample_id_list = list(range(num_id_samples))
+        
+        # Validate IDs
+        for sid in sample_id_list:
+            if sid < 0 or sid >= num_id_samples:
+                raise ValueError(f"Sample ID {sid} out of range [0, {num_id_samples})")
+        
+        # Create caption labels for display
+        captions = [f"Sample ID: {sid}" for sid in sample_id_list]
+        # Create condition tensor (LongTensor of sample IDs)
+        cond_ids = torch.LongTensor(sample_id_list).to(opt.device)
+        
+        # Set lengths 
+        if opt.motion_length > 0:
+            token_lens = torch.LongTensor([opt.motion_length // 4] * len(sample_id_list)).to(opt.device)
+        else:
+            default_camera_length = getattr(opt, 'default_camera_length', 200)
+            print(f"id_embedding mode: Using FIXED length of {default_camera_length} frames")
+            token_lens = torch.LongTensor([default_camera_length // 4] * len(sample_id_list)).to(opt.device)
+        
+        m_length = token_lens * 4
+        print(f"id_embedding mode: generating {len(sample_id_list)} samples (IDs: {sample_id_list})")
+        
+        # Load ground truth data and text descriptions for comparison
+        gt_data_list = []
+        gt_lengths = []
+        gt_text_descriptions = []  # Actual text prompts for each sample
+        train_split_file = pjoin(opt.data_root, 'train.txt')
+        if os.path.exists(train_split_file):
+            with open(train_split_file, 'r') as f:
+                all_sample_names = [line.strip() for line in f.readlines()]
+            
+            motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
+            texts_dir = pjoin(opt.data_root, 'texts')
+            for sid in sample_id_list:
+                if sid < len(all_sample_names):
+                    sample_name = all_sample_names[sid]
+                    gt_path = pjoin(motion_dir, f"{sample_name}.npy")
+                    if os.path.exists(gt_path):
+                        gt_motion = np.load(gt_path)
+                        gt_data_list.append(gt_motion)
+                        gt_lengths.append(len(gt_motion))
+                    else:
+                        gt_data_list.append(None)
+                        gt_lengths.append(0)
+                        print(f"  Warning: GT not found for sample ID {sid} at {gt_path}")
+                    
+                    # Load text description
+                    text_path = pjoin(texts_dir, f"{sample_name}.txt")
+                    if os.path.exists(text_path):
+                        with open(text_path, 'r') as tf:
+                            raw_text = tf.readline().strip()
+                            # Text format: "description#POS-tagged version" — take first part
+                            gt_text_descriptions.append(raw_text.split('#')[0].strip())
+                    else:
+                        gt_text_descriptions.append(f"Sample ID: {sid}")
                 else:
-                    length_list.append(int(infos[-1]))
-    else:
-        raise ValueError("A text prompt, or a file a text prompts are required!!!")
+                    gt_data_list.append(None)
+                    gt_lengths.append(0)
+                    gt_text_descriptions.append(f"Sample ID: {sid}")
+            print(f"  Loaded {sum(1 for g in gt_data_list if g is not None)}/{len(sample_id_list)} ground truth trajectories")
+            print(f"  Loaded {sum(1 for t in gt_text_descriptions if not t.startswith('Sample ID'))} text descriptions")
+        else:
+            print(f"  Warning: train.txt not found at {train_split_file}, GT comparison disabled")
+            gt_data_list = [None] * len(sample_id_list)
+            gt_text_descriptions = [f"Sample ID: {sid}" for sid in sample_id_list]
 
-    if est_length:
-        print("Since no motion length are specified, we will use estimated motion lengthes!!")
-        text_embedding = t2m_transformer.encode_text(prompt_list)
-        pred_dis = length_estimator(text_embedding)
-        probs = F.softmax(pred_dis, dim=-1)  # (b, ntoken)
-        token_lens = Categorical(probs).sample()  # (b, seqlen)
+    # ── text-based modes (clip / t5) ──
     else:
-        token_lens = torch.LongTensor(length_list) // 4
-        token_lens = token_lens.to(opt.device).long()
+        est_length = False
+        if opt.text_prompt != "":
+            prompt_list.append(opt.text_prompt)
+            if opt.motion_length == 0:
+                est_length = True
+            else:
+                length_list.append(opt.motion_length)
+        elif opt.text_path != "":
+            with open(opt.text_path, 'r') as f:
+                lines = f.readlines()
+                for line in lines:
+                    infos = line.split('#')
+                    prompt_list.append(infos[0])
+                    if len(infos) == 1 or (not infos[1].isdigit()):
+                        est_length = True
+                        length_list = []
+                    else:
+                        length_list.append(int(infos[-1]))
+        else:
+            raise ValueError("A text prompt, or a file of text prompts are required!!!")
 
-    m_length = token_lens * 4
-    captions = prompt_list
+        if est_length:
+            default_camera_length = getattr(opt, 'default_camera_length', 200)
+            print(f"Camera dataset: Using FIXED length of {default_camera_length} frames (~{default_camera_length/30:.1f}s)")
+            print(f"  (Length estimator disabled - not trained on camera data)")
+            token_lens = torch.LongTensor([default_camera_length // 4] * len(prompt_list))
+            token_lens = token_lens.to(opt.device).long()
+        else:
+            token_lens = torch.LongTensor(length_list) // 4
+            token_lens = token_lens.to(opt.device).long()
+
+        m_length = token_lens * 4
+        captions = prompt_list
+        cond_ids = None  # Not used in text modes
+        gt_data_list = None  # No GT comparison for text modes
+        gt_text_descriptions = None
     
     # Load keyframes if specified
     keyframe_paths_list = None
@@ -1003,13 +1145,17 @@ if __name__ == '__main__':
             # Generate with optional keyframe conditioning
             # Note: We need to modify transformer.generate() to accept frame_emb
             # For now, we'll use a workaround through the forward pass
-            mids = t2m_transformer.generate(captions, token_lens,
+            
+            # Choose conditions based on mode
+            gen_conds = cond_ids if conditioning_mode == 'id_embedding' else captions
+            
+            mids = t2m_transformer.generate(gen_conds, token_lens,
                                             timesteps=opt.time_steps,
                                             cond_scale=opt.cond_scale,
                                             temperature=opt.temperature,
                                             topk_filter_thres=opt.topkr,
                                             gsample=opt.gumbel_sample)
-            mids = res_model.generate(mids, captions, token_lens, temperature=1, cond_scale=5)
+            mids = res_model.generate(mids, gen_conds, token_lens, temperature=1, cond_scale=5)
             pred_motions = vq_model.forward_decoder(mids)
 
             pred_motions = pred_motions.detach().cpu().numpy()
@@ -1027,25 +1173,58 @@ if __name__ == '__main__':
             joint_data = joint_data[:m_length[k]]
             
             # Save raw camera data
-            np.save(pjoin(joint_path, "sample%d_repeat%d_len%d.npy"%(k, r, m_length[k])), joint_data)
+            np.save(pjoin(joint_path, "sample%d_repeat%d_len%d_pred.npy"%(k, r, m_length[k])), joint_data)
             
             # Create camera trajectory visualization (both static and animated)
-            plot_path = pjoin(animation_path, "sample%d_repeat%d_len%d_trajectory.png"%(k, r, m_length[k]))
-            plot_camera_trajectory(joint_data, plot_path, title=caption)
+            # Pass viz_format_type so rotmat datasets are not misdetected as euler
+            plot_path = pjoin(animation_path, "sample%d_repeat%d_len%d_pred_trajectory.png"%(k, r, m_length[k]))
+            plot_camera_trajectory(joint_data, plot_path, title=f"[Pred] {caption}",
+                                  format_type=viz_format_type)
             
             # Create animated version for better debugging (MP4 for better quality & smaller size)
-            anim_path = pjoin(animation_path, "sample%d_repeat%d_len%d_trajectory.mp4"%(k, r, m_length[k]))
-            plot_camera_trajectory_animation(joint_data, anim_path, title=caption, 
-                                           fps=30, show_trail=True, trail_length=20)
+            anim_path = pjoin(animation_path, "sample%d_repeat%d_len%d_pred_trajectory.mp4"%(k, r, m_length[k]))
+            plot_camera_trajectory_animation(joint_data, anim_path, title=f"[Pred] {caption}",
+                                           fps=30, show_trail=True, trail_length=20,
+                                           format_type=viz_format_type)
             
             # Create comprehensive debug animation with analysis
-            debug_path = pjoin(animation_path, "sample%d_repeat%d_len%d_debug.mp4"%(k, r, m_length[k]))
-            plot_camera_trajectory_debug(joint_data, debug_path, title=f"Debug: {caption}",
+            debug_path = pjoin(animation_path, "sample%d_repeat%d_len%d_pred_debug.mp4"%(k, r, m_length[k]))
+            plot_camera_trajectory_debug(joint_data, debug_path, title=f"[Pred] {caption}",
                                        fps=30, show_velocity=True, show_topdown=True, 
-                                       text_prompt=caption)
+                                       text_prompt=caption, format_type=viz_format_type)
+            
+            # ── Ground truth comparison for id_embedding mode ──
+            if conditioning_mode == 'id_embedding' and gt_data_list is not None and gt_data_list[k] is not None:
+                gt_raw = gt_data_list[k]  # Already in raw (unnormalized) feature space
+                gt_len = min(len(gt_raw), m_length[k].item())
+                gt_trimmed = gt_raw[:gt_len]
+                
+                # Save GT raw data
+                np.save(pjoin(joint_path, "sample%d_repeat%d_len%d_gt.npy"%(k, r, gt_len)), gt_trimmed)
+                
+                # GT static trajectory plot
+                gt_plot_path = pjoin(animation_path, "sample%d_repeat%d_len%d_gt_trajectory.png"%(k, r, gt_len))
+                plot_camera_trajectory(gt_trimmed, gt_plot_path, title=f"[GT] {caption}",
+                                      format_type=viz_format_type)
+                
+                # GT animated trajectory
+                gt_anim_path = pjoin(animation_path, "sample%d_repeat%d_len%d_gt_trajectory.mp4"%(k, r, gt_len))
+                plot_camera_trajectory_animation(gt_trimmed, gt_anim_path, title=f"[GT] {caption}",
+                                               fps=30, show_trail=True, trail_length=20,
+                                               format_type=viz_format_type)
+                
+                # GT debug animation (same comprehensive view as predicted)
+                # Use actual text description in sidebar instead of numeric ID
+                gt_text = gt_text_descriptions[k] if gt_text_descriptions else caption
+                gt_debug_path = pjoin(animation_path, "sample%d_repeat%d_len%d_gt_debug.mp4"%(k, r, gt_len))
+                plot_camera_trajectory_debug(gt_trimmed, gt_debug_path, title=f"[GT] {caption}",
+                                           fps=30, show_velocity=True, show_topdown=True,
+                                           text_prompt=gt_text, format_type=viz_format_type)
+                
+                print(f"  GT trajectory saved ({gt_len} frames) with trajectory + debug views")
             
             # Save camera data as text file for easy inspection with format-aware headers
-            unified_data = UnifiedCameraData(joint_data)
+            unified_data = UnifiedCameraData(joint_data, format_type=viz_format_type)
             positions = unified_data.positions.numpy()
             orientations = unified_data.orientations.numpy()
             
@@ -1058,12 +1237,12 @@ if __name__ == '__main__':
                 header = 'x y z pitch yaw roll'  # Only save position + orientation for readability
             
             camera_data = np.column_stack([positions, orientations])
-            np.savetxt(pjoin(joint_path, "sample%d_repeat%d_len%d.txt"%(k, r, m_length[k])), 
+            np.savetxt(pjoin(joint_path, "sample%d_repeat%d_len%d_pred.txt"%(k, r, m_length[k])), 
                       camera_data, fmt='%.6f', 
                       header=header, comments='')
             
             # Also save format information
-            format_info_path = pjoin(joint_path, "sample%d_repeat%d_len%d_format.txt"%(k, r, m_length[k]))
+            format_info_path = pjoin(joint_path, "sample%d_repeat%d_len%d_pred_format.txt"%(k, r, m_length[k]))
             with open(format_info_path, 'w') as f:
                 f.write(f"Original format: {unified_data.format_type.name}\n")
                 f.write(f"Original dimensions: {unified_data.num_features}\n")
@@ -1101,11 +1280,24 @@ Output Files Generated Per Sample:
 
 Usage Examples:
 
-# For 6D realestate10k_6 dataset with animations
-CUDA_VISIBLE_DEVICES=7 python gen_camera.py \
-    --dataset_name realestate10k_6 \
-    --name mtrans_noframe_baseline2 \
-    --res_name rtrans_baseline_noframe2 \
+CUDA_VISIBLE_DEVICES=3 python gen_camera.py \
+    --dataset_name realestate10k_rotmat \
+    --name mtrans_overfit50_idcond \
+    --res_name rtrans_overfit50_idcond \
+    --conditioning_mode id_embedding \
+    --gpu_id 0 \
+    --sample_ids "0,1,2,3,4,5,6,7,8,9" \
+    --repeat_times 2 \
+    --time_steps 10 \
+    --cond_scale 3 \
+    --temperature 1.0 \
+    --topkr 0.9 \
+    --ext camera_overfit50_idcond
+
+python gen_camera.py \
+    --dataset_name realestate10k_quat \
+    --name mtrans_reduce_data \
+    --res_name rtrans_reduce_data \
     --gpu_id 0 \
     --text_path camera_prompts.txt \
     --repeat_times 3 \
@@ -1113,7 +1305,12 @@ CUDA_VISIBLE_DEVICES=7 python gen_camera.py \
     --cond_scale 3 \
     --temperature 1.0 \
     --topkr 0.9 \
-    --ext camera_baseline_noframe
+    --ext camera_quat_baseline
+
+python gen_camera.py \
+  --dataset_name realestate10k_quat \
+  --name mtrans_reduce_mid \
+  --text_prompt "A camera slowly pans left then zooms in"
 
 # Demo the animation features
 python demo_camera_animation.py --demo-type full

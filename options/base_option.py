@@ -14,6 +14,7 @@ class BaseOptions():
 
         self.parser.add_argument("--gpu_id", type=int, default=-1, help='GPU id')
         self.parser.add_argument('--dataset_name', type=str, default='t2m', help='Dataset Name, {t2m} for humanml3d, {kit} for kit-ml')
+        self.parser.add_argument('--data_root', type=str, default=None, help='Override default dataset directory (e.g. ./dataset/RealEstate10K_rotmat1_overfit50)')
         self.parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints', help='models are saved here.')
 
         self.parser.add_argument('--latent_dim', type=int, default=384, help='Dimension of transformer latent.')

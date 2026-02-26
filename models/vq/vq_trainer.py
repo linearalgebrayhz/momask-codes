@@ -13,7 +13,6 @@ from utils.eval_t2m import evaluation_vqvae
 from utils.camera_eval import evaluation_camera_vqvae
 from utils.utils import print_current_loss
 from utils.logging_utils import VQLogger, create_loss_dict, aggregate_losses
-from utils.visual_consistency import create_visual_consistency_module
 
 import os
 import sys
@@ -21,6 +20,58 @@ from tqdm import tqdm
 
 def def_value():
     return 0.0
+
+
+def compute_smoothness_loss(pred_motion, gt_motion):
+    """
+    Compute temporal smoothness loss for camera trajectories.
+    Penalizes large changes in velocity (acceleration) and jerk.
+    
+    Args:
+        pred_motion: Predicted motion [B, T, D]
+        gt_motion: Ground truth motion [B, T, D]
+    
+    Returns:
+        smoothness_loss: Combined acceleration and jerk penalty
+    """
+    feature_dim = pred_motion.shape[-1]
+    
+    if feature_dim >= 10:  # Has explicit velocity components (10D quat, 12D formats)
+        # Extract velocity (dims 3-5 for all formats with velocity)
+        pred_vel = pred_motion[..., 3:6]  # [B, T, 3]
+        gt_vel = gt_motion[..., 3:6]
+        
+        # Compute acceleration (velocity changes between frames)
+        pred_accel = pred_vel[:, 1:] - pred_vel[:, :-1]  # [B, T-1, 3]
+        gt_accel = gt_vel[:, 1:] - gt_vel[:, :-1]
+        
+        # L2 penalty on acceleration difference
+        loss_accel = F.mse_loss(pred_accel, gt_accel)
+        
+        # Jerk penalty (acceleration changes) - smoother higher-order motion
+        if pred_accel.shape[1] > 1:  # Need at least 2 frames for jerk
+            pred_jerk = pred_accel[:, 1:] - pred_accel[:, :-1]  # [B, T-2, 3]
+            gt_jerk = gt_accel[:, 1:] - gt_accel[:, :-1]
+            loss_jerk = F.mse_loss(pred_jerk, gt_jerk)
+            return loss_accel + 0.5 * loss_jerk
+        else:
+            return loss_accel
+    else:
+        # For legacy formats (5D, 6D without explicit velocity), use position-based smoothness
+        pred_pos = pred_motion[..., :3]
+        gt_pos = gt_motion[..., :3]
+        
+        # Compute velocity via finite differences
+        pred_vel_fd = pred_pos[:, 1:] - pred_pos[:, :-1]  # [B, T-1, 3]
+        gt_vel_fd = gt_pos[:, 1:] - gt_pos[:, :-1]
+        
+        # Compute acceleration from finite differences
+        if pred_vel_fd.shape[1] > 1:
+            pred_accel = pred_vel_fd[:, 1:] - pred_vel_fd[:, :-1]  # [B, T-2, 3]
+            gt_accel = gt_vel_fd[:, 1:] - gt_vel_fd[:, :-1]
+            return F.mse_loss(pred_accel, gt_accel)
+        else:
+            return torch.tensor(0.0, device=pred_motion.device)
 
 
 class RVQTokenizerTrainer:
@@ -35,15 +86,6 @@ class RVQTokenizerTrainer:
                 self.l1_criterion = nn.L1Loss()
             elif args.recons_loss == 'l1_smooth':
                 self.l1_criterion = nn.SmoothL1Loss()
-
-        # Initialize visual consistency module
-        try:
-            from utils.visual_consistency import create_visual_consistency_module
-            self.visual_consistency = create_visual_consistency_module(args)
-            print(f"Visual consistency module enabled: {self.visual_consistency.enabled}")
-        except ImportError:
-            print("Visual consistency module not available")
-            self.visual_consistency = None
 
         # self.critic = CriticWrapper(self.opt.dataset_name, self.opt.device)
 
@@ -85,35 +127,53 @@ class RVQTokenizerTrainer:
                 loss_ori = self.l1_criterion(pred_ori, gt_ori)
                 loss_explicit = loss_pos + loss_ori
                 
+            elif feature_dim == 10:
+                # 10D quaternion: [x, y, z, dx, dy, dz, qw, qx, qy, qz]
+                pred_pos_vel = pred_motion[..., :6]   # position + velocity
+                pred_quat = pred_motion[..., 6:10]    # quaternion
+                
+                gt_pos_vel = motions[..., :6]
+                gt_quat = motions[..., 6:10]
+                
+                loss_pos_vel = self.l1_criterion(pred_pos_vel, gt_pos_vel)
+                loss_quat = self.l1_criterion(pred_quat, gt_quat)
+                
+                # Simple combination - normalized data should have similar scales
+                loss_explicit = loss_pos_vel + loss_quat
+                
             elif feature_dim == 12:
-                # 12-feature: [x, y, z, dx, dy, dz, pitch, yaw, roll, dpitch, dyaw, droll]
-                pred_pos = pred_motion[..., :3]      # x, y, z
-                pred_vel = pred_motion[..., 3:6]     # dx, dy, dz
-                pred_ori = pred_motion[..., 6:9]     # pitch, yaw, roll
-                pred_ang_vel = pred_motion[..., 9:12]  # dpitch, dyaw, droll
+                # 12D format - could be Euler or rotation matrix
+                # Both have structure: [x, y, z, dx, dy, dz, rot1, rot2, rot3, rot4, rot5, rot6]
+                # Euler: rot = [pitch, yaw, roll, dpitch, dyaw, droll]
+                # RotMat: rot = [r1x, r1y, r1z, r2x, r2y, r2z]
                 
-                gt_pos = motions[..., :3]
-                gt_vel = motions[..., 3:6]
-                gt_ori = motions[..., 6:9]
-                gt_ang_vel = motions[..., 9:12]
+                pred_pos_vel = pred_motion[..., :6]    # position + velocity
+                pred_rot = pred_motion[..., 6:12]      # rotation representation (6D)
                 
-                # Weighted loss for different components
-                loss_pos = self.l1_criterion(pred_pos, gt_pos)
-                loss_vel = self.l1_criterion(pred_vel, gt_vel)
-                loss_ori = self.l1_criterion(pred_ori, gt_ori)
-                loss_ang_vel = self.l1_criterion(pred_ang_vel, gt_ang_vel)
+                gt_pos_vel = motions[..., :6]
+                gt_rot = motions[..., 6:12]
                 
-                # Scale-aware weighting based on typical feature magnitudes
-                # Positions: ~1.0 scale, Velocities: ~0.01 scale, Orientations: ~0.5 scale, Angular vel: ~0.005 scale
-                pos_weight = 100.0
-                vel_weight = 10.0   # Boost velocity importance due to small scale
-                ori_weight = 2.0     # Boost orientation slightly
-                ang_vel_weight = 20.0  # Heavily boost angular velocity due to tiny scale
+                loss_pos_vel = self.l1_criterion(pred_pos_vel, gt_pos_vel)
+                loss_rot = self.l1_criterion(pred_rot, gt_rot)
                 
-                loss_explicit = (pos_weight * loss_pos + 
-                               vel_weight * loss_vel + 
-                               ori_weight * loss_ori + 
-                               ang_vel_weight * loss_ang_vel) / (pos_weight + vel_weight + ori_weight + ang_vel_weight)
+                # Check if this is rotation matrix format (need orthogonality)
+                is_rotmat = 'rotmat' in self.opt.dataset_name.lower()
+                
+                if is_rotmat:
+                    # Add orthogonality loss for rotation matrix format
+                    from utils.unified_data_format import compute_orthogonality_loss
+                    loss_orth = compute_orthogonality_loss(pred_rot)
+                    
+                    # Weight for orthogonality loss (default 0.1)
+                    orth_weight = getattr(self.opt, 'loss_orthogonality', 0.1)
+                    
+                    loss_explicit = loss_pos_vel + loss_rot + orth_weight * loss_orth
+                    
+                    # Store for logging
+                    self.loss_orth = loss_orth
+                else:
+                    loss_explicit = loss_pos_vel + loss_rot
+                    self.loss_orth = torch.tensor(0.0, device=self.device)
                 
             else:
                 # Fallback for unknown camera data format
@@ -125,7 +185,22 @@ class RVQTokenizerTrainer:
             local_pos = motions[..., 4 : (self.opt.joints_num - 1) * 3 + 4]
             loss_explicit = self.l1_criterion(pred_local_pos, local_pos)
 
-        loss = loss_rec + self.opt.loss_vel * loss_explicit + self.opt.commit * loss_commit
+        # Compute temporal smoothness loss (acceleration/jerk penalty)
+        # Only compute if weight > 0 to allow disabling for comparison experiments
+        loss_smoothness = torch.tensor(0.0, device=self.device)
+        smoothness_weight = getattr(self.opt, 'loss_smoothness', 0.0)  # Default 0.0 (disabled)
+        
+        if is_camera_dataset and smoothness_weight > 0 and motions.shape[1] > 2:
+            loss_smoothness = compute_smoothness_loss(pred_motion, motions)
+        
+        # Initialize loss_orth if not set (for non-rotmat datasets)
+        if not hasattr(self, 'loss_orth'):
+            self.loss_orth = torch.tensor(0.0, device=self.device)
+        
+        # Combine all losses
+        loss = loss_rec + self.opt.loss_vel * loss_explicit + \
+               self.opt.commit * loss_commit + \
+               smoothness_weight * loss_smoothness
         
         # Debug NaN detection
         if torch.isnan(loss).any() or torch.isnan(loss_explicit).any():
@@ -138,39 +213,7 @@ class RVQTokenizerTrainer:
             # Set loss to a small positive value to continue training
             loss = torch.tensor(1e-6, device=self.device, requires_grad=True)
 
-        # Visual consistency loss
-        loss_lpips = torch.tensor(0.0, device=self.device)
-        if (self.visual_consistency is not None and 
-            self.visual_consistency.enabled and 
-            step is not None and 
-            step % getattr(self.opt, 'visual_consistency_freq', 10) == 0 and
-            is_camera_dataset):
-            
-            batch_size = motions.shape[0]
-            total_lpips_loss = 0.0
-            num_valid_samples = 0
-            
-            for i in range(batch_size):
-                pred_traj = pred_motion[i].detach()  # [T, 5]
-                gt_traj = motions[i]  # [T, 5]
-                
-                # Compute visual consistency loss for this sample
-                try:
-                    visual_losses = self.visual_consistency.compute_visual_loss(
-                        pred_traj, gt_traj, data_id=None, step=step)
-                    total_lpips_loss += visual_losses['lpips_loss']
-                    num_valid_samples += 1
-                except Exception as e:
-                    # Handle any errors gracefully
-                    continue
-            
-            if num_valid_samples > 0:
-                loss_lpips = total_lpips_loss / num_valid_samples
-                loss += getattr(self.opt, 'visual_consistency_weight', 0.01) * loss_lpips
-
-        # return loss, loss_rec, loss_vel, loss_commit, perplexity
-        # return loss, loss_rec, loss_percept, loss_commit, perplexity
-        return loss, loss_rec, loss_explicit, loss_commit, perplexity, loss_lpips
+        return loss, loss_rec, loss_explicit, loss_commit, perplexity, loss_smoothness, self.loss_orth
 
 
     # @staticmethod
@@ -276,7 +319,7 @@ class RVQTokenizerTrainer:
                 it += 1
                 if it < self.opt.warm_up_iter:
                     current_lr = self.update_lr_warm_up(it, self.opt.warm_up_iter, self.opt.lr)
-                loss, loss_rec, loss_vel, loss_commit, perplexity, loss_lpips = self.forward(batch_data, step=it)
+                loss, loss_rec, loss_vel, loss_commit, perplexity, loss_smoothness, loss_orth = self.forward(batch_data, step=it)
                 self.opt_vq_model.zero_grad()
                 loss.backward()
                 
@@ -295,7 +338,8 @@ class RVQTokenizerTrainer:
                 logs['loss_commit'] += loss_commit.item()
                 logs['perplexity'] += perplexity.item()
                 logs['lr'] += self.opt_vq_model.param_groups[0]['lr']
-                logs['loss_lpips'] += loss_lpips.item() if isinstance(loss_lpips, torch.Tensor) else loss_lpips
+                logs['loss_smoothness'] += loss_smoothness.item() if isinstance(loss_smoothness, torch.Tensor) else loss_smoothness
+                logs['loss_orth'] += loss_orth.item() if isinstance(loss_orth, torch.Tensor) else loss_orth
 
                 if it % self.opt.log_every == 0:
                     mean_loss = OrderedDict()
@@ -341,18 +385,18 @@ class RVQTokenizerTrainer:
             val_loss_commit = []
             val_loss = []
             val_perpexity = []
-            val_loss_lpips = []
+            val_loss_smoothness = []
+            val_loss_orth = []
             with torch.no_grad():
                 for i, batch_data in tqdm(enumerate(val_loader), desc = f"[Validation RVQ epoch {epoch}/{self.opt.max_epoch}]", total=len(val_loader)):
-                    loss, loss_rec, loss_vel, loss_commit, perplexity, loss_lpips = self.forward(batch_data)
-                    # val_loss_rec += self.l1_criterion(self.recon_motions, self.motions).item()
-                    # val_loss_emb += self.embedding_loss.item()
+                    loss, loss_rec, loss_vel, loss_commit, perplexity, loss_smoothness, loss_orth = self.forward(batch_data)
                     val_loss.append(loss.item())
                     val_loss_rec.append(loss_rec.item())
                     val_loss_vel.append(loss_vel.item())
                     val_loss_commit.append(loss_commit.item())
                     val_perpexity.append(perplexity.item())
-                    val_loss_lpips.append(loss_lpips.item() if isinstance(loss_lpips, torch.Tensor) else loss_lpips)
+                    val_loss_smoothness.append(loss_smoothness.item() if isinstance(loss_smoothness, torch.Tensor) else loss_smoothness)
+                    val_loss_orth.append(loss_orth.item() if isinstance(loss_orth, torch.Tensor) else loss_orth)
 
             # Calculate validation metrics
             val_metrics = {
@@ -361,16 +405,17 @@ class RVQTokenizerTrainer:
                 'loss_explicit': sum(val_loss_vel) / len(val_loss_vel),
                 'loss_commit': sum(val_loss_commit) / len(val_loss_commit),
                 'perplexity': sum(val_perpexity) / len(val_perpexity),
-                'loss_lpips': sum(val_loss_lpips) / len(val_loss_lpips) if val_loss_lpips else 0.0
+                'loss_smoothness': sum(val_loss_smoothness) / len(val_loss_smoothness) if val_loss_smoothness else 0.0,
+                'loss_orth': sum(val_loss_orth) / len(val_loss_orth) if val_loss_orth else 0.0
             }
             
             # Log validation metrics
             self.logger.log_validation_metrics(val_metrics, epoch)
 
-            # Print validation metrics including LPIPS if enabled
-            lpips_str = f", LPIPS: {sum(val_loss_lpips)/len(val_loss_lpips):.5f}" if val_loss_lpips and any(val_loss_lpips) else ""
+            # Print validation metrics
+            smoothness_str = f", Smoothness: {sum(val_loss_smoothness)/len(val_loss_smoothness):.5f}" if val_loss_smoothness and any(val_loss_smoothness) else ""
             print(f'Validation Loss: {sum(val_loss)/len(val_loss):.5f} Reconstruction: {sum(val_loss_rec)/len(val_loss):.5f}, '
-                  f'Velocity: {sum(val_loss_vel)/len(val_loss):.5f}, Commit: {sum(val_loss_commit)/len(val_loss):.5f}{lpips_str}')
+                  f'Velocity: {sum(val_loss_vel)/len(val_loss):.5f}, Commit: {sum(val_loss_commit)/len(val_loss):.5f}{smoothness_str}')
 
             # if sum(val_loss) / len(val_loss) < min_val_loss:
             #     min_val_loss = sum(val_loss) / len(val_loss)
@@ -399,7 +444,8 @@ class RVQTokenizerTrainer:
 
 
             # if self.opt.eval_on and epoch % self.opt.eval_every_e == 0:
-            data = torch.cat([self.motions[:4], self.pred_motion[:4]], dim=0).detach().cpu().numpy()
+            n_vis = getattr(self.opt, 'num_vis_samples', 4)
+            data = torch.cat([self.motions[:n_vis], self.pred_motion[:n_vis]], dim=0).detach().cpu().numpy()
             # np.save(pjoin(self.opt.eval_dir, 'E%04d.npy' % (epoch)), data)
             save_dir = pjoin(self.opt.eval_dir, 'E%04d' % (epoch))
             os.makedirs(save_dir, exist_ok=True)

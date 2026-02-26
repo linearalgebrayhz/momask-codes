@@ -198,16 +198,29 @@ if __name__ == '__main__':
         raise "A text prompt, or a file a text prompts are required!!!"
     # print('loading checkpoint {}'.format(file))
 
+    # Check if this is a camera dataset
+    is_camera_dataset = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+    
     if est_length:
-        print("Since no motion length are specified, we will use estimated motion lengthes!!")
-        text_embedding = t2m_transformer.encode_text(prompt_list)
-        pred_dis = length_estimator(text_embedding)
-        probs = F.softmax(pred_dis, dim=-1)  # (b, ntoken)
-        token_lens = Categorical(probs).sample()  # (b, seqlen)
-        # lengths = torch.multinomial()
+        if is_camera_dataset:
+            # For camera datasets, use FIXED length instead of unreliable estimator
+            # Standard shot length: 6-8 seconds (180-240 frames at 30fps)
+            # Use configurable default via --motion_length, otherwise 200 frames
+            default_camera_length = getattr(opt, 'default_camera_length', 200)
+            print(f"Camera dataset detected: Using FIXED length of {default_camera_length} frames (~{default_camera_length/30:.1f}s)")
+            print(f"  (Length estimator is disabled for camera data)")
+            token_lens = torch.LongTensor([default_camera_length // 4] * len(prompt_list))
+        else:
+            # For human motion, use length estimator
+            print("Since no motion length are specified, we will use estimated motion lengthes!!")
+            text_embedding = t2m_transformer.encode_text(prompt_list)
+            pred_dis = length_estimator(text_embedding)
+            probs = F.softmax(pred_dis, dim=-1)  # (b, ntoken)
+            token_lens = Categorical(probs).sample()  # (b, seqlen)
     else:
         token_lens = torch.LongTensor(length_list) // 4
-        token_lens = token_lens.to(opt.device).long()
+    
+    token_lens = token_lens.to(opt.device).long()
 
     m_length = token_lens * 4
     captions = prompt_list

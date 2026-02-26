@@ -16,8 +16,7 @@ from utils.get_opt import get_opt
 from motion_loaders.dataset_motion_loader import get_dataset_motion_loader
 
 from utils.motion_process import recover_from_ric
-from utils.plot_script import plot_3d_motion, plot_3d_motion_camera
-from utils.camera_plot import create_camera_plot_function
+from utils.plot_script import plot_3d_motion
 from utils.fixseed import fixseed
 from utils.dataset_config import get_unified_dataset_config
 
@@ -33,7 +32,11 @@ def plot_t2m(data, save_dir):
         # For camera data, use GT vs Pred comparison visualizations
         from gen_camera import plot_camera_trajectory_animation, plot_camera_trajectory
         from utils.camera_plot import plot_camera_trajectory_3d
+        from utils.unified_data_format import detect_format_from_dataset_name
         import os
+        
+        # Detect format from dataset name
+        viz_format_type = detect_format_from_dataset_name(opt.dataset_name)
         
         os.makedirs(save_dir, exist_ok=True)
         
@@ -56,7 +59,8 @@ def plot_t2m(data, save_dir):
                     pred_data=pred_trajectory[None, ...],  # Add batch dimension
                     save_path=comparison_path,
                     title=f"RVQ Training Sample {i:02d} - GT vs Pred Comparison",
-                    seq_idx=0
+                    seq_idx=0,
+                    format_type=viz_format_type
                 )
                 print(f"Camera comparison plot saved: {comparison_path}")
             except Exception as e:
@@ -73,7 +77,8 @@ def plot_t2m(data, save_dir):
                     fps=30,
                     show_trail=True,
                     trail_length=30,
-                    figsize=(10, 8)
+                    figsize=(10, 8),
+                    format_type=viz_format_type
                 )
                 plot_camera_trajectory_animation(
                     data=pred_trajectory,
@@ -82,7 +87,8 @@ def plot_t2m(data, save_dir):
                     fps=30,
                     show_trail=True,
                     trail_length=30,
-                    figsize=(10, 8)
+                    figsize=(10, 8),
+                    format_type=viz_format_type
                 )
                 print(f"Camera videos saved: {gt_video_path}, {pred_video_path}")
             except Exception as e:
@@ -188,11 +194,13 @@ if __name__ == "__main__":
                                 shuffle=True, pin_memory=True)
     
     if opt.eval_on:
-        eval_val_loader, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device)
+        eval_val_loader, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device,
+                                                       data_root_override=opt.data_root)
     else:
         eval_val_loader = None
 
-    eval_val_loader, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device)
+    eval_val_loader, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device,
+                                                   data_root_override=opt.data_root)
     trainer.train(train_loader, val_loader, eval_val_loader, eval_wrapper, plot_t2m)
 
 ## train_vq.py --dataset_name kit --batch_size 512 --name VQVAE_dp2 --gpu_id 3

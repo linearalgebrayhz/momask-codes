@@ -4,7 +4,9 @@ Unified Data Format Module for Camera Trajectory Processing
 This module provides a unified interface for handling different camera trajectory data formats:
 - 5-feature: [x, y, z, pitch, yaw] (legacy cam dataset)
 - 6-feature: [x, y, z, pitch, yaw, roll] (position + full orientation)
-- 12-feature: [x, y, z, dx, dy, dz, pitch, yaw, roll, dpitch, dyaw, droll] (position + velocity + orientation + angular velocity)
+- 10-feature: [x, y, z, dx, dy, dz, qw, qx, qy, qz] (position + velocity + quaternion)
+- 12-feature Euler: [x, y, z, dx, dy, dz, pitch, yaw, roll, dpitch, dyaw, droll] (position + velocity + Euler + angular velocity)
+- 12-feature RotMat: [x, y, z, dx, dy, dz, r1x, r1y, r1z, r2x, r2y, r2z] (position + velocity + 2 rotation matrix columns)
 
 The module automatically detects format and provides conversion utilities.
 """
@@ -18,7 +20,9 @@ class CameraDataFormat(Enum):
     """Enumeration of supported camera data formats"""
     LEGACY_5 = 5  # [x, y, z, pitch, yaw]
     POSITION_ORIENTATION_6 = 6  # [x, y, z, pitch, yaw, roll]
-    FULL_12 = 12  # [x, y, z, dx, dy, dz, pitch, yaw, roll, dpitch, dyaw, droll]
+    QUATERNION_10 = 10  # [x, y, z, dx, dy, dz, qw, qx, qy, qz]
+    FULL_12_EULER = 12  # [x, y, z, dx, dy, dz, pitch, yaw, roll, dpitch, dyaw, droll]
+    FULL_12_ROTMAT = 13  # [x, y, z, dx, dy, dz, r1x, r1y, r1z, r2x, r2y, r2z] - uses 13 as unique ID
 
 class UnifiedCameraData:
     """
@@ -50,15 +54,20 @@ class UnifiedCameraData:
             return CameraDataFormat.LEGACY_5
         elif self.num_features == 6:
             return CameraDataFormat.POSITION_ORIENTATION_6
+        elif self.num_features == 10:
+            return CameraDataFormat.QUATERNION_10
         elif self.num_features == 12:
-            return CameraDataFormat.FULL_12
+            # Ambiguous - could be EULER or ROTMAT. Caller should specify explicitly or use dataset name
+            # Default to EULER for backward compatibility
+            return CameraDataFormat.FULL_12_EULER
         else:
             raise ValueError(f"Unsupported data format with {self.num_features} features. "
-                           f"Supported formats: 5, 6, or 12 features.")
+                           f"Supported formats: 5, 6, 10, or 12 features.")
     
     def _validate_format(self):
         """Validate that data matches declared format"""
-        expected_features = self.format_type.value
+        # FULL_12_ROTMAT uses 13 as enum value but has 12 features
+        expected_features = 12 if self.format_type == CameraDataFormat.FULL_12_ROTMAT else self.format_type.value
         if self.num_features != expected_features:
             raise ValueError(f"Data has {self.num_features} features but format expects {expected_features}")
     
@@ -69,26 +78,44 @@ class UnifiedCameraData:
     
     @property
     def orientations(self) -> torch.Tensor:
-        """Extract orientation data based on format"""
+        """Extract orientation data based on format (Euler angles or quaternion or rotation matrix)"""
         if self.format_type == CameraDataFormat.LEGACY_5:
             return self.data[:, 3:5]  # [pitch, yaw]
         elif self.format_type == CameraDataFormat.POSITION_ORIENTATION_6:
             return self.data[:, 3:6]  # [pitch, yaw, roll]
-        else:  # FULL_12
+        elif self.format_type == CameraDataFormat.QUATERNION_10:
+            return self.data[:, 6:10]  # [qw, qx, qy, qz]
+        elif self.format_type == CameraDataFormat.FULL_12_EULER:
             return self.data[:, 6:9]  # [pitch, yaw, roll]
+        else:  # FULL_12_ROTMAT
+            return self.data[:, 6:12]  # [r1x, r1y, r1z, r2x, r2y, r2z]
     
     @property
     def velocities(self) -> Optional[torch.Tensor]:
         """Extract velocity data if available"""
-        if self.format_type == CameraDataFormat.FULL_12:
+        if self.format_type in [CameraDataFormat.QUATERNION_10, CameraDataFormat.FULL_12_EULER, CameraDataFormat.FULL_12_ROTMAT]:
             return self.data[:, 3:6]  # [dx, dy, dz]
         return None
     
     @property
     def angular_velocities(self) -> Optional[torch.Tensor]:
-        """Extract angular velocity data if available"""
-        if self.format_type == CameraDataFormat.FULL_12:
+        """Extract angular velocity data if available (only for FULL_12_EULER)"""
+        if self.format_type == CameraDataFormat.FULL_12_EULER:
             return self.data[:, 9:12]  # [dpitch, dyaw, droll]
+        return None
+    
+    @property
+    def quaternions(self) -> Optional[torch.Tensor]:
+        """Extract quaternion data if available"""
+        if self.format_type == CameraDataFormat.QUATERNION_10:
+            return self.data[:, 6:10]  # [qw, qx, qy, qz]
+        return None
+    
+    @property
+    def rotation_matrix_columns(self) -> Optional[torch.Tensor]:
+        """Extract rotation matrix columns if available (returns first 2 columns as 6D vector)"""
+        if self.format_type == CameraDataFormat.FULL_12_ROTMAT:
+            return self.data[:, 6:12]  # [r1x, r1y, r1z, r2x, r2y, r2z]
         return None
     
     def to_format(self, target_format: CameraDataFormat) -> 'UnifiedCameraData':
@@ -111,7 +138,7 @@ class UnifiedCameraData:
         
         # Get base components
         positions = self.positions  # [seq_len, 3]
-        orientations = self.orientations  # [seq_len, 2 or 3]
+        orientations = self.orientations  # [seq_len, 2 or 3 or 4 or 6]
         
         if target_format == CameraDataFormat.LEGACY_5:
             # Convert to [x, y, z, pitch, yaw]
@@ -129,8 +156,71 @@ class UnifiedCameraData:
             else:  # Already [pitch, yaw, roll]
                 full_orientations = orientations
             converted_data = torch.cat([positions, full_orientations], dim=1)
+        
+        elif target_format == CameraDataFormat.QUATERNION_10:
+            # Convert to [x, y, z, dx, dy, dz, qw, qx, qy, qz]
             
-        else:  # target_format == CameraDataFormat.FULL_12
+            # Calculate velocities if not available
+            if self.velocities is not None:
+                velocities = self.velocities
+            else:
+                velocities = self._calculate_velocities(positions)
+            
+            # Ensure full Euler orientations [pitch, yaw, roll]
+            if self.format_type == CameraDataFormat.QUATERNION_10:
+                # Already quaternion, just use it
+                quaternions = orientations
+            elif orientations.shape[1] == 2:  # [pitch, yaw] -> [pitch, yaw, roll]
+                roll = torch.zeros(self.seq_len, 1, device=orientations.device)
+                full_euler = torch.cat([orientations, roll], dim=1)
+                quaternions = euler_to_quaternion(full_euler)
+            elif orientations.shape[1] == 3:  # [pitch, yaw, roll] Euler angles
+                quaternions = euler_to_quaternion(orientations)
+            elif orientations.shape[1] == 6:  # Rotation matrix columns
+                # Convert rotation matrix to quaternion
+                euler = rotation_matrix_to_euler(orientations)
+                quaternions = euler_to_quaternion(euler)
+            else:
+                raise ValueError(f"Cannot convert orientations of shape {orientations.shape} to quaternion")
+            
+            converted_data = torch.cat([
+                positions,     # [x, y, z]
+                velocities,    # [dx, dy, dz]
+                quaternions    # [qw, qx, qy, qz]
+            ], dim=1)
+        
+        elif target_format == CameraDataFormat.FULL_12_ROTMAT:
+            # Convert to [x, y, z, dx, dy, dz, r1x, r1y, r1z, r2x, r2y, r2z]
+            
+            # Calculate velocities if not available
+            if self.velocities is not None:
+                velocities = self.velocities
+            else:
+                velocities = self._calculate_velocities(positions)
+            
+            # Convert orientation to rotation matrix columns
+            if self.format_type == CameraDataFormat.FULL_12_ROTMAT:
+                # Already rotation matrix columns, just use it
+                rot_mat_cols = orientations
+            elif orientations.shape[1] == 2:  # [pitch, yaw] -> [pitch, yaw, roll]
+                roll = torch.zeros(self.seq_len, 1, device=orientations.device)
+                full_euler = torch.cat([orientations, roll], dim=1)
+                rot_mat_cols = euler_to_rotation_matrix(full_euler)
+            elif orientations.shape[1] == 3:  # [pitch, yaw, roll] Euler angles
+                rot_mat_cols = euler_to_rotation_matrix(orientations)
+            elif orientations.shape[1] == 4:  # Quaternion
+                euler = quaternion_to_euler(orientations)
+                rot_mat_cols = euler_to_rotation_matrix(euler)
+            else:
+                raise ValueError(f"Cannot convert orientations of shape {orientations.shape} to rotation matrix")
+            
+            converted_data = torch.cat([
+                positions,      # [x, y, z]
+                velocities,     # [dx, dy, dz]
+                rot_mat_cols    # [r1x, r1y, r1z, r2x, r2y, r2z]
+            ], dim=1)
+            
+        else:  # target_format == CameraDataFormat.FULL_12_EULER
             # Convert to [x, y, z, dx, dy, dz, pitch, yaw, roll, dpitch, dyaw, droll]
             
             # Calculate velocities if not available
@@ -143,8 +233,14 @@ class UnifiedCameraData:
             if orientations.shape[1] == 2:  # [pitch, yaw] -> [pitch, yaw, roll]
                 roll = torch.zeros(self.seq_len, 1, device=orientations.device)
                 full_orientations = torch.cat([orientations, roll], dim=1)
-            else:  # Already [pitch, yaw, roll]
+            elif orientations.shape[1] == 3:  # Already [pitch, yaw, roll]
                 full_orientations = orientations
+            elif orientations.shape[1] == 4:  # Quaternion
+                full_orientations = quaternion_to_euler(orientations)
+            elif orientations.shape[1] == 6:  # Rotation matrix columns
+                full_orientations = rotation_matrix_to_euler(orientations)
+            else:
+                raise ValueError(f"Cannot convert orientations of shape {orientations.shape}")
             
             # Calculate angular velocities if not available
             if self.angular_velocities is not None:
@@ -245,8 +341,15 @@ def detect_dataset_format(data_root: str, sample_file: str = None) -> CameraData
             return CameraDataFormat.LEGACY_5
         elif num_features == 6:
             return CameraDataFormat.POSITION_ORIENTATION_6
+        elif num_features == 10:
+            return CameraDataFormat.QUATERNION_10
         elif num_features == 12:
-            return CameraDataFormat.FULL_12
+            # Disambiguate 12D: check dataset name from path for rotmat vs euler
+            path_str = str(data_root).lower()
+            if 'rotmat' in path_str or 'rot_mat' in path_str:
+                return CameraDataFormat.FULL_12_ROTMAT
+            else:
+                return CameraDataFormat.FULL_12_EULER
         else:
             raise ValueError(f"Unsupported format with {num_features} features")
             
@@ -327,5 +430,244 @@ def batch_convert_dataset(input_dir: str, output_dir: str,
     with open(output_path / "format_info.json", 'w') as f:
         import json
         json.dump(format_info, f, indent=2)
+    
+    print(f"Dataset conversion completed. Output saved to: {output_path}")
+
+
+# ============================================================================
+# Conversion Utilities for Quaternion and Rotation Matrix
+# ============================================================================
+
+def euler_to_quaternion(euler: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+    """
+    Convert Euler angles (pitch, yaw, roll) to quaternion (qw, qx, qy, qz)
+    
+    Args:
+        euler: [..., 3] Euler angles in radians [pitch, yaw, roll]
+    
+    Returns:
+        [..., 4] Quaternion [qw, qx, qy, qz] (scalar-first convention)
+    """
+    from scipy.spatial.transform import Rotation as R
+    
+    is_torch = isinstance(euler, torch.Tensor)
+    if is_torch:
+        euler_np = euler.detach().cpu().numpy()
+    else:
+        euler_np = euler
+    
+    # scipy uses 'xyz' intrinsic rotations by default
+    # Our convention: pitch (X), yaw (Y), roll (Z)
+    rot = R.from_euler('xyz', euler_np, degrees=False)
+    quat = rot.as_quat()  # scipy returns [qx, qy, qz, qw]
+    
+    # Convert to scalar-first: [qw, qx, qy, qz]
+    quat_scalar_first = np.concatenate([quat[..., 3:4], quat[..., :3]], axis=-1)
+    
+    if is_torch:
+        return torch.tensor(quat_scalar_first, dtype=euler.dtype, device=euler.device)
+    return quat_scalar_first
+
+
+def quaternion_to_euler(quat: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+    """
+    Convert quaternion (qw, qx, qy, qz) to Euler angles (pitch, yaw, roll)
+    
+    Args:
+        quat: [..., 4] Quaternion [qw, qx, qy, qz] (scalar-first convention)
+    
+    Returns:
+        [..., 3] Euler angles [pitch, yaw, roll] in radians
+    """
+    from scipy.spatial.transform import Rotation as R
+    
+    is_torch = isinstance(quat, torch.Tensor)
+    if is_torch:
+        quat_np = quat.detach().cpu().numpy()
+    else:
+        quat_np = quat
+    
+    # Convert to scipy format: [qx, qy, qz, qw]
+    quat_scipy = np.concatenate([quat_np[..., 1:4], quat_np[..., 0:1]], axis=-1)
+    
+    rot = R.from_quat(quat_scipy)
+    euler = rot.as_euler('xyz', degrees=False)  # [pitch, yaw, roll]
+    
+    if is_torch:
+        return torch.tensor(euler, dtype=quat.dtype, device=quat.device)
+    return euler
+
+
+def euler_to_rotation_matrix(euler: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+    """
+    Convert Euler angles to rotation matrix (extract first 2 columns as 6D representation)
+    
+    Args:
+        euler: [..., 3] Euler angles [pitch, yaw, roll] in radians
+    
+    Returns:
+        [..., 6] First 2 columns of rotation matrix [r1x, r1y, r1z, r2x, r2y, r2z]
+    """
+    from scipy.spatial.transform import Rotation as R
+    
+    is_torch = isinstance(euler, torch.Tensor)
+    if is_torch:
+        euler_np = euler.detach().cpu().numpy()
+    else:
+        euler_np = euler
+    
+    rot = R.from_euler('xyz', euler_np, degrees=False)
+    rot_mat = rot.as_matrix()  # [..., 3, 3]
+    
+    # Extract first 2 columns
+    rot_6d = np.concatenate([rot_mat[..., :, 0], rot_mat[..., :, 1]], axis=-1)
+    
+    if is_torch:
+        return torch.tensor(rot_6d, dtype=euler.dtype, device=euler.device)
+    return rot_6d
+
+
+def rotation_matrix_to_euler(rot_6d: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+    """
+    Convert 6D rotation representation to Euler angles
+    
+    Args:
+        rot_6d: [..., 6] First 2 columns of rotation matrix [r1x, r1y, r1z, r2x, r2y, r2z]
+    
+    Returns:
+        [..., 3] Euler angles [pitch, yaw, roll] in radians
+    """
+    from scipy.spatial.transform import Rotation as R
+    
+    is_torch = isinstance(rot_6d, torch.Tensor)
+    if is_torch:
+        rot_6d_np = rot_6d.detach().cpu().numpy()
+    else:
+        rot_6d_np = rot_6d
+    
+    # Reconstruct full rotation matrix from 6D representation
+    r1 = rot_6d_np[..., :3]
+    r2 = rot_6d_np[..., 3:6]
+    
+    # Gram-Schmidt orthogonalization
+    r1_norm = r1 / (np.linalg.norm(r1, axis=-1, keepdims=True) + 1e-8)
+    r2_orth = r2 - (r1_norm * (r1_norm * r2).sum(axis=-1, keepdims=True))
+    r2_norm = r2_orth / (np.linalg.norm(r2_orth, axis=-1, keepdims=True) + 1e-8)
+    r3 = np.cross(r1_norm, r2_norm, axis=-1)
+    
+    # Stack into rotation matrix
+    rot_mat = np.stack([r1_norm, r2_norm, r3], axis=-1)  # [..., 3, 3]
+    
+    rot = R.from_matrix(rot_mat)
+    euler = rot.as_euler('xyz', degrees=False)
+    
+    if is_torch:
+        return torch.tensor(euler, dtype=rot_6d.dtype, device=rot_6d.device)
+    return euler
+
+
+def detect_format_from_dataset_name(dataset_name: str) -> Optional[CameraDataFormat]:
+    """
+    Detect format from dataset name convention
+    
+    Args:
+        dataset_name: Dataset name (e.g., 'realestate10k_quat', 'realestate10k_rotmat')
+    
+    Returns:
+        Detected format or None if cannot determine
+    """
+    dataset_name_lower = dataset_name.lower()
+    
+    # Check for rotation matrix format first (more specific)
+    if 'rotmat' in dataset_name_lower or 'rot_mat' in dataset_name_lower:
+        return CameraDataFormat.FULL_12_ROTMAT
+    # Then check for quaternion
+    elif 'quat' in dataset_name_lower:
+        return CameraDataFormat.QUATERNION_10
+    # Check for specific dimension markers
+    elif '12' in dataset_name_lower:
+        return CameraDataFormat.FULL_12_EULER
+    elif '10' in dataset_name_lower:
+        return CameraDataFormat.QUATERNION_10
+    elif '6' in dataset_name_lower:
+        return CameraDataFormat.POSITION_ORIENTATION_6
+    elif '5' in dataset_name_lower or 'legacy' in dataset_name_lower:
+        return CameraDataFormat.LEGACY_5
+    
+    return None
+
+
+def gram_schmidt_orthogonalize(rot_6d: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+    """
+    Apply Gram-Schmidt orthogonalization to 6D rotation representation.
+    Ensures r1 and r2 are orthonormal and reconstructs valid rotation matrix.
+    
+    Args:
+        rot_6d: [..., 6] First 2 columns of rotation matrix [r1x, r1y, r1z, r2x, r2y, r2z]
+    
+    Returns:
+        [..., 6] Orthogonalized rotation matrix columns with unit norm and orthogonality
+    """
+    is_torch = isinstance(rot_6d, torch.Tensor)
+    
+    if is_torch:
+        # Torch implementation
+        r1 = rot_6d[..., :3]
+        r2 = rot_6d[..., 3:6]
+        
+        # Normalize r1
+        r1_norm = r1 / (torch.norm(r1, dim=-1, keepdim=True) + 1e-8)
+        
+        # Orthogonalize r2 w.r.t r1 using Gram-Schmidt
+        r2_orth = r2 - (r1_norm * (r1_norm * r2).sum(dim=-1, keepdim=True))
+        
+        # Normalize r2
+        r2_norm = r2_orth / (torch.norm(r2_orth, dim=-1, keepdim=True) + 1e-8)
+        
+        # Concatenate back
+        return torch.cat([r1_norm, r2_norm], dim=-1)
+    else:
+        # NumPy implementation
+        r1 = rot_6d[..., :3]
+        r2 = rot_6d[..., 3:6]
+        
+        # Normalize r1
+        r1_norm = r1 / (np.linalg.norm(r1, axis=-1, keepdims=True) + 1e-8)
+        
+        # Orthogonalize r2 w.r.t r1 using Gram-Schmidt
+        r2_orth = r2 - (r1_norm * (r1_norm * r2).sum(axis=-1, keepdims=True))
+        
+        # Normalize r2
+        r2_norm = r2_orth / (np.linalg.norm(r2_orth, axis=-1, keepdims=True) + 1e-8)
+        
+        # Concatenate back
+        return np.concatenate([r1_norm, r2_norm], axis=-1)
+
+
+def compute_orthogonality_loss(rot_6d: torch.Tensor) -> torch.Tensor:
+    """
+    Compute orthogonality loss for 6D rotation representation.
+    Penalizes deviation from unit norm and orthogonality.
+    
+    Args:
+        rot_6d: [..., 6] Rotation matrix columns [r1x, r1y, r1z, r2x, r2y, r2z]
+    
+    Returns:
+        Scalar loss value
+    """
+    r1 = rot_6d[..., :3]
+    r2 = rot_6d[..., 3:6]
+    
+    # Unit norm loss: ||r1|| and ||r2|| should be 1
+    r1_norm = torch.norm(r1, dim=-1)
+    r2_norm = torch.norm(r2, dim=-1)
+    loss_norm = torch.mean((r1_norm - 1.0)**2 + (r2_norm - 1.0)**2)
+    
+    # Orthogonality loss: r1 · r2 should be 0
+    dot_product = (r1 * r2).sum(dim=-1)
+    loss_orth = torch.mean(dot_product**2)
+    
+    return loss_norm + loss_orth
+
     
     print(f"Dataset conversion completed. Output saved to: {output_path}")

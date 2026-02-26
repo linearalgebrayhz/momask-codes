@@ -1,8 +1,10 @@
 echo "Starting Camera Residual Transformer Training..."
 
-EXPERIMENT_NAME="rtrans_baseline_noframe2"
-TENSORBOARD_DIR="./log/res/realestate10k_6/${EXPERIMENT_NAME}"
-CHECKPOINT_DIR="./checkpoints/realestate10k_6/${EXPERIMENT_NAME}"
+dataset_name="realestate10k_rotmat"
+
+EXPERIMENT_NAME="rtrans_overfit50_t5cond"
+TENSORBOARD_DIR="./log/res/${dataset_name}/${EXPERIMENT_NAME}"
+CHECKPOINT_DIR="./checkpoints/${dataset_name}/${EXPERIMENT_NAME}"
 
 echo "Logging Configuration:"
 echo "- Experiment name: ${EXPERIMENT_NAME}"
@@ -17,14 +19,15 @@ echo "  tensorboard --logdir=${TENSORBOARD_DIR} --port=6006"
 echo "  # Then access via browser at: http://localhost:6006"
 echo ""
 
-CUDA_VISIBLE_DEVICES=7 python train_res_transformer.py \
+CUDA_VISIBLE_DEVICES=3 python train_res_transformer.py \
     --name ${EXPERIMENT_NAME} \
     --gpu_id 0 \
-    --dataset_name realestate10k_6 \
-    --batch_size 64 \
-    --vq_name rvq_baseline_window128 \
-    --cond_drop_prob 0.1 \
-    --share_weight \
+    --dataset_name ${dataset_name} \
+    --data_root ./dataset/RealEstate10K_rotmat1_overfit50 \
+    --batch_size 8 \
+    --vq_name rvq_window64_overfit50 \
+    --conditioning_mode t5 \
+    --cond_drop_prob 0.0 \
     --latent_dim 384 \
     --ff_size 1024 \
     --n_layers 8 \
@@ -32,6 +35,7 @@ CUDA_VISIBLE_DEVICES=7 python train_res_transformer.py \
     --dropout 0.1 \
     --max_epoch 400 \
     --lr 5e-5 \
+    # --share_weight \
     # --is_continue \
     # --keyframe_arch resnet18 \
     # --use_frames \

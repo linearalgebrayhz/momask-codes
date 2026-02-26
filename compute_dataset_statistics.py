@@ -1,480 +1,485 @@
 #!/usr/bin/env python3
 """
-Comprehensive Dataset Statistics Calculator for RealEstate10K Camera Trajectory Dataset
+Dataset Statistics Calculator for RealEstate10K Camera Trajectory Dataset
 
-Computes:
-1. Number of scenes and frames
-2. Average motion length (seconds @ 24fps)
-3. Vocabulary statistics and richness metrics
-4. Motion distribution (translation and rotation)
-5. Caption quality metrics
+Computes statistics aligned with the actual processing pipeline:
+  - Scene/frame counts, duration distributions
+  - Motion type distribution (using the same forward-vector analysis
+    as realestate10k_processor._generate_guidance())
+  - Vocabulary richness metrics
+  - Caption quality metrics
+
+Supports both 12D rotmat and 10D quaternion formats.
+
+Usage:
+    python compute_dataset_statistics.py ./dataset/RealEstate10K_rotmat
+    python compute_dataset_statistics.py ./dataset/RealEstate10K_rotmat --format rotmat --output stats.json
+    python compute_dataset_statistics.py ./dataset/RealEstate10K_rotmat --text-dir untagged_text
 """
 
-import numpy as np
-import json
-from pathlib import Path
-from collections import Counter, defaultdict
+import sys
 import argparse
+import json
 import re
-from typing import Dict, List, Tuple, Set
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Dict, List, Optional
 
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from utils.unified_data_format import CameraDataFormat, detect_format_from_dataset_name
+from utils.camera_geometry import forward_from_sixd
+
+
+# ============================================================================
+# Motion Classification (mirrors _generate_guidance in realestate10k_processor)
+# ============================================================================
+
+# Thresholds — same as realestate10k_processor._generate_guidance
+THRESHOLD_TRANSLATION = 0.10      # minimum total displacement to count
+THRESHOLD_DOMINANCE = 0.6         # axis must be >= 60% of max displacement
+THRESHOLD_YAW = 0.12              # radians
+THRESHOLD_PITCH = 0.10            # radians
+
+
+def _quat_to_forward(quat: np.ndarray) -> np.ndarray:
+    """Compute camera forward vector from quaternion [qw, qx, qy, qz].
+
+    Converts to rotation matrix, then uses -col2 (OpenGL forward).
+    """
+    from scipy.spatial.transform import Rotation as R
+    # scipy expects [qx, qy, qz, qw]
+    quat_scipy = np.concatenate([quat[1:4], quat[0:1]])
+    rot_mat = R.from_quat(quat_scipy).as_matrix()  # (3, 3)
+    return -rot_mat[:, 2]  # forward = -col2
+
+
+def classify_motion(trajectory: np.ndarray,
+                    fmt: CameraDataFormat) -> Dict[str, bool]:
+    """Classify camera motion using the same logic as the data processor.
+
+    Translation: OpenGL convention (+X right, +Y up, -Z forward).
+    Rotation: forward-vector yaw/pitch analysis (no Euler conversion).
+
+    Returns dict of motion flags aligned with guidance labels:
+        tracks_left, tracks_right, moves_up, moves_down,
+        dollies_forward, dollies_backward,
+        pans_left, pans_right, tilts_up, tilts_down, static
+    """
+    positions = trajectory[:, :3]
+
+    # Extract forward vector for first and last frame
+    if fmt == CameraDataFormat.FULL_12_ROTMAT:
+        fwd0 = forward_from_sixd(trajectory[0, 6:12])
+        fwd1 = forward_from_sixd(trajectory[-1, 6:12])
+    elif fmt == CameraDataFormat.QUATERNION_10:
+        fwd0 = _quat_to_forward(trajectory[0, 6:10])
+        fwd1 = _quat_to_forward(trajectory[-1, 6:10])
+    else:
+        raise ValueError(f"Unsupported format for motion classification: {fmt.name}")
+
+    flags = {
+        "static": False,
+        "dollies_forward": False,
+        "dollies_backward": False,
+        "tracks_left": False,
+        "tracks_right": False,
+        "moves_up": False,
+        "moves_down": False,
+        "pans_left": False,
+        "pans_right": False,
+        "tilts_up": False,
+        "tilts_down": False,
+    }
+
+    # --- Translation (same as _generate_guidance) ---
+    total_t = positions[-1] - positions[0]
+    abs_t = np.abs(total_t)
+    max_t = float(np.max(abs_t))
+
+    has_translation = False
+    if max_t > THRESHOLD_TRANSLATION:
+        # X: right / left
+        if abs_t[0] > THRESHOLD_TRANSLATION and abs_t[0] >= THRESHOLD_DOMINANCE * max_t:
+            has_translation = True
+            if total_t[0] > 0:
+                flags["tracks_right"] = True
+            else:
+                flags["tracks_left"] = True
+        # Y: up / down
+        if abs_t[1] > THRESHOLD_TRANSLATION and abs_t[1] >= THRESHOLD_DOMINANCE * max_t:
+            has_translation = True
+            if total_t[1] > 0:
+                flags["moves_up"] = True
+            else:
+                flags["moves_down"] = True
+        # Z: forward / backward (forward = -Z in OpenGL)
+        if abs_t[2] > THRESHOLD_TRANSLATION and abs_t[2] >= THRESHOLD_DOMINANCE * max_t:
+            has_translation = True
+            if total_t[2] < 0:
+                flags["dollies_forward"] = True
+            else:
+                flags["dollies_backward"] = True
+
+    # --- Rotation (forward-vector method, same as _generate_guidance) ---
+    yaw0 = np.arctan2(fwd0[0], -fwd0[2])
+    yaw1 = np.arctan2(fwd1[0], -fwd1[2])
+    dyaw = np.arctan2(np.sin(yaw1 - yaw0), np.cos(yaw1 - yaw0))  # wrap to [-π, π]
+
+    pitch0 = np.arcsin(np.clip(fwd0[1], -1, 1))
+    pitch1 = np.arcsin(np.clip(fwd1[1], -1, 1))
+    dpitch = pitch1 - pitch0
+
+    has_rotation = False
+    if abs(dyaw) > THRESHOLD_YAW:
+        has_rotation = True
+        if dyaw > 0:
+            flags["pans_right"] = True
+        else:
+            flags["pans_left"] = True
+    if abs(dpitch) > THRESHOLD_PITCH:
+        has_rotation = True
+        if dpitch > 0:
+            flags["tilts_up"] = True
+        else:
+            flags["tilts_down"] = True
+
+    # Static only if no translation AND no rotation detected
+    if not has_translation and not has_rotation:
+        flags["static"] = True
+
+    return flags
+
+
+# ============================================================================
+# Vocabulary Analysis
+# ============================================================================
+
+def analyze_vocabulary(captions: List[str]) -> Dict:
+    """Analyze vocabulary richness and diversity."""
+    vocabulary = Counter()
+    caption_lengths = []
+
+    for caption in captions:
+        words = re.findall(r'\b[a-z]+\b', caption.lower())
+        vocabulary.update(words)
+        caption_lengths.append(len(words))
+
+    total_tokens = sum(vocabulary.values())
+    unique_tokens = len(vocabulary)
+
+    # Type-Token Ratio
+    ttr = unique_tokens / total_tokens if total_tokens > 0 else 0
+
+    # Root TTR (more stable for large corpora)
+    rttr = unique_tokens / np.sqrt(total_tokens) if total_tokens > 0 else 0
+
+    # Moving-Average Type-Token Ratio (100-word windows)
+    all_words = []
+    for caption in captions:
+        all_words.extend(re.findall(r'\b[a-z]+\b', caption.lower()))
+
+    window_size = 100
+    if len(all_words) >= window_size:
+        mattr_scores = [
+            len(set(all_words[i:i + window_size])) / window_size
+            for i in range(len(all_words) - window_size + 1)
+        ]
+        mattr = float(np.mean(mattr_scores))
+    else:
+        mattr = ttr
+
+    return {
+        "total_tokens": total_tokens,
+        "unique_tokens": unique_tokens,
+        "type_token_ratio": round(ttr, 4),
+        "root_ttr": round(rttr, 4),
+        "mattr": round(mattr, 4),
+        "avg_caption_length": round(float(np.mean(caption_lengths)), 1) if caption_lengths else 0,
+        "median_caption_length": float(np.median(caption_lengths)) if caption_lengths else 0,
+        "most_common_words": vocabulary.most_common(20),
+    }
+
+
+# ============================================================================
+# Main Statistics Calculator
+# ============================================================================
 
 class DatasetStatistics:
-    """Compute comprehensive statistics for camera trajectory dataset"""
-    
-    # Motion detection thresholds (matching realestate10k_processor.py)
-    THRESHOLD_TRANSLATION_ABS = 0.10
-    THRESHOLD_YAW = 0.12
-    THRESHOLD_PITCH = 0.10
-    THRESHOLD_ROLL = 0.20
-    # Note: Angular speed threshold adjusted for per-frame analysis (not cumulative)
-    THRESHOLD_MIN_ANGULAR_SPEED = 0.001  # ~0.06°/frame, allows detection of slow rotations
-    THRESHOLD_MIN_TRANSLATION_SPEED = 0.01
-    
-    def __init__(self, dataset_root: Path, frames_roots: List[Path] = None, fps: float = 24.0):
+    """Compute comprehensive statistics for a processed camera trajectory dataset."""
+
+    def __init__(self, dataset_root: Path, fmt: CameraDataFormat,
+                 text_subdir: str = "texts", fps: float = 24.0):
         self.dataset_root = dataset_root
-        self.frames_roots = frames_roots if frames_roots else []
+        self.fmt = fmt
         self.fps = fps
-        
+
         self.motion_dir = dataset_root / "new_joint_vecs"
-        self.text_dir = dataset_root / "untagged_text"
-        self.metadata_dir = dataset_root / "metadata"
-        
-        # Statistics containers
-        self.stats = {}
-        self.motion_distribution = defaultdict(int)
-        self.vocabulary = Counter()
-        self.caption_lengths = []
-        self.sequence_lengths = []
-        self.sequence_durations = []
-    
-    def count_frames_in_directory(self, scene_id: str) -> int:
-        """Count frames for a scene in the frames directories"""
-        if not self.frames_roots:
-            return 0
-        
-        # Try all provided frames directories
-        for frames_root in self.frames_roots:
-            # Try multiple possible scene ID formats
-            possible_dirs = [
-                frames_root / scene_id,
-                frames_root / f"{scene_id}",
-            ]
-            
-            for frames_dir in possible_dirs:
-                if frames_dir.exists() and frames_dir.is_dir():
-                    # Count image files
-                    image_files = (
-                        list(frames_dir.glob("*.jpg")) +
-                        list(frames_dir.glob("*.jpeg")) +
-                        list(frames_dir.glob("*.png"))
-                    )
-                    if image_files:
-                        return len(image_files)
-        
-        return 0
-    
-    def analyze_vocabulary(self, captions: List[str]) -> Dict:
-        """Analyze vocabulary richness and diversity"""
-        all_words = []
-        
-        for caption in captions:
-            # Clean and tokenize
-            caption_lower = caption.lower()
-            # Remove punctuation and split
-            words = re.findall(r'\b[a-z]+\b', caption_lower)
-            all_words.extend(words)
-            self.vocabulary.update(words)
-            self.caption_lengths.append(len(words))
-        
-        # Calculate vocabulary metrics
-        total_tokens = len(all_words)
-        unique_tokens = len(self.vocabulary)
-        
-        # Type-Token Ratio (TTR)
-        ttr = unique_tokens / total_tokens if total_tokens > 0 else 0
-        
-        # Root TTR (RTTR) - more stable for large corpora
-        rttr = unique_tokens / np.sqrt(total_tokens) if total_tokens > 0 else 0
-        
-        # Moving-Average Type-Token Ratio (MATTR) - using 100-word windows
-        mattr_scores = []
-        window_size = 100
-        if len(all_words) >= window_size:
-            for i in range(len(all_words) - window_size + 1):
-                window = all_words[i:i + window_size]
-                window_ttr = len(set(window)) / window_size
-                mattr_scores.append(window_ttr)
-            mattr = np.mean(mattr_scores)
-        else:
-            mattr = ttr
-        
-        # Most common words
-        most_common_words = self.vocabulary.most_common(20)
-        
-        vocab_stats = {
-            'total_tokens': total_tokens,
-            'unique_tokens': unique_tokens,
-            'type_token_ratio': ttr,
-            'root_ttr': rttr,
-            'mattr': mattr,
-            'avg_caption_length': np.mean(self.caption_lengths) if self.caption_lengths else 0,
-            'median_caption_length': np.median(self.caption_lengths) if self.caption_lengths else 0,
-            'most_common_words': most_common_words
-        }
-        
-        return vocab_stats
-    
-    def classify_motion(self, trajectory: np.ndarray) -> Dict[str, bool]:
-        """
-        Classify motion types in a trajectory
-        Returns dict with motion flags
-        """
-        positions = trajectory[:, :3]  # [x, y, z]
-        orientations = trajectory[:, 3:6]  # [pitch, yaw, roll]
-        
-        # Calculate total changes
-        pos_delta = positions[-1] - positions[0]
-        ori_delta = orientations[-1] - orientations[0]
-        
-        # Calculate velocities
-        pos_diffs = np.diff(positions, axis=0)
-        ori_diffs = np.diff(orientations, axis=0)
-        
-        translation_speed = np.mean(np.linalg.norm(pos_diffs, axis=1))
-        angular_speed = np.mean(np.linalg.norm(ori_diffs, axis=1))
-        
-        # Translation detection
-        abs_trans = np.abs(pos_delta)
-        max_trans = np.max(abs_trans) if abs_trans.size > 0 else 0
-        
-        motion_flags = {
-            'static': False,
-            'forward': False,
-            'backward': False,
-            'left': False,
-            'right': False,
-            'up': False,
-            'down': False,
-            'pan_left': False,
-            'pan_right': False,
-            'tilt_up': False,
-            'tilt_down': False,
-            'roll_cw': False,
-            'roll_ccw': False
-        }
-        
-        # Check if static
-        if max_trans < self.THRESHOLD_TRANSLATION_ABS and angular_speed < self.THRESHOLD_MIN_ANGULAR_SPEED:
-            motion_flags['static'] = True
-            return motion_flags
-        
-        # Translation motions
-        if translation_speed > self.THRESHOLD_MIN_TRANSLATION_SPEED:
-            # X-axis: right/left
-            if abs_trans[0] >= self.THRESHOLD_TRANSLATION_ABS:
-                if pos_delta[0] > 0:
-                    motion_flags['right'] = True
-                else:
-                    motion_flags['left'] = True
-            
-            # Y-axis: up/down
-            if abs_trans[1] >= self.THRESHOLD_TRANSLATION_ABS:
-                if pos_delta[1] > 0:
-                    motion_flags['up'] = True
-                else:
-                    motion_flags['down'] = True
-            
-            # Z-axis: forward/backward (forward = negative Z in OpenGL)
-            if abs_trans[2] >= self.THRESHOLD_TRANSLATION_ABS:
-                if pos_delta[2] < 0:
-                    motion_flags['forward'] = True
-                else:
-                    motion_flags['backward'] = True
-        
-        # Rotational motions
-        if angular_speed > self.THRESHOLD_MIN_ANGULAR_SPEED:
-            # Yaw: pan left/right
-            if np.abs(ori_delta[1]) >= self.THRESHOLD_YAW:
-                if ori_delta[1] > 0:
-                    motion_flags['pan_right'] = True
-                else:
-                    motion_flags['pan_left'] = True
-            
-            # Pitch: tilt up/down
-            if np.abs(ori_delta[0]) >= self.THRESHOLD_PITCH:
-                if ori_delta[0] > 0:
-                    motion_flags['tilt_up'] = True
-                else:
-                    motion_flags['tilt_down'] = True
-            
-            # Roll: clockwise/counterclockwise
-            if np.abs(ori_delta[2]) >= self.THRESHOLD_ROLL:
-                if ori_delta[2] > 0:
-                    motion_flags['roll_cw'] = True
-                else:
-                    motion_flags['roll_ccw'] = True
-        
-        return motion_flags
-    
-    def compute_statistics(self):
-        """Compute all statistics for the dataset"""
-        print("Computing dataset statistics...")
-        print(f"Dataset root: {self.dataset_root}")
-        
-        # Get all scene files
+        self.text_dir = dataset_root / text_subdir
+
+        self.stats: Dict = {}
+
+    def compute(self) -> Dict:
+        """Compute all statistics. Returns dict suitable for JSON serialization."""
+        print(f"Dataset:  {self.dataset_root}")
+        print(f"Format:   {self.fmt.name}")
+        print(f"Text dir: {self.text_dir.name}")
+        print(f"FPS:      {self.fps}")
+
         npy_files = sorted(self.motion_dir.glob("*.npy"))
-        txt_files = sorted(self.text_dir.glob("*.txt"))
-        
         num_scenes = len(npy_files)
         print(f"\nFound {num_scenes} scenes")
-        
-        # Load scene_id_mapping if available
-        mapping_file = self.dataset_root / "scene_id_mapping.json"
-        if mapping_file.exists():
-            with open(mapping_file, 'r') as f:
-                scene_mapping = json.load(f)
-        else:
-            scene_mapping = {}
-        
-        # Process each scene
-        captions = []
-        total_frames_in_dirs = 0
-        scenes_with_frames = 0
-        
-        print("\nProcessing scenes...")
+        if num_scenes == 0:
+            print("No scenes found, nothing to compute.")
+            return {}
+
+        # Accumulators
+        seq_lengths: List[int] = []
+        captions: List[str] = []
+        motion_counts: Dict[str, int] = defaultdict(int)
+        combo_counts: Dict[str, int] = defaultdict(int)
+
+        print("Processing scenes...")
         for i, npy_file in enumerate(npy_files):
             if (i + 1) % 1000 == 0:
-                print(f"  Processed {i+1}/{num_scenes} scenes...")
-            
+                print(f"  {i + 1}/{num_scenes}...")
+
             scene_id = npy_file.stem
-            
-            # Load trajectory
             trajectory = np.load(npy_file)
-            seq_len = len(trajectory)
-            duration = seq_len / self.fps
-            
-            self.sequence_lengths.append(seq_len)
-            self.sequence_durations.append(duration)
-            
-            # Classify motion
-            motion_flags = self.classify_motion(trajectory)
-            
-            # Count motion types
-            for motion_type, is_active in motion_flags.items():
-                if is_active:
-                    self.motion_distribution[motion_type] += 1
-            
-            # Count motion combinations
-            active_motions = [k for k, v in motion_flags.items() if v]
-            if len(active_motions) > 1:
-                combo_key = '+'.join(sorted(active_motions))
-                self.motion_distribution[f"combo:{combo_key}"] += 1
-            
-            # Load caption
+            seq_lengths.append(len(trajectory))
+
+            # Motion classification
+            try:
+                flags = classify_motion(trajectory, self.fmt)
+            except Exception as e:
+                print(f"  Warning: motion classification failed for {scene_id}: {e}")
+                continue
+
+            active = [k for k, v in flags.items() if v]
+            for m in active:
+                motion_counts[m] += 1
+            if len(active) > 1:
+                combo_key = "+".join(sorted(active))
+                combo_counts[combo_key] += 1
+
+            # Caption
             txt_file = self.text_dir / f"{scene_id}.txt"
             if txt_file.exists():
-                with open(txt_file, 'r') as f:
-                    caption = f.read().strip()
+                caption = txt_file.read_text().strip().split("#")[0].strip()
+                if caption:
                     captions.append(caption)
-            
-            # Count frames in directories if provided
-            if self.frames_roots:
-                original_id = scene_mapping.get(scene_id, scene_id)
-                frame_count = self.count_frames_in_directory(original_id)
-                if frame_count > 0:
-                    total_frames_in_dirs += frame_count
-                    scenes_with_frames += 1
-        
-        print(f"  Completed processing {num_scenes} scenes")
-        
-        # Compute aggregate statistics
+
+        print(f"  Completed {num_scenes} scenes")
+
+        seq_arr = np.array(seq_lengths)
+        dur_arr = seq_arr / self.fps
+
+        # --- Aggregate stats ---
         self.stats = {
-            'num_scenes': num_scenes,
-            'num_captions': len(captions),
-            'total_trajectory_frames': int(np.sum(self.sequence_lengths)),
-            'avg_trajectory_length_frames': float(np.mean(self.sequence_lengths)),
-            'median_trajectory_length_frames': float(np.median(self.sequence_lengths)),
-            'min_trajectory_length_frames': int(np.min(self.sequence_lengths)),
-            'max_trajectory_length_frames': int(np.max(self.sequence_lengths)),
-            'avg_duration_seconds': float(np.mean(self.sequence_durations)),
-            'median_duration_seconds': float(np.median(self.sequence_durations)),
-            'min_duration_seconds': float(np.min(self.sequence_durations)),
-            'max_duration_seconds': float(np.max(self.sequence_durations)),
-            'fps': self.fps,
+            "dataset_root": str(self.dataset_root),
+            "format": self.fmt.name,
+            "fps": self.fps,
+            "num_scenes": num_scenes,
+            "num_captions": len(captions),
+            "total_frames": int(seq_arr.sum()),
+            "sequence_length": {
+                "mean": round(float(seq_arr.mean()), 1),
+                "median": float(np.median(seq_arr)),
+                "min": int(seq_arr.min()),
+                "max": int(seq_arr.max()),
+                "std": round(float(seq_arr.std()), 1),
+            },
+            "duration_seconds": {
+                "mean": round(float(dur_arr.mean()), 2),
+                "median": round(float(np.median(dur_arr)), 2),
+                "min": round(float(dur_arr.min()), 2),
+                "max": round(float(dur_arr.max()), 2),
+            },
         }
-        
-        # Frame directory statistics
-        if self.frames_roots:
-            self.stats['frames_directory'] = {
-                'total_frames': total_frames_in_dirs,
-                'scenes_with_frames': scenes_with_frames,
-                'avg_frames_per_scene': total_frames_in_dirs / scenes_with_frames if scenes_with_frames > 0 else 0
-            }
-        
-        # Vocabulary analysis
-        print("\nAnalyzing vocabulary...")
-        self.stats['vocabulary'] = self.analyze_vocabulary(captions)
-        
-        # Motion distribution (convert to percentages)
+
+        # --- Motion distribution (percentages) ---
         print("\nComputing motion distribution...")
-        motion_dist_counts = dict(self.motion_distribution)
-        motion_dist_percentages = {
-            k: (v / num_scenes * 100) for k, v in motion_dist_counts.items()
+        basic = {
+            k: round(v / num_scenes * 100, 2)
+            for k, v in sorted(motion_counts.items(), key=lambda x: -x[1])
         }
-        
-        # Separate basic motions from combinations
-        basic_motions = {k: v for k, v in motion_dist_percentages.items() if not k.startswith('combo:')}
-        combo_motions = {k.replace('combo:', ''): v for k, v in motion_dist_percentages.items() if k.startswith('combo:')}
-        
-        self.stats['motion_distribution'] = {
-            'basic_motions': basic_motions,
-            'top_combinations': dict(sorted(combo_motions.items(), key=lambda x: x[1], reverse=True)[:20])
+        combos = {
+            k: round(v / num_scenes * 100, 2)
+            for k, v in sorted(combo_counts.items(), key=lambda x: -x[1])[:20]
         }
-        
+        self.stats["motion_distribution"] = {
+            "counts": dict(motion_counts),
+            "percentages": basic,
+            "top_combinations": combos,
+        }
+
+        # --- Vocabulary ---
+        print("Analyzing vocabulary...")
+        self.stats["vocabulary"] = analyze_vocabulary(captions)
+
         return self.stats
-    
+
+    # ------------------------------------------------------------------
+    # Reporting
+    # ------------------------------------------------------------------
+
     def print_report(self):
-        """Print comprehensive statistics report"""
+        s = self.stats
+        if not s:
+            print("No statistics computed yet.")
+            return
+
         print("\n" + "=" * 80)
         print("DATASET STATISTICS REPORT")
         print("=" * 80)
-        
-        # Basic statistics
+
         print(f"\n{'BASIC STATISTICS':^80}")
         print("-" * 80)
-        print(f"Total scenes:                {self.stats['num_scenes']:,}")
-        print(f"Total captions:              {self.stats['num_captions']:,}")
-        print(f"Total trajectory frames:     {self.stats['total_trajectory_frames']:,}")
-        
-        # Sequence length statistics
-        print(f"\n{'SEQUENCE LENGTH STATISTICS':^80}")
-        print("-" * 80)
-        print(f"Average length:              {self.stats['avg_trajectory_length_frames']:.1f} frames ({self.stats['avg_duration_seconds']:.2f}s)")
-        print(f"Median length:               {self.stats['median_trajectory_length_frames']:.0f} frames ({self.stats['median_duration_seconds']:.2f}s)")
-        print(f"Min length:                  {self.stats['min_trajectory_length_frames']} frames ({self.stats['min_duration_seconds']:.2f}s)")
-        print(f"Max length:                  {self.stats['max_trajectory_length_frames']} frames ({self.stats['max_duration_seconds']:.2f}s)")
-        print(f"Frame rate:                  {self.stats['fps']} fps")
-        
-        # Frame directory statistics
-        if 'frames_directory' in self.stats:
-            print(f"\n{'FRAME DIRECTORY STATISTICS':^80}")
-            print("-" * 80)
-            fd = self.stats['frames_directory']
-            print(f"Total frames in directories: {fd['total_frames']:,}")
-            print(f"Scenes with frames:          {fd['scenes_with_frames']:,}")
-            print(f"Avg frames per scene:        {fd['avg_frames_per_scene']:.1f}")
-        
-        # Vocabulary statistics
-        print(f"\n{'VOCABULARY STATISTICS':^80}")
-        print("-" * 80)
-        vocab = self.stats['vocabulary']
-        print(f"Total tokens:                {vocab['total_tokens']:,}")
-        print(f"Unique tokens:               {vocab['unique_tokens']:,}")
-        print(f"Type-Token Ratio (TTR):      {vocab['type_token_ratio']:.4f}")
-        print(f"Root TTR:                    {vocab['root_ttr']:.4f}")
-        print(f"MATTR:                       {vocab['mattr']:.4f}")
-        print(f"Avg caption length:          {vocab['avg_caption_length']:.1f} words")
-        print(f"Median caption length:       {vocab['median_caption_length']:.1f} words")
-        
-        print(f"\nMost common words:")
-        for word, count in vocab['most_common_words'][:15]:
-            print(f"  {word:20s} {count:6,} ({count/vocab['total_tokens']*100:.2f}%)")
-        
-        # Motion distribution
-        print(f"\n{'MOTION DISTRIBUTION (Basic Motions)':^80}")
-        print("-" * 80)
-        motion_dist = self.stats['motion_distribution']['basic_motions']
-        
-        # Group by category
-        translation = {k: v for k, v in motion_dist.items() if k in ['forward', 'backward', 'left', 'right', 'up', 'down']}
-        rotation = {k: v for k, v in motion_dist.items() if k.startswith('pan_') or k.startswith('tilt_') or k.startswith('roll_')}
-        other = {k: v for k, v in motion_dist.items() if k not in translation and k not in rotation}
-        
-        if translation:
-            print("\nTranslation motions:")
-            for motion, pct in sorted(translation.items(), key=lambda x: x[1], reverse=True):
-                print(f"  {motion:20s} {pct:6.2f}%")
-        
-        if rotation:
-            print("\nRotation motions:")
-            for motion, pct in sorted(rotation.items(), key=lambda x: x[1], reverse=True):
-                print(f"  {motion:20s} {pct:6.2f}%")
-        
-        if other:
-            print("\nOther:")
-            for motion, pct in sorted(other.items(), key=lambda x: x[1], reverse=True):
-                print(f"  {motion:20s} {pct:6.2f}%")
-        
-        # Top motion combinations
-        print(f"\n{'TOP MOTION COMBINATIONS':^80}")
-        print("-" * 80)
-        combo_dist = self.stats['motion_distribution']['top_combinations']
-        for i, (combo, pct) in enumerate(list(combo_dist.items())[:10], 1):
-            print(f"{i:2}. {combo:50s} {pct:6.2f}%")
-        
-        print("\n" + "=" * 80)
-    
-    def save_report(self, output_file: Path):
-        """Save statistics to JSON file"""
-        with open(output_file, 'w') as f:
-            json.dump(self.stats, f, indent=2)
-        print(f"\nStatistics saved to: {output_file}")
+        print(f"  Dataset:              {s['dataset_root']}")
+        print(f"  Format:               {s['format']}")
+        print(f"  Total scenes:         {s['num_scenes']:,}")
+        print(f"  Total captions:       {s['num_captions']:,}")
+        print(f"  Total frames:         {s['total_frames']:,}")
 
+        sl = s["sequence_length"]
+        dur = s["duration_seconds"]
+        print(f"\n{'SEQUENCE LENGTH':^80}")
+        print("-" * 80)
+        print(f"  Mean:   {sl['mean']:.1f} frames  ({dur['mean']:.2f}s)")
+        print(f"  Median: {sl['median']:.0f} frames  ({dur['median']:.2f}s)")
+        print(f"  Min:    {sl['min']} frames  ({dur['min']:.2f}s)")
+        print(f"  Max:    {sl['max']} frames  ({dur['max']:.2f}s)")
+        print(f"  Std:    {sl['std']:.1f} frames")
+        print(f"  FPS:    {s['fps']}")
+
+        md = s["motion_distribution"]
+        pcts = md["percentages"]
+
+        # Separate translation, rotation, static
+        trans_keys = ["dollies_forward", "dollies_backward", "tracks_left",
+                      "tracks_right", "moves_up", "moves_down"]
+        rot_keys = ["pans_left", "pans_right", "tilts_up", "tilts_down"]
+
+        print(f"\n{'MOTION DISTRIBUTION':^80}")
+        print("-" * 80)
+
+        trans = {k: pcts[k] for k in trans_keys if k in pcts}
+        rot = {k: pcts[k] for k in rot_keys if k in pcts}
+        other = {k: pcts[k] for k in pcts if k not in trans_keys and k not in rot_keys}
+
+        if trans:
+            print("\n  Translation:")
+            for k, v in sorted(trans.items(), key=lambda x: -x[1]):
+                cnt = md["counts"].get(k, 0)
+                print(f"    {k:25s} {v:6.2f}%  ({cnt:,})")
+        if rot:
+            print("\n  Rotation:")
+            for k, v in sorted(rot.items(), key=lambda x: -x[1]):
+                cnt = md["counts"].get(k, 0)
+                print(f"    {k:25s} {v:6.2f}%  ({cnt:,})")
+        if other:
+            print("\n  Other:")
+            for k, v in sorted(other.items(), key=lambda x: -x[1]):
+                cnt = md["counts"].get(k, 0)
+                print(f"    {k:25s} {v:6.2f}%  ({cnt:,})")
+
+        combos = md["top_combinations"]
+        if combos:
+            print(f"\n{'TOP MOTION COMBINATIONS':^80}")
+            print("-" * 80)
+            for i, (combo, pct) in enumerate(combos.items(), 1):
+                print(f"  {i:2}. {combo:55s} {pct:6.2f}%")
+
+        vocab = s["vocabulary"]
+        print(f"\n{'VOCABULARY':^80}")
+        print("-" * 80)
+        print(f"  Total tokens:   {vocab['total_tokens']:,}")
+        print(f"  Unique tokens:  {vocab['unique_tokens']:,}")
+        print(f"  TTR:            {vocab['type_token_ratio']:.4f}")
+        print(f"  Root TTR:       {vocab['root_ttr']:.4f}")
+        print(f"  MATTR:          {vocab['mattr']:.4f}")
+        print(f"  Avg caption:    {vocab['avg_caption_length']:.1f} words")
+        print(f"  Median caption: {vocab['median_caption_length']:.1f} words")
+        print(f"\n  Most common words:")
+        for word, count in vocab["most_common_words"][:15]:
+            pct = count / vocab["total_tokens"] * 100 if vocab["total_tokens"] > 0 else 0
+            print(f"    {word:20s} {count:6,}  ({pct:.2f}%)")
+
+        print("\n" + "=" * 80)
+
+    def save_json(self, output_path: Path):
+        """Save statistics to JSON (convert Counter tuples for serialization)."""
+        serializable = json.loads(json.dumps(self.stats, default=str))
+        with open(output_path, "w") as f:
+            json.dump(serializable, f, indent=2)
+        print(f"\nSaved: {output_path}")
+
+
+# ============================================================================
+# CLI
+# ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Compute comprehensive dataset statistics")
-    parser.add_argument(
-        "dataset_root",
-        help="Root directory of the dataset (contains new_joint_vecs/, untagged_text/, etc.)"
+    parser = argparse.ArgumentParser(
+        description="Compute statistics for a processed RealEstate10K dataset",
     )
     parser.add_argument(
-        "--frames-root",
-        nargs='+',
-        help="Root directory/directories containing frame subdirectories (optional, for frame counting). Can specify multiple directories."
+        "dataset_root",
+        help="Root directory (contains new_joint_vecs/, texts/, metadata/)",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["rotmat", "quat", "auto"],
+        default="auto",
+        help="Data format, or 'auto' to detect from directory name (default: auto)",
+    )
+    parser.add_argument(
+        "--text-dir",
+        default="texts",
+        help="Subdirectory for captions (default: texts)",
     )
     parser.add_argument(
         "--fps",
         type=float,
         default=24.0,
-        help="Frame rate for duration calculations (default: 24.0)"
+        help="Frame rate for duration calculations (default: 24.0)",
     )
     parser.add_argument(
-        "--output",
-        help="Output JSON file for statistics (optional)"
+        "--output", "-o",
+        help="Output JSON file (optional)",
     )
-    
+
     args = parser.parse_args()
-    
     dataset_root = Path(args.dataset_root)
-    frames_roots = [Path(p) for p in args.frames_root] if args.frames_root else None
-    
+
     if not dataset_root.exists():
-        print(f"Error: Dataset root does not exist: {dataset_root}")
+        print(f"Error: {dataset_root} does not exist")
         return 1
-    
-    # Validate frames directories
-    if frames_roots:
-        print(f"Frame directories to search:")
-        for fr in frames_roots:
-            exists = fr.exists()
-            print(f"  - {fr} {'✓' if exists else '✗ (not found)'}")
-    
-    # Compute statistics
-    analyzer = DatasetStatistics(dataset_root, frames_roots, args.fps)
-    analyzer.compute_statistics()
-    
-    # Print report
+    if not (dataset_root / "new_joint_vecs").is_dir():
+        print(f"Error: {dataset_root / 'new_joint_vecs'} not found")
+        return 1
+
+    # Resolve format
+    if args.format == "auto":
+        fmt = detect_format_from_dataset_name(dataset_root.name)
+        if fmt is None:
+            print("Cannot auto-detect format, defaulting to rotmat")
+            fmt = CameraDataFormat.FULL_12_ROTMAT
+    else:
+        fmt = (CameraDataFormat.FULL_12_ROTMAT if args.format == "rotmat"
+               else CameraDataFormat.QUATERNION_10)
+
+    analyzer = DatasetStatistics(dataset_root, fmt, args.text_dir, args.fps)
+    analyzer.compute()
     analyzer.print_report()
-    
-    # Save to file if requested
+
     if args.output:
-        analyzer.save_report(Path(args.output))
-    
+        analyzer.save_json(Path(args.output))
+
     return 0
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main())
-

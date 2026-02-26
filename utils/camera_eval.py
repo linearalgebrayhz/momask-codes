@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
-from utils.camera_process import calculate_camera_metrics, recover_from_camera_data
+from utils.camera_process import calculate_camera_metrics
 from utils.metrics import calculate_R_precision, euclidean_distance_matrix, calculate_activation_statistics, calculate_frechet_distance, calculate_diversity, calculate_multimodality
 import os
 from os.path import join as pjoin
@@ -139,7 +139,7 @@ def evaluation_camera_vqvae(out_dir, val_loader, net, writer, ep, best_recon, be
     batch_count = 0
     for batch in val_loader:
         batch_count += 1
-        print(f"Processing batch {batch_count}, batch type: {type(batch)}")
+        # print(f"Processing batch {batch_count}, batch type: {type(batch)}")
         
         # Handle different batch formats - VQ training vs text-to-motion evaluation
         if isinstance(batch, torch.Tensor):
@@ -197,18 +197,18 @@ def evaluation_camera_vqvae(out_dir, val_loader, net, writer, ep, best_recon, be
             total_smoothness += metrics['pred_smoothness']
             total_velocity_error += metrics['velocity_error']
             
-            # Log trajectory to tensorboard (limit to first few per epoch)
-            if trajectory_log_count < max_trajectory_logs and draw:
-                caption_text = "VQ Training Sample" if skip_text_metrics else (caption[i] if i < len(caption) else "No caption")
-                log_trajectory_to_tensorboard(
-                    writer, 
-                    gt_data, 
-                    pred_data, 
-                    caption_text,
-                    ep, 
-                    trajectory_log_count
-                )
-                trajectory_log_count += 1
+            # Log trajectory to tensorboard (limit to first few per epoch), disabled, something wrong with add_image
+            # if trajectory_log_count < max_trajectory_logs and draw:
+            #     caption_text = "VQ Training Sample" if skip_text_metrics else (caption[i] if i < len(caption) else "No caption")
+            #     log_trajectory_to_tensorboard(
+            #         writer, 
+            #         gt_data, 
+            #         pred_data, 
+            #         caption_text,
+            #         ep, 
+            #         trajectory_log_count
+            #     )
+            #     trajectory_log_count += 1
         
         # Reconstruction loss
         recon_loss = F.l1_loss(pred_motion, motion)

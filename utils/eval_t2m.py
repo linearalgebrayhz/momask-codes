@@ -460,13 +460,55 @@ def evaluation_mask_transformer(out_dir, val_loader, trans, vq_model, writer, ep
     # assert num_quantizer >= len(time_steps) and num_quantizer >= len(cond_scales)
 
     nb_sample = 0
+    # Detect id_embedding mode from the model's conditioning_mode attribute so we
+    # are never misled by the eval_val_loader returning the standard 7-element
+    # text-dataset batch format even when the model was trained with sample IDs.
+    is_id_embedding_mode = (
+        getattr(trans, 'conditioning_mode', 'clip') == 'id_embedding'
+    )
+    last_batch_data = {}  # Store last batch for visualization
+
     # for i in range(1):
     for batch in val_loader:
+        # Check if this is id_embedding mode (3 elements) or text mode (7 elements)
+        if len(batch) == 3:
+            is_id_embedding_mode = True
+            sample_idx, pose, m_length = batch
+            sample_idx = sample_idx.cuda()
+            pose = pose.cuda()
+            m_length = m_length.cuda()
+            bs, seq = pose.shape[:2]
+            
+            # Generate motions using sample indices as conditions
+            mids = trans.generate(sample_idx, torch.div(m_length, 4, rounding_mode='floor'), time_steps, cond_scale, temperature=1)
+            mids.unsqueeze_(-1)
+            pred_motions = vq_model.forward_decoder(mids)
+            
+            # Store for visualization
+            last_batch_data = {
+                'pred_motions': pred_motions,
+                'pose': pose,
+                'm_length': m_length,
+                'sample_idx': sample_idx,
+                'bs': bs
+            }
+            
+            # Skip text-based metric computation for id_embedding mode
+            nb_sample += bs
+            continue
+            
+        # Standard text-based evaluation
         word_embeddings, pos_one_hots, clip_text, sent_len, pose, m_length, token = batch
         m_length = m_length.cuda()
 
         bs, seq = pose.shape[:2]
-        # num_joints = 21 if pose.shape[-1] == 251 else 22
+
+        # When the model uses id_embedding mode but the eval_val_loader returns
+        # the standard 7-element text batch, skip generation — passing string
+        # text to an id_embedding model would crash with AttributeError.
+        if is_id_embedding_mode:
+            nb_sample += bs
+            continue
 
         # (b, seqlen)
         mids = trans.generate(clip_text, torch.div(m_length, 4, rounding_mode='floor'), time_steps, cond_scale, temperature=1)
@@ -474,6 +516,15 @@ def evaluation_mask_transformer(out_dir, val_loader, trans, vq_model, writer, ep
         # motion_codes = motion_codes.permute(0, 2, 1)
         mids.unsqueeze_(-1)
         pred_motions = vq_model.forward_decoder(mids)
+        
+        # Store for visualization
+        last_batch_data = {
+            'pred_motions': pred_motions,
+            'pose': pose,
+            'm_length': m_length,
+            'clip_text': clip_text,
+            'bs': bs
+        }
 
         et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_motions.clone(),
                                                           m_length)
@@ -495,29 +546,94 @@ def evaluation_mask_transformer(out_dir, val_loader, trans, vq_model, writer, ep
 
         nb_sample += bs
 
-    # Safety check for empty motion lists (single sample debugging)
-    if motion_annotation_list and motion_pred_list:
-        motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
-        motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    # Animation generation — runs BEFORE metric guards so it works in id_embedding
+    # mode even when motion_annotation_list is empty (no text-metric batches).
+    if save_anim and nb_sample > 0 and last_batch_data:
+        # Extract data from last_batch_data
+        pred_motions = last_batch_data['pred_motions']
+        pose = last_batch_data['pose']
+        m_length = last_batch_data['m_length']
+        bs = last_batch_data['bs']
+
+        # Use min(3, bs) to handle small batches
+        num_viz = min(3, bs)
+        rand_idx = torch.randint(bs, (num_viz,))
+
+        # Save PREDICTED trajectories
+        pred_data = pred_motions[rand_idx].detach().cpu().numpy()
+
+        # Handle captions based on mode
+        if is_id_embedding_mode:
+            sample_idx = last_batch_data['sample_idx']
+            captions = [f"Sample ID: {sample_idx[k].item()}" for k in rand_idx]
+        else:
+            clip_text = last_batch_data['clip_text']
+            captions = [clip_text[k] for k in rand_idx]
+
+        lengths = m_length[rand_idx].cpu().numpy()
+        save_dir = os.path.join(out_dir, 'animation', 'E%04d' % ep)
+        os.makedirs(save_dir, exist_ok=True)
+        plot_func(pred_data, save_dir, captions, lengths)
+
+        # Save GROUND TRUTH trajectories for comparison
+        gt_data = pose[rand_idx].detach().cpu().numpy()
+        if is_id_embedding_mode:
+            gt_captions = [f"[GT] Sample ID: {sample_idx[k].item()}" for k in rand_idx]
+        else:
+            gt_captions = [f"[GT] {clip_text[k]}" for k in rand_idx]
+        save_dir_gt = os.path.join(out_dir, 'animation', 'E%04d_groundtruth' % ep)
+        os.makedirs(save_dir_gt, exist_ok=True)
+        plot_func(gt_data, save_dir_gt, gt_captions, lengths)
+
+        print(f"Saved validation animations: predicted (E{ep:04d}) + ground truth (E{ep:04d}_groundtruth)")
+    elif save_anim:
+        print(f"Warning: Skipping animation generation for epoch {ep} - no samples processed")
+
+    # When the model uses id_embedding mode and the eval_val_loader returns
+    # standard 7-element text batches, every batch is skipped — motion lists
+    # stay empty.  Computing FID/diversity on dummy zeros would poison best_fid
+    # to 0.0 on epoch 0, preventing net_best_fid.tar from ever being saved.
+    # Guard: skip metric computation and return the incoming best values intact.
+    if not motion_annotation_list or not motion_pred_list:
+        print(f"[Eval Ep {ep}] No text-metric samples processed (id_embedding mode). "
+              "Skipping FID/diversity/R-precision — returning current best values.")
+        return best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer
+
+    # Compute metrics only for text-based evaluation
+    if not is_id_embedding_mode:
+        # Safety check for empty motion lists (single sample debugging)
+        if motion_annotation_list and motion_pred_list:
+            motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+            motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+        else:
+            print("Warning: No motion samples for evaluation, using dummy data")
+            motion_annotation_np = motion_pred_np = np.zeros((1, 512))
+        gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
+        mu, cov = calculate_activation_statistics(motion_pred_np)
+
+        diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
+        diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
+
+        R_precision_real = R_precision_real / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
+        R_precision = R_precision / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
+
+        matching_score_real = matching_score_real / nb_sample if nb_sample > 0 else 0.0
+        matching_score_pred = matching_score_pred / nb_sample if nb_sample > 0 else 0.0
+
+        fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
+
+        msg = f"--> \t Eva. Ep {ep} :, FID. {fid:.4f}, Diversity Real. {diversity_real:.4f}, Diversity. {diversity:.4f}, R_precision_real. {R_precision_real}, R_precision. {R_precision}, matching_score_real. {matching_score_real}, matching_score_pred. {matching_score_pred}"
+        print(msg)
     else:
-        print("Warning: No motion samples for evaluation, using dummy data")
-        motion_annotation_np = motion_pred_np = np.zeros((1, 512))
-    gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
-    mu, cov = calculate_activation_statistics(motion_pred_np)
-
-    diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
-    diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
-
-    R_precision_real = R_precision_real / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
-    R_precision = R_precision / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
-
-    matching_score_real = matching_score_real / nb_sample if nb_sample > 0 else 0.0
-    matching_score_pred = matching_score_pred / nb_sample if nb_sample > 0 else 0.0
-
-    fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
-
-    msg = f"--> \t Eva. Ep {ep} :, FID. {fid:.4f}, Diversity Real. {diversity_real:.4f}, Diversity. {diversity:.4f}, R_precision_real. {R_precision_real}, R_precision. {R_precision}, matching_score_real. {matching_score_real}, matching_score_pred. {matching_score_pred}"
-    print(msg)
+        # Set all metrics to 0 for id_embedding mode
+        fid = 0.0
+        diversity_real = 0.0
+        diversity = 0.0
+        R_precision_real = np.array([0.0, 0.0, 0.0])
+        R_precision = np.array([0.0, 0.0, 0.0])
+        matching_score_real = 0.0
+        matching_score_pred = 0.0
+        print(f"--> \t Eva. Ep {ep} (id_embedding mode - {nb_sample} samples generated, text metrics skipped)")
 
     # if draw:
     writer.add_scalar('./Test/FID', fid, ep)
@@ -559,19 +675,6 @@ def evaluation_mask_transformer(out_dir, val_loader, trans, vq_model, writer, ep
         msg = f"--> --> \t Top3 Improved from {best_top3:.4f} to {R_precision[2]:.4f} !!!"
         print(msg)
         best_top3 = R_precision[2]
-
-    if save_anim and nb_sample > 0 and 'pred_motions' in locals():
-        rand_idx = torch.randint(bs, (3,))
-        data = pred_motions[rand_idx].detach().cpu().numpy()
-        captions = [clip_text[k] for k in rand_idx]
-        lengths = m_length[rand_idx].cpu().numpy()
-        save_dir = os.path.join(out_dir, 'animation', 'E%04d' % ep)
-        os.makedirs(save_dir, exist_ok=True)
-        # print(lengths)
-        plot_func(data, save_dir, captions, lengths)
-    elif save_anim:
-        print(f"Warning: Skipping animation generation for epoch {ep} - no samples processed")
-
 
     return best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer
 
@@ -610,14 +713,58 @@ def evaluation_res_transformer(out_dir, val_loader, trans, vq_model, writer, ep,
     # assert num_quantizer >= len(time_steps) and num_quantizer >= len(cond_scales)
 
     nb_sample = 0
+    last_batch_data = {}  # Store last batch for visualization
+    # Detect id_embedding mode from the model's conditioning_mode attribute so we
+    # are never misled by the eval_val_loader returning the standard 7-element
+    # text-dataset batch format even when the model was trained with sample IDs.
+    is_id_embedding_mode = (
+        getattr(trans, 'conditioning_mode', 'clip') == 'id_embedding'
+    )
     # for i in range(1):
     for batch in val_loader:
+        # id_embedding dataset yields (sample_idx, pose, m_length)
+        if len(batch) == 3:
+            is_id_embedding_mode = True
+            sample_idx, pose, m_length = batch
+            sample_idx = sample_idx.cuda()
+            pose = pose.cuda().float()
+            m_length = m_length.cuda().long()
+            bs, seq = pose.shape[:2]
+
+            code_indices, all_codes = vq_model.encode(pose)
+            if ep == 0:
+                pred_ids = code_indices[..., 0:1]
+            else:
+                pred_ids = trans.generate(
+                    code_indices[..., 0], sample_idx,
+                    torch.div(m_length, 4, rounding_mode='floor'),
+                    temperature=temperature, cond_scale=cond_scale)
+
+            pred_motions_id = vq_model.forward_decoder(pred_ids)
+            # Store for visualization
+            last_batch_data = {
+                'pred_motions': pred_motions_id,
+                'pose': pose,
+                'm_length': m_length,
+                'sample_idx': sample_idx,
+                'bs': bs,
+            }
+
+            nb_sample += bs
+            continue
+
         word_embeddings, pos_one_hots, clip_text, sent_len, pose, m_length, token = batch
         m_length = m_length.cuda().long()
         pose = pose.cuda().float()
 
         bs, seq = pose.shape[:2]
-        # num_joints = 21 if pose.shape[-1] == 251 else 22
+
+        # When the model uses id_embedding mode but the eval_val_loader returns
+        # the standard 7-element text batch, skip generation — passing string
+        # text to an id_embedding model would crash with AttributeError.
+        if is_id_embedding_mode:
+            nb_sample += bs
+            continue
 
         code_indices, all_codes = vq_model.encode(pose)
         # (b, seqlen)
@@ -629,6 +776,14 @@ def evaluation_res_transformer(out_dir, val_loader, trans, vq_model, writer, ep,
             # pred_codes = trans(code_indices[..., 0], clip_text, torch.div(m_length, 4, rounding_mode='floor'), force_mask=force_mask)
 
         pred_motions = vq_model.forward_decoder(pred_ids)
+        # Store for visualization (captures the last text-mode batch)
+        last_batch_data = {
+            'pred_motions': pred_motions,
+            'pose': pose,
+            'm_length': m_length,
+            'clip_text': clip_text,
+            'bs': bs,
+        }
 
         et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_motions.clone(),
                                                           m_length)
@@ -650,24 +805,70 @@ def evaluation_res_transformer(out_dir, val_loader, trans, vq_model, writer, ep,
 
         nb_sample += bs
 
-    # Safety check for empty motion lists (single sample debugging)
-    if motion_annotation_list and motion_pred_list:
-        motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
-        motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
-    else:
-        print("Warning: No motion samples for evaluation, using dummy data")
-        motion_annotation_np = motion_pred_np = np.zeros((1, 512))
+    # Animation generation — runs BEFORE metric guards so it works in id_embedding
+    # mode even when motion_annotation_list is empty (no text-metric batches).
+    if save_anim and nb_sample > 0 and last_batch_data:
+        pred_motions_viz = last_batch_data['pred_motions']
+        pose_viz = last_batch_data['pose']
+        m_length_viz = last_batch_data['m_length']
+        bs_viz = last_batch_data['bs']
+
+        num_viz = min(3, bs_viz)
+        rand_idx = torch.randint(bs_viz, (num_viz,))
+
+        # Save PREDICTED trajectories
+        pred_data = pred_motions_viz[rand_idx].detach().cpu().numpy()
+
+        # Handle captions based on mode
+        if is_id_embedding_mode:
+            sample_idx_viz = last_batch_data['sample_idx']
+            captions = [f"Sample ID: {sample_idx_viz[k].item()}" for k in rand_idx]
+        else:
+            clip_text_viz = last_batch_data['clip_text']
+            captions = [clip_text_viz[k] for k in rand_idx]
+
+        lengths = m_length_viz[rand_idx].cpu().numpy()
+        save_dir = os.path.join(out_dir, 'animation', 'E%04d' % ep)
+        os.makedirs(save_dir, exist_ok=True)
+        plot_func(pred_data, save_dir, captions, lengths)
+
+        # Save GROUND TRUTH trajectories for comparison
+        gt_data = pose_viz[rand_idx].detach().cpu().numpy()
+        if is_id_embedding_mode:
+            gt_captions = [f"[GT] Sample ID: {sample_idx_viz[k].item()}" for k in rand_idx]
+        else:
+            gt_captions = [f"[GT] {clip_text_viz[k]}" for k in rand_idx]
+        save_dir_gt = os.path.join(out_dir, 'animation', 'E%04d_groundtruth' % ep)
+        os.makedirs(save_dir_gt, exist_ok=True)
+        plot_func(gt_data, save_dir_gt, gt_captions, lengths)
+
+        print(f"Saved validation animations: predicted (E{ep:04d}) + ground truth (E{ep:04d}_groundtruth)")
+    elif save_anim:
+        print(f"Warning: Skipping animation generation for epoch {ep} - no samples processed")
+
+    # When the model uses id_embedding mode and the eval_val_loader returns
+    # standard 7-element text batches, every batch is skipped — motion lists
+    # stay empty.  Computing FID/diversity on dummy zeros would poison best_fid
+    # to 0.0 on epoch 0, preventing net_best_fid.tar from ever being saved.
+    # Guard: skip metric computation and return the incoming best values intact.
+    if not motion_annotation_list or not motion_pred_list:
+        print(f"[Eval Ep {ep}] No text-metric samples processed (id_embedding mode). "
+              "Skipping FID/diversity/R-precision — returning current best values.")
+        return best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer
+
+    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
     gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
     mu, cov = calculate_activation_statistics(motion_pred_np)
 
     diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
     diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
 
-    R_precision_real = R_precision_real / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
-    R_precision = R_precision / nb_sample if nb_sample > 0 else np.array([0.0, 0.0, 0.0])
+    R_precision_real = R_precision_real / nb_sample
+    R_precision = R_precision / nb_sample
 
-    matching_score_real = matching_score_real / nb_sample if nb_sample > 0 else 0.0
-    matching_score_pred = matching_score_pred / nb_sample if nb_sample > 0 else 0.0
+    matching_score_real = matching_score_real / nb_sample
+    matching_score_pred = matching_score_pred / nb_sample
 
     fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
 
@@ -681,7 +882,6 @@ def evaluation_res_transformer(out_dir, val_loader, trans, vq_model, writer, ep,
     writer.add_scalar('./Test/top2', R_precision[1], ep)
     writer.add_scalar('./Test/top3', R_precision[2], ep)
     writer.add_scalar('./Test/matching_score', matching_score_pred, ep)
-
 
     if fid < best_fid:
         msg = f"--> --> \t FID Improved from {best_fid:.5f} to {fid:.5f} !!!"
@@ -714,19 +914,6 @@ def evaluation_res_transformer(out_dir, val_loader, trans, vq_model, writer, ep,
         msg = f"--> --> \t Top3 Improved from {best_top3:.4f} to {R_precision[2]:.4f} !!!"
         print(msg)
         best_top3 = R_precision[2]
-
-    if save_anim and nb_sample > 0 and 'pred_motions' in locals():
-        rand_idx = torch.randint(bs, (3,))
-        data = pred_motions[rand_idx].detach().cpu().numpy()
-        captions = [clip_text[k] for k in rand_idx]
-        lengths = m_length[rand_idx].cpu().numpy()
-        save_dir = os.path.join(out_dir, 'animation', 'E%04d' % ep)
-        os.makedirs(save_dir, exist_ok=True)
-        # print(lengths)
-        plot_func(data, save_dir, captions, lengths)
-    elif save_anim:
-        print(f"Warning: Skipping animation generation for epoch {ep} - no samples processed")
-
 
     return best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer
 

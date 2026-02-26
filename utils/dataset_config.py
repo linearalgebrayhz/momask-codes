@@ -34,7 +34,7 @@ class DatasetConfig:
         self.joints_num = 1 if self._is_camera_dataset() else 22
         self.radius = 240 * 8 if self._is_camera_dataset() else 4
         self.fps = 30 if self._is_camera_dataset() else 20
-        self.max_motion_length = 240 if self._is_camera_dataset() else 196
+        self.max_motion_length = 500 if self._is_camera_dataset() else 196
         self.kinematic_chain = paramUtil.kit_kinematic_chain if self._is_camera_dataset() else paramUtil.t2m_kinematic_chain
         
         # Set dim_pose based on dataset type
@@ -56,9 +56,10 @@ class DatasetConfig:
         try:
             if self.motion_dir.exists():
                 detected_format = detect_dataset_format(str(self.data_root))
-                self.dim_pose = detected_format.value
+                # FULL_12_ROTMAT uses enum value 13 as unique ID but has 12 actual features
+                self.dim_pose = 12 if detected_format == CameraDataFormat.FULL_12_ROTMAT else detected_format.value
                 self.detected_format = detected_format
-                print(f"Auto-detected format for {self.dataset_name}: {detected_format.name} ({self.dim_pose} features)")
+                print(f"Auto-detected format: {detected_format.name} ({self.dim_pose}D features)")
             else:
                 print(f"Motion directory not found: {self.motion_dir}. Using default dim_pose={self.dim_pose}")
                 self.detected_format = CameraDataFormat.POSITION_ORIENTATION_6  # Default
@@ -80,6 +81,10 @@ class DatasetConfig:
             return f'{checkpoints_dir}/realestate10k_6/Comp_v6_KLD005/opt.txt'
         elif self.dataset_name == "realestate10k_12":
             return f'{checkpoints_dir}/realestate10k_12/Comp_v6_KLD005/opt.txt'
+        elif self.dataset_name == "realestate10k_quat":
+            return f'{checkpoints_dir}/realestate10k_quat/Comp_v6_KLD005/opt.txt'
+        elif self.dataset_name == "realestate10k_rotmat":
+            return f'{checkpoints_dir}/realestate10k_rotmat/Comp_v6_KLD005/opt.txt'
         else:
             raise ValueError(f"Unknown dataset '{self.dataset_name}'. Please provide custom_data_root or use: {list(default_roots.keys())}")
 
@@ -134,7 +139,9 @@ def create_dataset_config(dataset_name: str, custom_data_root: Optional[str] = N
         "realestate": "./dataset/RealEstate10K/",
         "realestate10k": "./dataset/RealEstate10K/",
         "realestate10k_6": "./dataset/RealEstate10K_6feat/",
-        "realestate10k_12": "./dataset/RealEstate10K_12feat/"
+        "realestate10k_12": "./dataset/RealEstate10K_12feat/",
+        "realestate10k_quat": "./dataset/RealEstate10K_quat/",
+        "realestate10k_rotmat": "./dataset/RealEstate10K_rotmat/"
     }
     
     # Use custom root or default

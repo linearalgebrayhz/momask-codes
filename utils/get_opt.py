@@ -48,59 +48,43 @@ def get_opt(opt_path, device, **kwargs):
                 else:
                     opt_dict[key] = str(value)
 
-    print(opt)
+    # Only print key model info, not the full Namespace
+    _name = getattr(opt, 'name', '?')
+    _dataset = getattr(opt, 'dataset_name', '?')
+    print(f'  -> {_name} (dataset={_dataset})')
     opt_dict['which_epoch'] = 'finest'
     opt.save_root = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.name)
     opt.model_dir = pjoin(opt.save_root, 'model')
     opt.meta_dir = pjoin(opt.save_root, 'meta')
 
-    if opt.dataset_name == 't2m':
-        opt.data_root = './dataset/HumanML3D/'
-        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-        opt.text_dir = pjoin(opt.data_root, 'texts')
-        opt.joints_num = 22
-        opt.dim_pose = 263
-        opt.max_motion_length = 196
-        opt.max_motion_frame = 196
-        opt.max_motion_token = 55
-    elif opt.dataset_name == 'kit':
-        opt.data_root = './dataset/KIT-ML/'
-        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-        opt.text_dir = pjoin(opt.data_root, 'texts')
-        opt.joints_num = 21
-        opt.dim_pose = 251
-        opt.max_motion_length = 196
-        opt.max_motion_frame = 196
-        opt.max_motion_token = 55
-    elif opt.dataset_name == 'cam':
-        opt.data_root = './dataset/CameraTraj/'
-        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-        opt.text_dir = pjoin(opt.data_root, 'texts')
-        opt.joints_num = 1
-        opt.dim_pose = 5
-        opt.max_motion_length = 240
-        opt.max_motion_frame = 240
-        opt.max_motion_token = 60
-    elif opt.dataset_name == 'realestate10k_6':
-        opt.data_root = './dataset/RealEstate10K_6feat/'
-        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-        opt.text_dir = pjoin(opt.data_root, 'texts')
-        opt.joints_num = 1
-        opt.dim_pose = 6
-        opt.max_motion_length = 240
-        opt.max_motion_frame = 240
-        opt.max_motion_token = 60
-    elif opt.dataset_name == 'realestate10k_12':
-        opt.data_root = './dataset/RealEstate10K_12feat/'
-        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-        opt.text_dir = pjoin(opt.data_root, 'texts')
-        opt.joints_num = 1
-        opt.dim_pose = 12
-        opt.max_motion_length = 240
-        opt.max_motion_frame = 240
-        opt.max_motion_token = 60
-    else:
-        raise KeyError('Dataset not recognized')
+    # Dataset-specific defaults — only set data_root if not already loaded from opt.txt
+    _dataset_defaults = {
+        't2m':               {'data_root': './dataset/HumanML3D/',           'joints_num': 22, 'dim_pose': 263, 'max_motion_length': 196, 'max_motion_frame': 196, 'max_motion_token': 55},
+        'kit':               {'data_root': './dataset/KIT-ML/',              'joints_num': 21, 'dim_pose': 251, 'max_motion_length': 196, 'max_motion_frame': 196, 'max_motion_token': 55},
+        'cam':               {'data_root': './dataset/CameraTraj/',          'joints_num': 1,  'dim_pose': 5,   'max_motion_length': 500, 'max_motion_frame': 500, 'max_motion_token': 125},
+        'realestate10k_6':   {'data_root': './dataset/RealEstate10K_6feat/', 'joints_num': 1,  'dim_pose': 6,   'max_motion_length': 500, 'max_motion_frame': 500, 'max_motion_token': 125},
+        'realestate10k_12':  {'data_root': './dataset/RealEstate10K_12feat/','joints_num': 1,  'dim_pose': 12,  'max_motion_length': 500, 'max_motion_frame': 500, 'max_motion_token': 125},
+        'realestate10k_quat':{'data_root': './dataset/RealEstate10K_quat/', 'joints_num': 1,  'dim_pose': 10,  'max_motion_length': 500, 'max_motion_frame': 500, 'max_motion_token': 125},
+        'realestate10k_rotmat':{'data_root': './dataset/RealEstate10K_rotmat/','joints_num': 1,'dim_pose': 12,  'max_motion_length': 500, 'max_motion_frame': 500, 'max_motion_token': 125},
+    }
+
+    if opt.dataset_name not in _dataset_defaults:
+        raise KeyError(f'Dataset not recognized: {opt.dataset_name}')
+
+    defaults = _dataset_defaults[opt.dataset_name]
+
+    # Respect data_root from opt.txt if it was saved there; otherwise use default
+    if not hasattr(opt, 'data_root') or not opt.data_root:
+        opt.data_root = defaults['data_root']
+
+    opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
+    opt.text_dir = pjoin(opt.data_root, 'texts')
+    opt.joints_num = defaults['joints_num']
+    opt.dim_pose = defaults['dim_pose']
+    opt.max_motion_length = defaults['max_motion_length']
+    opt.max_motion_frame = defaults['max_motion_frame']
+    opt.max_motion_token = defaults['max_motion_token']
+
     if not hasattr(opt, 'unit_length'):
         opt.unit_length = 4
     if not hasattr(opt, 'max_text_len'):
@@ -113,6 +97,4 @@ def get_opt(opt_path, device, **kwargs):
     opt.device = device
 
     opt_dict.update(kwargs) # Overwrite with kwargs params
-    print("At the end of get_opt function: ")
-    print(opt)
     return opt

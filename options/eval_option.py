@@ -35,7 +35,21 @@ class EvalT2MOptions(BaseOptions):
         self.parser.add_argument('--source_motion', default='example_data/000612.npy', type=str, help="Source motion path for editing. (new_joint_vecs format .npy file)")
         self.parser.add_argument("--motion_length", default=0, type=int,
                                  help="Motion length for generation, only applicable with single text prompt.")
+        self.parser.add_argument("--default_camera_length", default=200, type=int,
+                                 help="Default motion length for camera datasets when --motion_length is not set (frames). "
+                                      "Use --motion_length N to override and generate any length. Default: 200 frames (~6.7s at 30fps).")
         
+        '''Conditioning Mode (Inference)'''
+        self.parser.add_argument('--conditioning_mode', type=str, default='clip', choices=['clip', 't5', 'id_embedding'],
+                                 help='Conditioning mode: clip (text), t5 (token-level text), id_embedding (per-sample learnable)')
+        self.parser.add_argument('--num_id_samples', type=int, default=50,
+                                 help='Number of learnable sample embeddings for id_embedding mode')
+        self.parser.add_argument('--t5_model_name', type=str, default='t5-base',
+                                 help='HuggingFace T5 model name for t5 mode')
+        self.parser.add_argument('--sample_ids', type=str, default='',
+                                 help='Comma-separated sample IDs for id_embedding generation (e.g., "0,1,2,3"). '
+                                      'If empty, generates for all IDs [0, num_id_samples).')
+
         '''Keyframe Conditioning (Inference)'''
         self.parser.add_argument('--keyframe_dir', type=str, default=None, help='Directory containing keyframe images (jpg/png)')
         self.parser.add_argument('--keyframe_indices', type=str, default=None, 

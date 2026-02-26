@@ -11,7 +11,7 @@ from models.vq.model import RVQVAE
 
 from options.train_option import TrainT2MOptions
 
-from utils.plot_script import plot_3d_motion, plot_3d_motion_camera
+from utils.plot_script import plot_3d_motion
 from utils.unified_plotting import create_plotting_function_for_transformer
 from utils.motion_process import recover_from_ric
 from utils.get_opt import get_opt
@@ -19,7 +19,7 @@ from utils.fixseed import fixseed
 from utils.paramUtil import t2m_kinematic_chain, kit_kinematic_chain
 from utils.dataset_config import get_unified_dataset_config
 
-from data.t2m_dataset import Text2MotionDataset, collate_fn_text2motion_camera_train, collate_fn_text2motion_camera_train_frames
+from data.t2m_dataset import Text2MotionDataset, Text2MotionDatasetIDWrapped, collate_fn_text2motion_camera_train, collate_fn_text2motion_camera_train_frames, collate_fn_text2motion_id_train
 from motion_loaders.dataset_motion_loader import get_dataset_motion_loader
 from models.t2m_eval_wrapper import EvaluatorModelWrapper
 
@@ -139,6 +139,7 @@ if __name__ == '__main__':
     vq_model.to(opt.device)  # Move VQ model to GPU
     
     clip_version = 'ViT-B/32'
+    conditioning_mode = getattr(opt, 'conditioning_mode', 'clip')
 
     opt.num_tokens = vq_opt.nb_code
 
@@ -156,6 +157,9 @@ if __name__ == '__main__':
                                       frame_dim=512,
                                       finetune_clip=getattr(opt, 'finetune_clip', False),
                                       finetune_clip_layers=getattr(opt, 'finetune_clip_layers', 2),
+                                      conditioning_mode=conditioning_mode,
+                                      num_id_samples=getattr(opt, 'num_id_samples', 50),
+                                      t5_model_name=getattr(opt, 't5_model_name', 't5-base'),
                                       opt=opt)
 
     # if opt.fix_token_emb:
@@ -181,13 +185,27 @@ if __name__ == '__main__':
     val_dataset = Text2MotionDataset(opt, mean, std, val_split_file,
                                      load_frames=getattr(opt, 'use_frames', False))
 
+    # Wrap datasets for id_embedding mode (adds sample index to each batch)
+    if conditioning_mode == 'id_embedding':
+        num_id_samples = getattr(opt, 'num_id_samples', 50)
+        print(f'ID-embedding mode: wrapping datasets with sample indices (N={num_id_samples})')
+        train_dataset = Text2MotionDatasetIDWrapped(train_dataset)
+        val_dataset = Text2MotionDatasetIDWrapped(val_dataset)
+
     print(f"train.txt path: {train_split_file}")
     print(f"Number of training samples: {len(train_dataset)}")
 
     # Use camera-specific collate function for camera datasets
     is_camera_dataset = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
     
-    if is_camera_dataset:
+    if conditioning_mode == 'id_embedding':
+        # ID embedding mode uses its own collate function
+        collate_fn = collate_fn_text2motion_id_train
+        train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, 
+                                   collate_fn=collate_fn, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, 
+                                 collate_fn=collate_fn, pin_memory=True)
+    elif is_camera_dataset:
         collate_fn = collate_fn_text2motion_camera_train_frames if getattr(opt, 'use_frames', False) else collate_fn_text2motion_camera_train
         train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, 
                                    collate_fn=collate_fn, pin_memory=True)
@@ -202,11 +220,23 @@ if __name__ == '__main__':
     # print(f"DEBUG: train_loader: {len(train_loader)}")
     # print(f"DEBUG: val_loader: {len(val_loader)}")
     # exit()
-    eval_val_loader, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device)
+    if conditioning_mode == 'id_embedding':
+        # val_dataset is already Text2MotionDatasetIDWrapped (3-element batches).
+        # Using the standard text loader here would give 7-element batches whose
+        # text conditioning is incompatible with id_embedding, causing every batch
+        # to be skipped and animations to never be generated.
+        eval_val_loader = DataLoader(val_dataset, batch_size=32, num_workers=4,
+                                     shuffle=False, drop_last=False,
+                                     collate_fn=collate_fn_text2motion_id_train,
+                                     pin_memory=True)
+    else:
+        eval_val_loader, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device,
+                                                       data_root_override=opt.data_root)
 
     wrapper_opt = get_opt(dataset_opt_path, torch.device('cuda'))
-    # Add eval_on attribute - set to False for camera datasets since we don't have pretrained evaluation models
-    wrapper_opt.eval_on = False if is_camera_dataset else True
+    # Add eval_on attribute - set to False for camera datasets or id_embedding mode
+    # (id_embedding has no text to evaluate, and typically uses tiny datasets)
+    wrapper_opt.eval_on = False if (is_camera_dataset or conditioning_mode == 'id_embedding') else True
     eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
 
     trainer = MaskTransformerTrainer(opt, t2m_transformer, vq_model)

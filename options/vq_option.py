@@ -6,7 +6,8 @@ def arg_parse(is_train=False):
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     ## dataloader
-    parser.add_argument('--dataset_name', type=str, default='humanml3d', help='dataset directory')
+    parser.add_argument('--dataset_name', type=str, default='humanml3d', help='dataset name (e.g. t2m, realestate10k_rotmat)')
+    parser.add_argument('--data_root', type=str, default=None, help='override default dataset directory (e.g. ./dataset/RealEstate10K_rotmat1_overfit50)')
     parser.add_argument('--batch_size', default=256, type=int, help='batch size')
     parser.add_argument('--window_size', type=int, default=64, help='training motion length')
     parser.add_argument("--gpu_id", type=int, default=0, help='GPU id')
@@ -22,6 +23,7 @@ def arg_parse(is_train=False):
     parser.add_argument('--weight_decay', default=0.0, type=float, help='weight decay')
     parser.add_argument("--commit", type=float, default=0.02, help="hyper-parameter for the commitment loss")
     parser.add_argument('--loss_vel', type=float, default=0.5, help='hyper-parameter for the velocity loss')
+    parser.add_argument('--loss_smoothness', type=float, default=0.0, help='hyper-parameter for temporal smoothness (acceleration/jerk) loss. Set to 0 to disable.')
     parser.add_argument('--recons_loss', type=str, default='l1_smooth', help='reconstruction loss')
 
     ## vqvae arch
@@ -35,28 +37,27 @@ def arg_parse(is_train=False):
     parser.add_argument("--dilation_growth_rate", type=int, default=3, help="dilation growth rate")
     parser.add_argument("--output_emb_width", type=int, default=512, help="output embedding width")
     parser.add_argument('--vq_act', type=str, default='relu', choices=['relu', 'silu', 'gelu'],
-                        help='dataset directory')
-    parser.add_argument('--vq_norm', type=str, default=None, help='dataset directory')
+                        help='activation function for VQ encoder/decoder')
+    parser.add_argument('--vq_norm', type=str, default=None, help='normalization type for VQ encoder/decoder')
 
     parser.add_argument('--num_quantizers', type=int, default=3, help='num_quantizers')
     parser.add_argument('--shared_codebook', action="store_true")
     parser.add_argument('--quantize_dropout_prob', type=float, default=0.2, help='quantize_dropout_prob')
     # parser.add_argument('--use_vq_prob', type=float, default=0.8, help='quantize_dropout_prob')
 
-    parser.add_argument('--ext', type=str, default='default', help='reconstruction loss')
+    parser.add_argument('--ext', type=str, default='default', help='extension/suffix for eval output filenames')
 
 
     ## other
     parser.add_argument('--name', type=str, default="test", help='Name of this trial')
-    parser.add_argument('--is_continue', action="store_true", help='Name of this trial')
+    parser.add_argument('--is_continue', action="store_true", help='resume training from latest checkpoint')
     parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints', help='models are saved here')
     parser.add_argument('--log_every', default=10, type=int, help='iter log frequency')
     parser.add_argument('--save_latest', default=500, type=int, help='iter save latest model frequency')
-    parser.add_argument('--save_every_e', default=2, type=int, help='save model every n epoch')
     parser.add_argument('--eval_every_e', default=1, type=int, help='save eval results every n epoch')
     parser.add_argument('--eval_on', action="store_true", help='turn off evaluation when there is no pretrained evaluator')
     # parser.add_argument('--early_stop_e', default=5, type=int, help='early stopping epoch')
-    parser.add_argument('--feat_bias', type=float, default=5, help='Layers of GRU')
+    parser.add_argument('--feat_bias', type=float, default=5, help='feature bias scaling factor for normalization')
     
     ## logging
     parser.add_argument('--use_wandb', action="store_true", help='Use Weights & Biases for logging')
@@ -69,21 +70,12 @@ def arg_parse(is_train=False):
     parser.add_argument('--log_gradients', action="store_true", help='Log gradient norms and histograms')
     parser.add_argument('--log_codebook_usage', action="store_true", help='Log codebook usage statistics')
     parser.add_argument('--log_model_weights', action="store_true", help='Log model weight histograms periodically')
+    parser.add_argument('--num_vis_samples', type=int, default=4, help='number of GT/Pred sample pairs to visualize per epoch')
 
-    parser.add_argument('--which_epoch', type=str, default="all", help='Name of this trial')
-
-    ## Visual Consistency Module
-    parser.add_argument('--use_visual_consistency', action="store_true", help='Enable visual consistency module with LPIPS loss')
-    parser.add_argument('--no_video_data', action="store_true", help='Disable visual consistency if no video data available')
-    parser.add_argument('--visual_consistency_weight', type=float, default=0.01, help='Weight for LPIPS visual consistency loss (γ)')
-    parser.add_argument('--visual_consistency_freq', type=int, default=10, help='Compute visual consistency every N steps')
-    parser.add_argument('--visual_consistency_image_size', type=int, default=256, help='Image size for rendering and LPIPS computation')
-    parser.add_argument('--lpips_net', type=str, default='alex', choices=['alex', 'vgg', 'squeeze'], help='Network backbone for LPIPS')
-    parser.add_argument('--num_keyframes', type=int, default=4, help='Number of keyframes to render for visual consistency')
-    parser.add_argument('--keyframe_strategy', type=str, default='uniform', choices=['uniform', 'motion_based'], help='Keyframe selection strategy')
+    parser.add_argument('--which_epoch', type=str, default="all", help='which epoch checkpoint to evaluate (e.g. all, best, latest)')
 
     ## For Res Predictor only
-    parser.add_argument('--vq_name', type=str, default="rvq_nq6_dc512_nc512_noshare_qdp0.2", help='Name of this trial')
+    parser.add_argument('--vq_name', type=str, default="rvq_nq6_dc512_nc512_noshare_qdp0.2", help='VQ model checkpoint name for residual predictor')
     # parser.add_argument('--n_res', type=int, default=2, help='Name of this trial')
     # parser.add_argument('--do_vq_res', action="store_true")
     parser.add_argument("--seed", default=3407, type=int)

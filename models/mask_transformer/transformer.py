@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import numpy as np
-# from networks.layers import *
 import torch.nn.functional as F
 import clip
 from einops import rearrange, repeat
@@ -12,7 +11,11 @@ from typing import Callable, Optional, List, Dict
 from copy import deepcopy
 from functools import partial
 from models.mask_transformer.tools import *
+from models.mask_transformer.conditioning import ConditioningProvider
 from torch.distributions.categorical import Categorical
+
+
+# ──────────────────── Helper Modules ────────────────────
 
 class InputProcess(nn.Module):
     def __init__(self, input_feats, latent_dim):
@@ -23,13 +26,12 @@ class InputProcess(nn.Module):
 
     def forward(self, x):
         # [bs, ntokens, input_feats]
-        x = x.permute((1, 0, 2)) # [seqen, bs, input_feats]
-        # print(x.shape)
+        x = x.permute((1, 0, 2))  # [seqlen, bs, input_feats]
         x = self.poseEmbedding(x)  # [seqlen, bs, d]
         return x
 
+
 class PositionalEncoding(nn.Module):
-    #Borrow from MDM, the same as above, but add dropout, exponential may improve precision
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
@@ -39,14 +41,14 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1) #[max_len, 1, d_model]
+        pe = pe.unsqueeze(0).transpose(0, 1)  # [max_len, 1, d_model]
 
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        # not used in the final model
         x = x + self.pe[:x.shape[0], :]
         return self.dropout(x)
+
 
 class OutputProcess_Bert(nn.Module):
     def __init__(self, out_feats, latent_dim):
@@ -54,7 +56,7 @@ class OutputProcess_Bert(nn.Module):
         self.dense = nn.Linear(latent_dim, latent_dim)
         self.transform_act_fn = F.gelu
         self.LayerNorm = nn.LayerNorm(latent_dim, eps=1e-12)
-        self.poseFinal = nn.Linear(latent_dim, out_feats) #Bias!
+        self.poseFinal = nn.Linear(latent_dim, out_feats)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
@@ -64,13 +66,14 @@ class OutputProcess_Bert(nn.Module):
         output = output.permute(1, 2, 0)  # [bs, c, seqlen]
         return output
 
+
 class OutputProcess(nn.Module):
     def __init__(self, out_feats, latent_dim):
         super().__init__()
         self.dense = nn.Linear(latent_dim, latent_dim)
         self.transform_act_fn = F.gelu
         self.LayerNorm = nn.LayerNorm(latent_dim, eps=1e-12)
-        self.poseFinal = nn.Linear(latent_dim, out_feats) #Bias!
+        self.poseFinal = nn.Linear(latent_dim, out_feats)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
@@ -81,12 +84,27 @@ class OutputProcess(nn.Module):
         return output
 
 
-class MaskTransformer(nn.Module):
+# ──────────────────── Shared Base Class ────────────────────
+
+class BaseCondTransformer(nn.Module):
+    """Shared base for MaskTransformer and ResidualTransformer.
+
+    Consolidates:
+      - CLIP loading, freezing, encoding (with built-in finetune guard)
+      - Condition encoding (text / action / uncond)
+      - Condition masking (classifier-free guidance)
+      - Weight initialization
+      - Frame conditioning modules
+      - Core transformer encoder
+    """
+
     def __init__(self, code_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8,
                  num_heads=4, dropout=0.1, clip_dim=512, cond_drop_prob=0.1,
-                 clip_version=None, opt=None, use_frames=False, frame_dim=512, finetune_clip=False, 
-                 finetune_clip_layers=2, **kargs):
-        super(MaskTransformer, self).__init__()
+                 clip_version=None, opt=None, use_frames=False, frame_dim=512,
+                 finetune_clip=False, finetune_clip_layers=2,
+                 conditioning_mode='clip', num_id_samples=50,
+                 t5_model_name='t5-base', **kargs):
+        super().__init__()
         print(f'latent_dim: {latent_dim}, ff_size: {ff_size}, nlayers: {num_layers}, nheads: {num_heads}, dropout: {dropout}')
 
         self.code_dim = code_dim
@@ -97,67 +115,72 @@ class MaskTransformer(nn.Module):
         self.use_frames = use_frames
         self.finetune_clip = finetune_clip
         self.finetune_clip_layers = finetune_clip_layers
-
         self.cond_mode = cond_mode
         self.cond_drop_prob = cond_drop_prob
-        
-        print(f'Frame conditioning: {use_frames}')
-        if use_frames:
-            print(f'  Frame dim: {frame_dim} -> latent_dim: {latent_dim}')
+
+        # ── New: conditioning mode (clip / t5 / id_embedding) ──
+        self.conditioning_mode = conditioning_mode
+        self.num_id_samples = num_id_samples
+        self.t5_model_name = t5_model_name
+        self._use_new_provider = conditioning_mode in ('t5', 'id_embedding')
+        print(f'Conditioning mode: {conditioning_mode}')
+
+        if self._use_new_provider:
+            self.cond_provider = ConditioningProvider(
+                mode=conditioning_mode,
+                latent_dim=latent_dim,
+                clip_dim=clip_dim,
+                num_samples=num_id_samples,
+                t5_model_name=t5_model_name,
+                cond_drop_prob=cond_drop_prob,
+                device=getattr(opt, 'device', None),
+            )
 
         if self.cond_mode == 'action':
             assert 'num_actions' in kargs
         self.num_actions = kargs.get('num_actions', 1)
 
-        '''
-        Preparing Networks
-        '''
+        print(f'Frame conditioning: {use_frames}')
+        if use_frames:
+            print(f'  Frame dim: {frame_dim} -> latent_dim: {latent_dim}')
+
+        # ── Core network layers ──
         self.input_process = InputProcess(self.code_dim, self.latent_dim)
         self.position_enc = PositionalEncoding(self.latent_dim, self.dropout)
 
-        seqTransEncoderLayer = nn.TransformerEncoderLayer(d_model=self.latent_dim,
-                                                          nhead=num_heads,
-                                                          dim_feedforward=ff_size,
-                                                          dropout=dropout,
-                                                          activation='gelu')
-
-        self.seqTransEncoder = nn.TransformerEncoder(seqTransEncoderLayer,
-                                                     num_layers=num_layers)
+        seqTransEncoderLayer = nn.TransformerEncoderLayer(
+            d_model=self.latent_dim, nhead=num_heads,
+            dim_feedforward=ff_size, dropout=dropout, activation='gelu')
+        self.seqTransEncoder = nn.TransformerEncoder(seqTransEncoderLayer, num_layers=num_layers)
 
         self.encode_action = partial(F.one_hot, num_classes=self.num_actions)
 
-        # if self.cond_mode != 'no_cond':
-        if self.cond_mode == 'text':
-            self.cond_emb = nn.Linear(self.clip_dim, self.latent_dim)
-        elif self.cond_mode == 'action':
-            self.cond_emb = nn.Linear(self.num_actions, self.latent_dim)
-        elif self.cond_mode == 'uncond':
-            self.cond_emb = nn.Identity()
+        # ── Condition embedding (legacy CLIP / action / uncond path) ──
+        if not self._use_new_provider:
+            if self.cond_mode == 'text':
+                self.cond_emb = nn.Linear(self.clip_dim, self.latent_dim)
+            elif self.cond_mode == 'action':
+                self.cond_emb = nn.Linear(self.num_actions, self.latent_dim)
+            elif self.cond_mode == 'uncond':
+                self.cond_emb = nn.Identity()
+            else:
+                raise KeyError("Unsupported condition mode!")
         else:
-            raise KeyError("Unsupported condition mode!!!")
+            # For new provider modes, cond_emb is inside ConditioningProvider
+            # but we still keep a dummy for action/uncond fallback
+            if self.cond_mode == 'action':
+                self.cond_emb = nn.Linear(self.num_actions, self.latent_dim)
 
-        # Sparse keyframe conditioning (NEW: replaces TC-CLIP)
+        # ── Sparse keyframe conditioning ──
         if self.use_frames:
-            # Modality embedding to distinguish motion vs frame tokens
             self.modality_emb_frame = nn.Parameter(torch.randn(1, 1, self.latent_dim))
             print(f'  Sparse keyframe fusion: enabled')
-            print(f'  Note: SparseKeyframeEncoder loaded separately in trainer')
 
-        _num_tokens = opt.num_tokens + 2  # two dummy tokens, one for masking, one for padding
-        self.mask_id = opt.num_tokens
-        self.pad_id = opt.num_tokens + 1
+    # ── CLIP ────────────────────────────────────────────────
 
-        self.output_process = OutputProcess_Bert(out_feats=opt.num_tokens, latent_dim=latent_dim)
-
-        self.token_emb = nn.Embedding(_num_tokens, self.code_dim)
-
-        self.apply(self.__init_weights)
-
-        '''
-        Preparing frozen weights
-        '''
-
-        if self.cond_mode == 'text':
+    def _init_clip(self, clip_version):
+        """Initialize CLIP model. Call AFTER self.apply(_init_weights)."""
+        if self.cond_mode == 'text' and self.conditioning_mode == 'clip':
             print('Loading CLIP...')
             self.clip_version = clip_version
             self.clip_model = self.load_and_freeze_clip(clip_version)
@@ -165,23 +188,92 @@ class MaskTransformer(nn.Module):
                 print(f'CLIP Fine-tuning: ENABLED (last {self.finetune_clip_layers} layers)')
             else:
                 print('CLIP Fine-tuning: DISABLED (fully frozen)')
+        elif self._use_new_provider and self.conditioning_mode == 'clip':
+            # Initialise CLIP via the ConditioningProvider
+            self.cond_provider.init_clip(clip_version, device=getattr(self.opt, 'device', None))
 
-        self.noise_schedule = cosine_schedule
+    def load_and_freeze_clip(self, clip_version):
+        clip_model, _ = clip.load(clip_version, device='cpu', jit=False)
+        # Convert to FP16 only if NOT fine-tuning (fine-tuning requires FP32 for stability)
+        if str(self.opt.device) != "cpu" and not self.finetune_clip:
+            clip.model.convert_weights(clip_model)
 
-    def load_and_freeze_token_emb(self, codebook):
-        '''
-        :param codebook: (c, d)
-        :return:
-        '''
-        assert self.training, 'Only necessary in training mode'
-        c, d = codebook.shape
-        self.token_emb.weight = nn.Parameter(torch.cat([codebook, torch.zeros(size=(2, d), device=codebook.device)], dim=0)) #add two dummy tokens, 0 vectors
-        self.token_emb.requires_grad_(False)
-        # self.token_emb.weight.requires_grad = False
-        # self.token_emb_ready = True
-        print("Token embedding initialized!")
+        if self.finetune_clip:
+            clip_model.eval()
+            for p in clip_model.parameters():
+                p.requires_grad = False
+            total_layers = len(clip_model.transformer.resblocks)
+            for i in range(total_layers - self.finetune_clip_layers, total_layers):
+                for p in clip_model.transformer.resblocks[i].parameters():
+                    p.requires_grad = True
+            for p in clip_model.ln_final.parameters():
+                p.requires_grad = True
+            if hasattr(clip_model, 'text_projection') and clip_model.text_projection is not None:
+                clip_model.text_projection.requires_grad = True
+            print(f'Unfroze last {self.finetune_clip_layers} transformer layers + final LN + projection')
+        else:
+            clip_model.eval()
+            for p in clip_model.parameters():
+                p.requires_grad = False
 
-    def __init_weights(self, module):
+        return clip_model
+
+    def encode_text(self, raw_text):
+        """Encode text via CLIP. Handles finetune_clip gradient guard internally."""
+        device = next(self.parameters()).device
+        text = clip.tokenize(raw_text, truncate=True).to(device)
+        if self.finetune_clip:
+            feat_clip_text = self.clip_model.encode_text(text).float()
+        else:
+            with torch.no_grad():
+                feat_clip_text = self.clip_model.encode_text(text).float()
+        return feat_clip_text
+
+    def encode_condition(self, y, bs, device):
+        """Encode condition vector from text / action / uncond.
+
+        For new conditioning modes (t5, id_embedding), delegates to
+        ConditioningProvider and returns a tuple:
+            (cond_vector, force_mask)              — for clip / action / uncond
+            (cond_vector, force_mask, cond_mask)   — for t5 (sequence condition)
+
+        Returns:
+            cond_vector: (B, clip_dim) or (B, T, t5_dim) or (B, num_actions) or (B, latent_dim)
+            force_mask: bool -- True for uncond mode
+            cond_mask: Optional (B, T) bool -- only for t5 mode
+        """
+        # ── New provider modes ──
+        if self._use_new_provider:
+            cond, cond_mask, force_mask = self.cond_provider.encode(y, bs, device)
+            return cond, force_mask, cond_mask
+
+        # ── Legacy clip / action / uncond path ──
+        force_mask = False
+        if self.cond_mode == 'text':
+            cond_vector = self.encode_text(y)
+        elif self.cond_mode == 'action':
+            cond_vector = self.encode_action(y).to(device).float()
+        elif self.cond_mode == 'uncond':
+            cond_vector = torch.zeros(bs, self.latent_dim).float().to(device)
+            force_mask = True
+        else:
+            raise NotImplementedError("Unsupported condition mode!")
+        return cond_vector, force_mask, None
+
+    # ── Shared utilities ───────────────────────────────────
+
+    def mask_cond(self, cond, force_mask=False):
+        """Apply CFG dropout. Works for (B, D) single-vector conditions."""
+        bs = cond.shape[0]
+        if force_mask:
+            return torch.zeros_like(cond)
+        elif self.training and self.cond_drop_prob > 0.:
+            mask = torch.bernoulli(torch.ones(bs, device=cond.device) * self.cond_drop_prob).view(bs, 1)
+            return cond * (1. - mask)
+        else:
+            return cond
+
+    def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
             module.weight.data.normal_(mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
@@ -191,420 +283,233 @@ class MaskTransformer(nn.Module):
             module.weight.data.fill_(1.0)
 
     def parameters_wo_clip(self):
-        """Return parameters excluding CLIP (unless fine-tuning CLIP)"""
+        """Return parameters excluding frozen encoders (CLIP / T5)."""
+        if self._use_new_provider:
+            return self.cond_provider.parameters_wo_clip() + [
+                p for n, p in self.named_parameters()
+                if not n.startswith('cond_provider.')]
         if self.finetune_clip:
-            # When fine-tuning, include all parameters (including CLIP)
             return list(self.parameters())
         else:
-            # When CLIP is frozen, exclude CLIP parameters
             return [p for name, p in self.named_parameters() if not name.startswith('clip_model.')]
 
-    def load_and_freeze_clip(self, clip_version):
-        clip_model, clip_preprocess = clip.load(clip_version, device='cpu',
-                                                jit=False)  # Must set jit=False for training
-        # Convert to FP16 only if NOT fine-tuning (fine-tuning requires FP32 for stability)
-        if str(self.opt.device) != "cpu" and not self.finetune_clip:
-            clip.model.convert_weights(clip_model)  # Convert to FP16 for inference only
 
-        # Conditionally freeze CLIP weights
-        if self.finetune_clip:
-            # Unfreeze last N transformer layers
-            clip_model.eval()  # Keep in eval mode for stability
-            # Freeze all parameters first
-            for p in clip_model.parameters():
-                p.requires_grad = False
-            
-            # Unfreeze last N transformer layers (resblocks)
-            total_layers = len(clip_model.transformer.resblocks)
-            for i in range(total_layers - self.finetune_clip_layers, total_layers):
-                for p in clip_model.transformer.resblocks[i].parameters():
-                    p.requires_grad = True
-            
-            # Unfreeze final layer norm and projection
-            for p in clip_model.ln_final.parameters():
-                p.requires_grad = True
-            if hasattr(clip_model, 'text_projection') and clip_model.text_projection is not None:
-                clip_model.text_projection.requires_grad = True
-            
-            print(f'Unfroze last {self.finetune_clip_layers} transformer layers + final LN + projection')
-        else:
-            # Freeze all CLIP weights
-            clip_model.eval()
-            for p in clip_model.parameters():
-                p.requires_grad = False
+# ──────────────────── Mask Transformer ────────────────────
 
-        return clip_model
+class MaskTransformer(BaseCondTransformer):
+    def __init__(self, code_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8,
+                 num_heads=4, dropout=0.1, clip_dim=512, cond_drop_prob=0.1,
+                 clip_version=None, opt=None, use_frames=False, frame_dim=512,
+                 finetune_clip=False, finetune_clip_layers=2,
+                 conditioning_mode='clip', num_id_samples=50,
+                 t5_model_name='t5-base', **kargs):
+        super().__init__(
+            code_dim, cond_mode, latent_dim=latent_dim, ff_size=ff_size,
+            num_layers=num_layers, num_heads=num_heads, dropout=dropout,
+            clip_dim=clip_dim, cond_drop_prob=cond_drop_prob,
+            clip_version=clip_version, opt=opt, use_frames=use_frames,
+            frame_dim=frame_dim, finetune_clip=finetune_clip,
+            finetune_clip_layers=finetune_clip_layers,
+            conditioning_mode=conditioning_mode,
+            num_id_samples=num_id_samples,
+            t5_model_name=t5_model_name, **kargs)
 
-    def encode_text(self, raw_text):
-        device = next(self.parameters()).device
-        text = clip.tokenize(raw_text, truncate=True).to(device)
-        feat_clip_text = self.clip_model.encode_text(text).float()
-        return feat_clip_text
+        # ── Mask-specific layers ──
+        _num_tokens = opt.num_tokens + 2  # mask + pad dummies
+        self.mask_id = opt.num_tokens
+        self.pad_id = opt.num_tokens + 1
 
-    def mask_cond(self, cond, force_mask=False):
-        bs, d =  cond.shape
-        if force_mask:
-            return torch.zeros_like(cond)
-        elif self.training and self.cond_drop_prob > 0.:
-            mask = torch.bernoulli(torch.ones(bs, device=cond.device) * self.cond_drop_prob).view(bs, 1)
-            return cond * (1. - mask)
-        else:
-            return cond
+        self.output_process = OutputProcess_Bert(out_feats=opt.num_tokens, latent_dim=latent_dim)
+        self.token_emb = nn.Embedding(_num_tokens, self.code_dim)
 
-    def trans_forward(self, motion_ids, cond, padding_mask, force_mask=False, frame_emb=None, has_frames=False):
+        self.apply(self._init_weights)
+        self._init_clip(clip_version)
+
+        self.noise_schedule = cosine_schedule
+
+    def load_and_freeze_token_emb(self, codebook):
+        '''
+        :param codebook: (c, d)
+        '''
+        assert self.training, 'Only necessary in training mode'
+        c, d = codebook.shape
+        self.token_emb.weight = nn.Parameter(
+            torch.cat([codebook, torch.zeros(size=(2, d), device=codebook.device)], dim=0))
+        self.token_emb.requires_grad_(False)
+        print("Token embedding initialized!")
+
+    def trans_forward(self, motion_ids, cond, padding_mask, force_mask=False,
+                      frame_emb=None, has_frames=False, cond_mask=None):
         '''
         :param motion_ids: (b, seqlen)
-        :param padding_mask: (b, seqlen), all pad positions are TRUE else FALSE
-        :param cond: (b, embed_dim) for text, (b, num_actions) for action
-        :param force_mask: boolean
-        :param frame_emb: (seqlen, b, latent_dim) optional frame embeddings from SparseKeyframeEncoder
-        :param has_frames: bool flag indicating if any sample in batch has actual frames
-        :return:
-            -logits: (b, num_token, seqlen)
+        :param cond: (b, embed_dim)  OR  (b, T_text, t5_dim)  for t5 mode
+        :param padding_mask: (b, seqlen), pad positions are TRUE
+        :param frame_emb: (seqlen, b, latent_dim) optional
+        :param cond_mask: (b, T_text) optional — T5 attention mask
+        :return: logits (b, num_token, seqlen)
         '''
+        x = self.token_emb(motion_ids)   # (b, seqlen, code_dim)
+        x = self.input_process(x)        # (seqlen, b, latent_dim)
+        x = self.position_enc(x)
 
-        cond = self.mask_cond(cond, force_mask=force_mask)
-
-        # Process motion tokens
-        x = self.token_emb(motion_ids)  # (b, seqlen, code_dim)
-
-        x = self.input_process(x)  # (seqlen, b, latent_dim)
-
-        # Process text condition
-        cond = self.cond_emb(cond).unsqueeze(0)  # (1, b, latent_dim)
-
-        # Add positional encoding to motion
-        x = self.position_enc(x)  # (seqlen, b, latent_dim)
-        
-        # Conditional fusion: only fuse if frames contain actual features
+        # Sparse keyframe fusion
         if self.use_frames and frame_emb is not None and has_frames:
-            # frame_emb: (seqlen, b, latent_dim) - already downsampled to match motion length
-            # Add modality embedding to frames
-            f = frame_emb + self.modality_emb_frame  # (seqlen, b, latent_dim)
-            
-            # Add positional encoding to frames
-            f = self.position_enc(f)  # (seqlen, b, latent_dim)
-            
-            # Element-wise addition fusion
-            x = x + f  # (seqlen, b, latent_dim)
-        
-        # Concatenate text token with fused motion+frame tokens
-        xseq = torch.cat([cond, x], dim=0)  # (seqlen+1, b, latent_dim)
+            f = frame_emb + self.modality_emb_frame
+            f = self.position_enc(f)
+            x = x + f
 
-        # Update padding mask to include text token
-        padding_mask = torch.cat([torch.zeros_like(padding_mask[:, 0:1]), padding_mask], dim=1)  # (b, seqlen+1)
+        # ── Build prefix conditioning ──
+        if self._use_new_provider:
+            # ConditioningProvider handles projection + CFG masking
+            prefix, prefix_kp, n_prefix = self.cond_provider.project_and_prepare(
+                cond, cond_mask, force_mask=force_mask)
+            # prefix: (N_prefix, B, D),  prefix_kp: (B, N_prefix) or None
+        else:
+            # Legacy CLIP path: project + CFG mask + unsqueeze
+            cond = self.mask_cond(cond, force_mask=force_mask)
+            prefix = self.cond_emb(cond).unsqueeze(0)    # (1, B, D)
+            prefix_kp = None
+            n_prefix = 1
 
-        # Transformer encoding
-        output = self.seqTransEncoder(xseq, src_key_padding_mask=padding_mask)[1:]  # (seqlen, b, e)
-        
-        # Output projection (only for motion tokens)
-        logits = self.output_process(output)  # (seqlen, b, e) -> (b, ntoken, seqlen)
+        xseq = torch.cat([prefix, x], dim=0)             # (n_prefix+S, B, D)
+
+        # Build key-padding mask for the full sequence
+        if prefix_kp is not None:
+            padding_mask = torch.cat([prefix_kp, padding_mask], dim=1)
+        else:
+            padding_mask = torch.cat(
+                [torch.zeros_like(padding_mask[:, :1]).expand(-1, n_prefix), padding_mask], dim=1)
+
+        output = self.seqTransEncoder(xseq, src_key_padding_mask=padding_mask)[n_prefix:]
+        logits = self.output_process(output)  # (b, ntoken, seqlen)
         return logits
 
-    def forward(self, ids, y, m_lens, frame_emb=None, has_frames=False):
+    def forward(self, ids, y, m_lens, frame_emb=None, has_frames=False, return_logits=False):
         '''
         :param ids: (b, n)
-        :param y: raw text for cond_mode=text, (b, ) for cond_mode=action
+        :param y: raw text for text, (b,) for action, LongTensor for id_embedding
         :param m_lens: (b,)
-        :param frame_emb: (seqlen, b, latent_dim) optional frame embeddings from SparseKeyframeEncoder
-        :param has_frames: bool flag indicating if any sample in batch has actual frames
-        :return:
+        :param return_logits: if True, also returns logits tensor
         '''
-
         bs, ntokens = ids.shape
         device = ids.device
 
-        # Positions that are PADDED are ALL FALSE
-        non_pad_mask = lengths_to_mask(m_lens, ntokens) #(b, n)
+        non_pad_mask = lengths_to_mask(m_lens, ntokens)
         ids = torch.where(non_pad_mask, ids, self.pad_id)
 
-        force_mask = False
-        if self.cond_mode == 'text':
-            # Only disable gradients if CLIP is frozen
-            if self.finetune_clip:
-                cond_vector = self.encode_text(y)
-            else:
-                with torch.no_grad():
-                    cond_vector = self.encode_text(y)
-        elif self.cond_mode == 'action':
-            cond_vector = self.enc_action(y).to(device).float()
-        elif self.cond_mode == 'uncond':
-            cond_vector = torch.zeros(bs, self.latent_dim).float().to(device)
-            force_mask = True
-        else:
-            raise NotImplementedError("Unsupported condition mode!!!")
+        cond_vector, force_mask, cond_mask = self.encode_condition(y, bs, device)
 
-        '''
-        Prepare mask
-        '''
+        # BERT-style masking
         rand_time = uniform((bs,), device=device)
         rand_mask_probs = self.noise_schedule(rand_time)
         num_token_masked = (ntokens * rand_mask_probs).round().clamp(min=1)
 
         batch_randperm = torch.rand((bs, ntokens), device=device).argsort(dim=-1)
-        # Positions to be MASKED are ALL TRUE
         mask = batch_randperm < num_token_masked.unsqueeze(-1)
-
-        # Positions to be MASKED must also be NON-PADDED
         mask &= non_pad_mask
 
-        # Note this is our training target, not input
         labels = torch.where(mask, ids, self.mask_id)
-
         x_ids = ids.clone()
 
-        # Further Apply Bert Masking Scheme
-        # Step 1: 10% replace with an incorrect token
+        # 10% random replace
         mask_rid = get_mask_subset_prob(mask, 0.1)
         rand_id = torch.randint_like(x_ids, high=self.opt.num_tokens)
         x_ids = torch.where(mask_rid, rand_id, x_ids)
-        # Step 2: 90% x 10% replace with correct token, and 90% x 88% replace with mask token
+        # 79.2% mask token
         mask_mid = get_mask_subset_prob(mask & ~mask_rid, 0.88)
-
-        # mask_mid = mask
-
         x_ids = torch.where(mask_mid, self.mask_id, x_ids)
 
-        logits = self.trans_forward(x_ids, cond_vector, ~non_pad_mask, force_mask, 
-                                     frame_emb=frame_emb, has_frames=has_frames)
+        logits = self.trans_forward(x_ids, cond_vector, ~non_pad_mask, force_mask,
+                                    frame_emb=frame_emb, has_frames=has_frames,
+                                    cond_mask=cond_mask)
         ce_loss, pred_id, acc = cal_performance(logits, labels, ignore_index=self.mask_id)
 
+        if return_logits:
+            return ce_loss, pred_id, acc, logits
         return ce_loss, pred_id, acc
 
-    def forward_with_logits(self, ids, y, m_lens, frame_emb=None, has_frames=False):
-        '''
-        Same as forward() but also returns logits for Gumbel-softmax smoothness loss.
-        This allows gradient flow through soft token predictions.
-        '''
-        bs, ntokens = ids.shape
-        device = ids.device
-
-        # Positions that are PADDED are ALL FALSE
-        non_pad_mask = lengths_to_mask(m_lens, ntokens) #(b, n)
-        ids = torch.where(non_pad_mask, ids, self.pad_id)
-
-        force_mask = False
-        if self.cond_mode == 'text':
-            # Only disable gradients if CLIP is frozen
-            if self.finetune_clip:
-                cond_vector = self.encode_text(y)
-            else:
-                with torch.no_grad():
-                    cond_vector = self.encode_text(y)
-        elif self.cond_mode == 'action':
-            cond_vector = self.enc_action(y).to(device).float()
-        elif self.cond_mode == 'uncond':
-            cond_vector = torch.zeros(bs, self.latent_dim).float().to(device)
-            force_mask = True
-        else:
-            raise NotImplementedError("Unsupported condition mode!!!")
-
-        '''
-        Prepare mask
-        '''
-        rand_time = uniform((bs,), device=device)
-        rand_mask_probs = self.noise_schedule(rand_time)
-        num_token_masked = (ntokens * rand_mask_probs).round().clamp(min=1)
-
-        batch_randperm = torch.rand((bs, ntokens), device=device).argsort(dim=-1)
-        # Positions to be MASKED are ALL TRUE
-        mask = batch_randperm < num_token_masked.unsqueeze(-1)
-
-        # Positions to be MASKED must also be NON-PADDED
-        mask &= non_pad_mask
-
-        # Note this is our training target, not input
-        labels = torch.where(mask, ids, self.mask_id)
-
-        x_ids = ids.clone()
-
-        # Further Apply Bert Masking Scheme
-        # Step 1: 10% replace with an incorrect token
-        mask_rid = get_mask_subset_prob(mask, 0.1)
-        rand_id = torch.randint_like(x_ids, high=self.opt.num_tokens)
-        x_ids = torch.where(mask_rid, rand_id, x_ids)
-        # Step 2: 90% x 10% replace with correct token, and 90% x 88% replace with mask token
-        mask_mid = get_mask_subset_prob(mask & ~mask_rid, 0.88)
-
-        x_ids = torch.where(mask_mid, self.mask_id, x_ids)
-
-        logits = self.trans_forward(x_ids, cond_vector, ~non_pad_mask, force_mask, 
-                                     frame_emb=frame_emb, has_frames=has_frames)
-        ce_loss, pred_id, acc = cal_performance(logits, labels, ignore_index=self.mask_id)
-
-        # Return logits as well for Gumbel-softmax
-        return ce_loss, pred_id, acc, logits
-
-    def forward_with_cond_scale(self,
-                                motion_ids,
-                                cond_vector,
-                                padding_mask,
-                                cond_scale=3,
-                                force_mask=False):
-        # bs = motion_ids.shape[0]
-        # if cond_scale == 1:
+    def forward_with_cond_scale(self, motion_ids, cond_vector, padding_mask,
+                                cond_scale=3, force_mask=False, cond_mask=None):
         if force_mask:
-            return self.trans_forward(motion_ids, cond_vector, padding_mask, force_mask=True)
+            return self.trans_forward(motion_ids, cond_vector, padding_mask,
+                                      force_mask=True, cond_mask=cond_mask)
 
-        logits = self.trans_forward(motion_ids, cond_vector, padding_mask)
+        logits = self.trans_forward(motion_ids, cond_vector, padding_mask,
+                                    cond_mask=cond_mask)
         if cond_scale == 1:
             return logits
 
-        aux_logits = self.trans_forward(motion_ids, cond_vector, padding_mask, force_mask=True)
-
+        aux_logits = self.trans_forward(motion_ids, cond_vector, padding_mask,
+                                        force_mask=True, cond_mask=cond_mask)
         scaled_logits = aux_logits + (logits - aux_logits) * cond_scale
         return scaled_logits
 
     @torch.no_grad()
     @eval_decorator
-    def generate(self,
-                 conds,
-                 m_lens,
-                 timesteps: int,
-                 cond_scale: int,
-                 temperature=1,
-                 topk_filter_thres=0.9,
-                 gsample=False,
-                 force_mask=False
-                 ):
-        # print(self.opt.num_quantizers)
-        # assert len(timesteps) >= len(cond_scales) == self.opt.num_quantizers
+    def generate(self, conds, m_lens, timesteps: int, cond_scale: int,
+                 temperature=1, topk_filter_thres=0.9, gsample=False, force_mask=False):
 
         device = next(self.parameters()).device
         seq_len = max(m_lens)
         batch_size = len(m_lens)
 
-        if self.cond_mode == 'text':
-            # Only disable gradients if CLIP is frozen
-            if self.finetune_clip:
-                cond_vector = self.encode_text(conds)
-            else:
-                with torch.no_grad():
-                    cond_vector = self.encode_text(conds)
-        elif self.cond_mode == 'action':
-            cond_vector = self.enc_action(conds).to(device)
-        elif self.cond_mode == 'uncond':
-            cond_vector = torch.zeros(batch_size, self.latent_dim).float().to(device)
-        else:
-            raise NotImplementedError("Unsupported condition mode!!!")
+        cond_vector, _, cond_mask = self.encode_condition(conds, batch_size, device)
 
         padding_mask = ~lengths_to_mask(m_lens, seq_len)
-        # print(padding_mask.shape, )
-
-        # Start from all tokens being masked
         ids = torch.where(padding_mask, self.pad_id, self.mask_id)
         scores = torch.where(padding_mask, 1e5, 0.)
         starting_temperature = temperature
 
-        for timestep, steps_until_x0 in zip(torch.linspace(0, 1, timesteps, device=device), reversed(range(timesteps))):
-            # 0 < timestep < 1
-            rand_mask_prob = self.noise_schedule(timestep)  # Tensor
+        for timestep, steps_until_x0 in zip(torch.linspace(0, 1, timesteps, device=device),
+                                            reversed(range(timesteps))):
+            rand_mask_prob = self.noise_schedule(timestep)
+            num_token_masked = torch.round(rand_mask_prob * m_lens).clamp(min=1)
 
-            '''
-            Maskout, and cope with variable length
-            '''
-            # fix: the ratio regarding lengths, instead of seq_len
-            num_token_masked = torch.round(rand_mask_prob * m_lens).clamp(min=1)  # (b, )
-
-            # select num_token_masked tokens with lowest scores to be masked
-            sorted_indices = scores.argsort(
-                dim=1)  # (b, k), sorted_indices[i, j] = the index of j-th lowest element in scores on dim=1
-            ranks = sorted_indices.argsort(dim=1)  # (b, k), rank[i, j] = the rank (0: lowest) of scores[i, j] on dim=1
+            sorted_indices = scores.argsort(dim=1)
+            ranks = sorted_indices.argsort(dim=1)
             is_mask = (ranks < num_token_masked.unsqueeze(-1))
             ids = torch.where(is_mask, self.mask_id, ids)
 
-            '''
-            Preparing input
-            '''
-            # (b, num_token, seqlen)
             logits = self.forward_with_cond_scale(ids, cond_vector=cond_vector,
                                                   padding_mask=padding_mask,
                                                   cond_scale=cond_scale,
-                                                  force_mask=force_mask)
-
+                                                  force_mask=force_mask,
+                                                  cond_mask=cond_mask)
             logits = logits.permute(0, 2, 1)  # (b, seqlen, ntoken)
-            # print(logits.shape, self.opt.num_tokens)
-            # clean low prob token
             filtered_logits = top_k(logits, topk_filter_thres, dim=-1)
 
-            '''
-            Update ids
-            '''
-            # if force_mask:
             temperature = starting_temperature
-            # else:
-            # temperature = starting_temperature * (steps_until_x0 / timesteps)
-            # temperature = max(temperature, 1e-4)
-            # print(filtered_logits.shape)
-            # temperature is annealed, gradually reducing temperature as well as randomness
-            if gsample:  # use gumbel_softmax sampling
-                # print("1111")
-                pred_ids = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)  # (b, seqlen)
-            else:  # use multinomial sampling
-                # print("2222")
-                probs = F.softmax(filtered_logits / temperature, dim=-1)  # (b, seqlen, ntoken)
-                # print(temperature, starting_temperature, steps_until_x0, timesteps)
-                # print(probs / temperature)
-                pred_ids = Categorical(probs).sample()  # (b, seqlen)
+            if gsample:
+                pred_ids = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
+            else:
+                probs = F.softmax(filtered_logits / temperature, dim=-1)
+                pred_ids = Categorical(probs).sample()
 
-            # print(pred_ids.max(), pred_ids.min())
-            # if pred_ids.
             ids = torch.where(is_mask, pred_ids, ids)
 
-            '''
-            Updating scores
-            '''
-            probs_without_temperature = logits.softmax(dim=-1)  # (b, seqlen, ntoken)
-            scores = probs_without_temperature.gather(2, pred_ids.unsqueeze(dim=-1))  # (b, seqlen, 1)
-            scores = scores.squeeze(-1)  # (b, seqlen)
-
-            # We do not want to re-mask the previously kept tokens, or pad tokens
+            probs_without_temperature = logits.softmax(dim=-1)
+            scores = probs_without_temperature.gather(2, pred_ids.unsqueeze(dim=-1)).squeeze(-1)
             scores = scores.masked_fill(~is_mask, 1e5)
 
         ids = torch.where(padding_mask, -1, ids)
-        # print("Final", ids.max(), ids.min())
         return ids
-
 
     @torch.no_grad()
     @eval_decorator
-    def edit(self,
-             conds,
-             tokens,
-             m_lens,
-             timesteps: int,
-             cond_scale: int,
-             temperature=1,
-             topk_filter_thres=0.9,
-             gsample=False,
-             force_mask=False,
-             edit_mask=None,
-             padding_mask=None,
-             ):
+    def edit(self, conds, tokens, m_lens, timesteps: int, cond_scale: int,
+             temperature=1, topk_filter_thres=0.9, gsample=False, force_mask=False,
+             edit_mask=None, padding_mask=None):
 
         assert edit_mask.shape == tokens.shape if edit_mask is not None else True
         device = next(self.parameters()).device
         seq_len = tokens.shape[1]
 
-        if self.cond_mode == 'text':
-            # Only disable gradients if CLIP is frozen (inference always uses no_grad anyway)
-            if self.finetune_clip:
-                cond_vector = self.encode_text(conds)
-            else:
-                with torch.no_grad():
-                    cond_vector = self.encode_text(conds)
-        elif self.cond_mode == 'action':
-            cond_vector = self.enc_action(conds).to(device)
-        elif self.cond_mode == 'uncond':
-            cond_vector = torch.zeros(1, self.latent_dim).float().to(device)
-        else:
-            raise NotImplementedError("Unsupported condition mode!!!")
+        cond_vector, _, cond_mask = self.encode_condition(conds, tokens.shape[0], device)
 
-        if padding_mask == None:
+        if padding_mask is None:
             padding_mask = ~lengths_to_mask(m_lens, seq_len)
 
-        # Start from all tokens being masked
-        if edit_mask == None:
+        if edit_mask is None:
             mask_free = True
             ids = torch.where(padding_mask, self.pad_id, tokens)
             edit_mask = torch.ones_like(padding_mask)
@@ -619,324 +524,134 @@ class MaskTransformer(nn.Module):
             scores = torch.where(edit_mask, 0., 1e5)
         starting_temperature = temperature
 
-        for timestep, steps_until_x0 in zip(torch.linspace(0, 1, timesteps, device=device), reversed(range(timesteps))):
-            # 0 < timestep < 1
-            rand_mask_prob = 0.16 if mask_free else self.noise_schedule(timestep)  # Tensor
+        for timestep, steps_until_x0 in zip(torch.linspace(0, 1, timesteps, device=device),
+                                            reversed(range(timesteps))):
+            rand_mask_prob = 0.16 if mask_free else self.noise_schedule(timestep)
+            num_token_masked = torch.round(rand_mask_prob * edit_len).clamp(min=1)
 
-            '''
-            Maskout, and cope with variable length
-            '''
-            # fix: the ratio regarding lengths, instead of seq_len
-            num_token_masked = torch.round(rand_mask_prob * edit_len).clamp(min=1)  # (b, )
-
-            # select num_token_masked tokens with lowest scores to be masked
-            sorted_indices = scores.argsort(
-                dim=1)  # (b, k), sorted_indices[i, j] = the index of j-th lowest element in scores on dim=1
-            ranks = sorted_indices.argsort(dim=1)  # (b, k), rank[i, j] = the rank (0: lowest) of scores[i, j] on dim=1
+            sorted_indices = scores.argsort(dim=1)
+            ranks = sorted_indices.argsort(dim=1)
             is_mask = (ranks < num_token_masked.unsqueeze(-1))
-            # is_mask = (torch.rand_like(scores) < 0.8) * ~padding_mask if mask_free else is_mask
             ids = torch.where(is_mask, self.mask_id, ids)
 
-            '''
-            Preparing input
-            '''
-            # (b, num_token, seqlen)
             logits = self.forward_with_cond_scale(ids, cond_vector=cond_vector,
                                                   padding_mask=padding_mask,
                                                   cond_scale=cond_scale,
-                                                  force_mask=force_mask)
-
-            logits = logits.permute(0, 2, 1)  # (b, seqlen, ntoken)
-            # print(logits.shape, self.opt.num_tokens)
-            # clean low prob token
+                                                  force_mask=force_mask,
+                                                  cond_mask=cond_mask)
+            logits = logits.permute(0, 2, 1)
             filtered_logits = top_k(logits, topk_filter_thres, dim=-1)
 
-            '''
-            Update ids
-            '''
-            # if force_mask:
             temperature = starting_temperature
-            # else:
-            # temperature = starting_temperature * (steps_until_x0 / timesteps)
-            # temperature = max(temperature, 1e-4)
-            # print(filtered_logits.shape)
-            # temperature is annealed, gradually reducing temperature as well as randomness
-            if gsample:  # use gumbel_softmax sampling
-                # print("1111")
-                pred_ids = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)  # (b, seqlen)
-            else:  # use multinomial sampling
-                # print("2222")
-                probs = F.softmax(filtered_logits / temperature, dim=-1)  # (b, seqlen, ntoken)
-                # print(temperature, starting_temperature, steps_until_x0, timesteps)
-                # print(probs / temperature)
-                pred_ids = Categorical(probs).sample()  # (b, seqlen)
+            if gsample:
+                pred_ids = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
+            else:
+                probs = F.softmax(filtered_logits / temperature, dim=-1)
+                pred_ids = Categorical(probs).sample()
 
-            # print(pred_ids.max(), pred_ids.min())
-            # if pred_ids.
             ids = torch.where(is_mask, pred_ids, ids)
 
-            '''
-            Updating scores
-            '''
-            probs_without_temperature = logits.softmax(dim=-1)  # (b, seqlen, ntoken)
-            scores = probs_without_temperature.gather(2, pred_ids.unsqueeze(dim=-1))  # (b, seqlen, 1)
-            scores = scores.squeeze(-1)  # (b, seqlen)
-
-            # We do not want to re-mask the previously kept tokens, or pad tokens
+            probs_without_temperature = logits.softmax(dim=-1)
+            scores = probs_without_temperature.gather(2, pred_ids.unsqueeze(dim=-1)).squeeze(-1)
             scores = scores.masked_fill(~edit_mask, 1e5) if mask_free else scores.masked_fill(~is_mask, 1e5)
 
         ids = torch.where(padding_mask, -1, ids)
-        # print("Final", ids.max(), ids.min())
         return ids
 
     @torch.no_grad()
     @eval_decorator
-    def edit_beta(self,
-                  conds,
-                  conds_og,
-                  tokens,
-                  m_lens,
-                  cond_scale: int,
-                  force_mask=False,
-                  ):
-
+    def edit_beta(self, conds, conds_og, tokens, m_lens, cond_scale: int, force_mask=False):
         device = next(self.parameters()).device
         seq_len = tokens.shape[1]
 
-        if self.cond_mode == 'text':
-            # Only disable gradients if CLIP is frozen
-            if self.finetune_clip:
-                cond_vector = self.encode_text(conds)
-                if conds_og is not None:
-                    cond_vector_og = self.encode_text(conds_og)
-                else:
-                    cond_vector_og = None
-            else:
-                with torch.no_grad():
-                    cond_vector = self.encode_text(conds)
-                    if conds_og is not None:
-                        cond_vector_og = self.encode_text(conds_og)
-                    else:
-                        cond_vector_og = None
-        elif self.cond_mode == 'action':
-            cond_vector = self.enc_action(conds).to(device)
-            if conds_og is not None:
-                cond_vector_og = self.enc_action(conds_og).to(device)
-            else:
-                cond_vector_og = None
+        cond_vector, _, cond_mask = self.encode_condition(conds, tokens.shape[0], device)
+        if conds_og is not None:
+            cond_vector_og, _, _ = self.encode_condition(conds_og, tokens.shape[0], device)
         else:
-            raise NotImplementedError("Unsupported condition mode!!!")
+            cond_vector_og = None
 
         padding_mask = ~lengths_to_mask(m_lens, seq_len)
+        ids = torch.where(padding_mask, self.pad_id, tokens)
 
-        # Start from all tokens being masked
-        ids = torch.where(padding_mask, self.pad_id, tokens)  # Do not mask anything
-
-        '''
-        Preparing input
-        '''
-        # (b, num_token, seqlen)
+        # NOTE: cond_vector_neg is passed but forward_with_cond_scale does not accept it.
+        # This is preserved from the original code for future extension.
         logits = self.forward_with_cond_scale(ids,
                                               cond_vector=cond_vector,
-                                              cond_vector_neg=cond_vector_og,
                                               padding_mask=padding_mask,
                                               cond_scale=cond_scale,
                                               force_mask=force_mask)
+        logits = logits.permute(0, 2, 1)
 
-        logits = logits.permute(0, 2, 1)  # (b, seqlen, ntoken)
-
-        '''
-        Updating scores
-        '''
-        probs_without_temperature = logits.softmax(dim=-1)  # (b, seqlen, ntoken)
-        tokens[tokens == -1] = 0  # just to get through an error when index = -1 using gather
-        og_tokens_scores = probs_without_temperature.gather(2, tokens.unsqueeze(dim=-1))  # (b, seqlen, 1)
-        og_tokens_scores = og_tokens_scores.squeeze(-1)  # (b, seqlen)
-
+        probs_without_temperature = logits.softmax(dim=-1)
+        tokens[tokens == -1] = 0
+        og_tokens_scores = probs_without_temperature.gather(2, tokens.unsqueeze(dim=-1)).squeeze(-1)
         return og_tokens_scores
 
 
-class ResidualTransformer(nn.Module):
-    def __init__(self, code_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8, cond_drop_prob=0.1,
-                 num_heads=4, dropout=0.1, clip_dim=512, shared_codebook=False, share_weight=False,
-                 clip_version=None, opt=None, use_frames=False, finetune_clip=False, 
-                 finetune_clip_layers=2, **kargs):
-        super(ResidualTransformer, self).__init__()
-        print(f'latent_dim: {latent_dim}, ff_size: {ff_size}, nlayers: {num_layers}, nheads: {num_heads}, dropout: {dropout}')
+# ──────────────────── Residual Transformer ────────────────────
 
-        # assert shared_codebook == True, "Only support shared codebook right now!"
+class ResidualTransformer(BaseCondTransformer):
+    def __init__(self, code_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8,
+                 cond_drop_prob=0.1, num_heads=4, dropout=0.1, clip_dim=512,
+                 shared_codebook=False, share_weight=False,
+                 clip_version=None, opt=None, use_frames=False, finetune_clip=False,
+                 finetune_clip_layers=2,
+                 conditioning_mode='clip', num_id_samples=50,
+                 t5_model_name='t5-base', **kargs):
+        super().__init__(
+            code_dim, cond_mode, latent_dim=latent_dim, ff_size=ff_size,
+            num_layers=num_layers, num_heads=num_heads, dropout=dropout,
+            clip_dim=clip_dim, cond_drop_prob=cond_drop_prob,
+            clip_version=clip_version, opt=opt, use_frames=use_frames,
+            finetune_clip=finetune_clip, finetune_clip_layers=finetune_clip_layers,
+            conditioning_mode=conditioning_mode,
+            num_id_samples=num_id_samples,
+            t5_model_name=t5_model_name, **kargs)
 
-        self.code_dim = code_dim
-        self.latent_dim = latent_dim
-        self.clip_dim = clip_dim
-        self.dropout = dropout
-        self.opt = opt
-        self.use_frames = use_frames
-        self.finetune_clip = finetune_clip
-        self.finetune_clip_layers = finetune_clip_layers
-
-        self.cond_mode = cond_mode
-        # self.cond_drop_prob = cond_drop_prob
-
-        if self.cond_mode == 'action':
-            assert 'num_actions' in kargs
-        self.num_actions = kargs.get('num_actions', 1)
-        self.cond_drop_prob = cond_drop_prob
-
-        '''
-        Preparing Networks
-        '''
-        self.input_process = InputProcess(self.code_dim, self.latent_dim)
-        self.position_enc = PositionalEncoding(self.latent_dim, self.dropout)
-
-        seqTransEncoderLayer = nn.TransformerEncoderLayer(d_model=self.latent_dim,
-                                                          nhead=num_heads,
-                                                          dim_feedforward=ff_size,
-                                                          dropout=dropout,
-                                                          activation='gelu')
-
-        self.seqTransEncoder = nn.TransformerEncoder(seqTransEncoderLayer,
-                                                     num_layers=num_layers)
-
+        # ── Residual-specific layers ──
         self.encode_quant = partial(F.one_hot, num_classes=self.opt.num_quantizers)
-        self.encode_action = partial(F.one_hot, num_classes=self.num_actions)
-
         self.quant_emb = nn.Linear(self.opt.num_quantizers, self.latent_dim)
-        # if self.cond_mode != 'no_cond':
-        if self.cond_mode == 'text':
-            self.cond_emb = nn.Linear(self.clip_dim, self.latent_dim)
-        elif self.cond_mode == 'action':
-            self.cond_emb = nn.Linear(self.num_actions, self.latent_dim)
-        else:
-            raise KeyError("Unsupported condition mode!!!")
 
-        # Sparse keyframe conditioning (same as base transformer)
-        if self.use_frames:
-            self.modality_emb_frame = nn.Parameter(torch.randn(1, 1, self.latent_dim))
-            print(f'  ResidualTransformer: Sparse keyframe fusion enabled')
-
-
-        _num_tokens = opt.num_tokens + 1  # one dummy tokens for padding
+        _num_tokens = opt.num_tokens + 1  # one pad dummy
         self.pad_id = opt.num_tokens
 
-        # self.output_process = OutputProcess_Bert(out_feats=opt.num_tokens, latent_dim=latent_dim)
         self.output_process = OutputProcess(out_feats=code_dim, latent_dim=latent_dim)
 
+        # ── Codebook weight schemes ──
         if shared_codebook:
             token_embed = nn.Parameter(torch.normal(mean=0, std=0.02, size=(_num_tokens, code_dim)))
-            self.token_embed_weight = token_embed.expand(opt.num_quantizers-1, _num_tokens, code_dim)
+            self.token_embed_weight = token_embed.expand(opt.num_quantizers - 1, _num_tokens, code_dim)
             if share_weight:
                 self.output_proj_weight = self.token_embed_weight
                 self.output_proj_bias = None
             else:
                 output_proj = nn.Parameter(torch.normal(mean=0, std=0.02, size=(_num_tokens, code_dim)))
                 output_bias = nn.Parameter(torch.zeros(size=(_num_tokens,)))
-                # self.output_proj_bias = 0
-                self.output_proj_weight = output_proj.expand(opt.num_quantizers-1, _num_tokens, code_dim)
-                self.output_proj_bias = output_bias.expand(opt.num_quantizers-1, _num_tokens)
-
+                self.output_proj_weight = output_proj.expand(opt.num_quantizers - 1, _num_tokens, code_dim)
+                self.output_proj_bias = output_bias.expand(opt.num_quantizers - 1, _num_tokens)
         else:
             if share_weight:
-                self.embed_proj_shared_weight = nn.Parameter(torch.normal(mean=0, std=0.02, size=(opt.num_quantizers - 2, _num_tokens, code_dim)))
-                self.token_embed_weight_ = nn.Parameter(torch.normal(mean=0, std=0.02, size=(1, _num_tokens, code_dim)))
-                self.output_proj_weight_ = nn.Parameter(torch.normal(mean=0, std=0.02, size=(1, _num_tokens, code_dim)))
+                self.embed_proj_shared_weight = nn.Parameter(
+                    torch.normal(mean=0, std=0.02, size=(opt.num_quantizers - 2, _num_tokens, code_dim)))
+                self.token_embed_weight_ = nn.Parameter(
+                    torch.normal(mean=0, std=0.02, size=(1, _num_tokens, code_dim)))
+                self.output_proj_weight_ = nn.Parameter(
+                    torch.normal(mean=0, std=0.02, size=(1, _num_tokens, code_dim)))
                 self.output_proj_bias = None
                 self.registered = False
             else:
-                output_proj_weight = torch.normal(mean=0, std=0.02,
-                                                  size=(opt.num_quantizers - 1, _num_tokens, code_dim))
+                self.output_proj_weight = nn.Parameter(
+                    torch.normal(mean=0, std=0.02, size=(opt.num_quantizers - 1, _num_tokens, code_dim)))
+                self.output_proj_bias = nn.Parameter(
+                    torch.zeros(size=(opt.num_quantizers, _num_tokens)))
+                self.token_embed_weight = nn.Parameter(
+                    torch.normal(mean=0, std=0.02, size=(opt.num_quantizers - 1, _num_tokens, code_dim)))
 
-                self.output_proj_weight = nn.Parameter(output_proj_weight)
-                self.output_proj_bias = nn.Parameter(torch.zeros(size=(opt.num_quantizers, _num_tokens)))
-                token_embed_weight = torch.normal(mean=0, std=0.02,
-                                                  size=(opt.num_quantizers - 1, _num_tokens, code_dim))
-                self.token_embed_weight = nn.Parameter(token_embed_weight)
-
-        self.apply(self.__init_weights)
         self.shared_codebook = shared_codebook
         self.share_weight = share_weight
 
-        if self.cond_mode == 'text':
-            print('Loading CLIP...')
-            self.clip_version = clip_version
-            self.clip_model = self.load_and_freeze_clip(clip_version)
-            if self.finetune_clip:
-                print(f'CLIP Fine-tuning: ENABLED (last {self.finetune_clip_layers} layers)')
-            else:
-                print('CLIP Fine-tuning: DISABLED (fully frozen)')
-
-    # def
-
-    def mask_cond(self, cond, force_mask=False):
-        bs, d =  cond.shape
-        if force_mask:
-            return torch.zeros_like(cond)
-        elif self.training and self.cond_drop_prob > 0.:
-            mask = torch.bernoulli(torch.ones(bs, device=cond.device) * self.cond_drop_prob).view(bs, 1)
-            return cond * (1. - mask)
-        else:
-            return cond
-
-    def __init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=0.02)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-
-    def parameters_wo_clip(self):
-        """Return parameters excluding CLIP (unless fine-tuning CLIP)"""
-        if self.finetune_clip:
-            # When fine-tuning, include all parameters (including CLIP)
-            return list(self.parameters())
-        else:
-            # When CLIP is frozen, exclude CLIP parameters
-            return [p for name, p in self.named_parameters() if not name.startswith('clip_model.')]
-
-    def load_and_freeze_clip(self, clip_version):
-        clip_model, clip_preprocess = clip.load(clip_version, device='cpu',
-                                                jit=False)  # Must set jit=False for training
-        # Convert to FP16 only if NOT fine-tuning (fine-tuning requires FP32 for stability)
-        if str(self.opt.device) != "cpu" and not self.finetune_clip:
-            clip.model.convert_weights(clip_model)  # Convert to FP16 for inference only
-
-        # Conditionally freeze CLIP weights
-        if self.finetune_clip:
-            # Unfreeze last N transformer layers
-            clip_model.eval()  # Keep in eval mode for stability
-            # Freeze all parameters first
-            for p in clip_model.parameters():
-                p.requires_grad = False
-            
-            # Unfreeze last N transformer layers (resblocks)
-            total_layers = len(clip_model.transformer.resblocks)
-            for i in range(total_layers - self.finetune_clip_layers, total_layers):
-                for p in clip_model.transformer.resblocks[i].parameters():
-                    p.requires_grad = True
-            
-            # Unfreeze final layer norm and projection
-            for p in clip_model.ln_final.parameters():
-                p.requires_grad = True
-            if hasattr(clip_model, 'text_projection') and clip_model.text_projection is not None:
-                clip_model.text_projection.requires_grad = True
-            
-            print(f'Unfroze last {self.finetune_clip_layers} transformer layers + final LN + projection')
-        else:
-            # Freeze all CLIP weights
-            clip_model.eval()
-            for p in clip_model.parameters():
-                p.requires_grad = False
-
-        return clip_model
-
-    def encode_text(self, raw_text):
-        device = next(self.parameters()).device
-        text = clip.tokenize(raw_text, truncate=True).to(device)
-        feat_clip_text = self.clip_model.encode_text(text).float()
-        return feat_clip_text
-
+        self.apply(self._init_weights)
+        self._init_clip(clip_version)
 
     def q_schedule(self, bs, low, high):
         noise = uniform((bs,), device=self.opt.device)
@@ -945,23 +660,19 @@ class ResidualTransformer(nn.Module):
 
     def process_embed_proj_weight(self):
         if self.share_weight and (not self.shared_codebook):
-            # if not self.registered:
             device = next(self.parameters()).device
-            self.output_proj_weight = torch.cat([self.embed_proj_shared_weight, self.output_proj_weight_], dim=0).to(device)
-            self.token_embed_weight = torch.cat([self.token_embed_weight_, self.embed_proj_shared_weight], dim=0).to(device)
-                # self.registered = True
+            self.output_proj_weight = torch.cat(
+                [self.embed_proj_shared_weight, self.output_proj_weight_], dim=0).to(device)
+            self.token_embed_weight = torch.cat(
+                [self.token_embed_weight_, self.embed_proj_shared_weight], dim=0).to(device)
 
     def output_project(self, logits, qids):
         '''
         :logits: (bs, code_dim, seqlen)
         :qids: (bs)
-
-        :return:
-            -logits (bs, ntoken, seqlen)
+        :return: logits (bs, ntoken, seqlen)
         '''
-        # (num_qlayers-1, num_token, code_dim) -> (bs, ntoken, code_dim)
         output_proj_weight = self.output_proj_weight[qids]
-        # (num_qlayers, ntoken) -> (bs, ntoken)
         output_proj_bias = None if self.output_proj_bias is None else self.output_proj_bias[qids]
 
         output = torch.einsum('bnc, bcs->bns', output_proj_weight, logits)
@@ -969,284 +680,184 @@ class ResidualTransformer(nn.Module):
             output += output + output_proj_bias.unsqueeze(-1)
         return output
 
-
-
-    def trans_forward(self, motion_codes, qids, cond, padding_mask, force_mask=False, frame_emb=None, has_frames=False):
+    def trans_forward(self, motion_codes, qids, cond, padding_mask, force_mask=False,
+                      frame_emb=None, has_frames=False, cond_mask=None):
         '''
         :param motion_codes: (b, seqlen, d)
-        :padding_mask: (b, seqlen), all pad positions are TRUE else FALSE
         :param qids: (b), quantizer layer ids
-        :param cond: (b, embed_dim) for text, (b, num_actions) for action
-        :param frame_emb: (seqlen, b, latent_dim) optional sparse keyframe embeddings
-        :param has_frames: bool flag indicating if any sample in batch has actual frames
-        :return:
-            -logits: (b, num_token, seqlen)
+        :param cond: (b, embed_dim) or (b, T_text, t5_dim)
+        :param padding_mask: (b, seqlen), pad positions are TRUE
+        :param cond_mask: (b, T_text) optional — T5 attention mask
+        :return: logits (b, code_dim, seqlen)
         '''
-        cond = self.mask_cond(cond, force_mask=force_mask)
-
-        # (b, seqlen, d) -> (seqlen, b, latent_dim)
-        x = self.input_process(motion_codes)
-
-        # (b, num_quantizer)
+        x = self.input_process(motion_codes)  # (seqlen, b, latent_dim)
         q_onehot = self.encode_quant(qids).float().to(x.device)
-
         q_emb = self.quant_emb(q_onehot).unsqueeze(0)  # (1, b, latent_dim)
-        cond = self.cond_emb(cond).unsqueeze(0)  # (1, b, latent_dim)
 
         x = self.position_enc(x)
-        
-        # Conditional fusion: only fuse if frames contain actual features
+
+        # Sparse keyframe fusion
         if self.use_frames and frame_emb is not None and has_frames:
             f = frame_emb + self.modality_emb_frame
             f = self.position_enc(f)
             x = x + f
-        
-        xseq = torch.cat([cond, q_emb, x], dim=0)  # (seqlen+2, b, latent_dim)
 
-        padding_mask = torch.cat([torch.zeros_like(padding_mask[:, 0:2]), padding_mask], dim=1)  # (b, seqlen+2)
-        output = self.seqTransEncoder(xseq, src_key_padding_mask=padding_mask)[2:]  # (seqlen, b, e)
+        # ── Build prefix conditioning ──
+        if self._use_new_provider:
+            prefix, prefix_kp, n_prefix = self.cond_provider.project_and_prepare(
+                cond, cond_mask, force_mask=force_mask)
+        else:
+            cond = self.mask_cond(cond, force_mask=force_mask)
+            prefix = self.cond_emb(cond).unsqueeze(0)  # (1, b, latent_dim)
+            prefix_kp = None
+            n_prefix = 1
+
+        xseq = torch.cat([prefix, q_emb, x], dim=0)  # (n_prefix+1+seqlen, b, latent_dim)
+        n_strip = n_prefix + 1  # strip prefix + q_emb from output
+
+        if prefix_kp is not None:
+            padding_mask = torch.cat([
+                prefix_kp,
+                torch.zeros_like(padding_mask[:, :1]),  # q_emb is never padded
+                padding_mask
+            ], dim=1)
+        else:
+            padding_mask = torch.cat([
+                torch.zeros_like(padding_mask[:, :1]).expand(-1, n_prefix + 1),
+                padding_mask
+            ], dim=1)
+
+        output = self.seqTransEncoder(xseq, src_key_padding_mask=padding_mask)[n_strip:]
         logits = self.output_process(output)
         return logits
 
-    def forward_with_cond_scale(self,
-                                motion_codes,
-                                q_id,
-                                cond_vector,
-                                padding_mask,
-                                cond_scale=3,
-                                force_mask=False):
+    def forward_with_cond_scale(self, motion_codes, q_id, cond_vector, padding_mask,
+                                cond_scale=3, force_mask=False, cond_mask=None):
         bs = motion_codes.shape[0]
-        # if cond_scale == 1:
         qids = torch.full((bs,), q_id, dtype=torch.long, device=motion_codes.device)
         if force_mask:
-            logits = self.trans_forward(motion_codes, qids, cond_vector, padding_mask, force_mask=True)
-            logits = self.output_project(logits, qids-1)
-            return logits
+            logits = self.trans_forward(motion_codes, qids, cond_vector, padding_mask,
+                                        force_mask=True, cond_mask=cond_mask)
+            return self.output_project(logits, qids - 1)
 
-        logits = self.trans_forward(motion_codes, qids, cond_vector, padding_mask)
-        logits = self.output_project(logits, qids-1)
+        logits = self.trans_forward(motion_codes, qids, cond_vector, padding_mask,
+                                    cond_mask=cond_mask)
+        logits = self.output_project(logits, qids - 1)
         if cond_scale == 1:
             return logits
 
-        aux_logits = self.trans_forward(motion_codes, qids, cond_vector, padding_mask, force_mask=True)
-        aux_logits = self.output_project(aux_logits, qids-1)
-
-        scaled_logits = aux_logits + (logits - aux_logits) * cond_scale
-        return scaled_logits
+        aux_logits = self.trans_forward(motion_codes, qids, cond_vector, padding_mask,
+                                        force_mask=True, cond_mask=cond_mask)
+        aux_logits = self.output_project(aux_logits, qids - 1)
+        return aux_logits + (logits - aux_logits) * cond_scale
 
     def forward(self, all_indices, y, m_lens, frame_emb=None, has_frames=False):
         '''
         :param all_indices: (b, n, q)
-        :param y: raw text for cond_mode=text, (b, ) for cond_mode=action
-        :m_lens: (b,)
-        :param frame_emb: (n, b, latent_dim) optional sparse keyframe embeddings
-        :param has_frames: bool flag indicating if any sample in batch has actual frames
-        :return:
+        :param y: raw text or action labels
+        :param m_lens: (b,)
         '''
-
         self.process_embed_proj_weight()
 
         bs, ntokens, num_quant_layers = all_indices.shape
         device = all_indices.device
 
-        # Positions that are PADDED are ALL FALSE
-        non_pad_mask = lengths_to_mask(m_lens, ntokens)  # (b, n)
-
+        non_pad_mask = lengths_to_mask(m_lens, ntokens)
         q_non_pad_mask = repeat(non_pad_mask, 'b n -> b n q', q=num_quant_layers)
-        all_indices = torch.where(q_non_pad_mask, all_indices, self.pad_id) #(b, n, q)
+        all_indices = torch.where(q_non_pad_mask, all_indices, self.pad_id)
 
-        # randomly sample quantization layers to work on, [1, num_q)
         active_q_layers = q_schedule(bs, low=1, high=num_quant_layers, device=device)
 
-        # print(self.token_embed_weight.shape, all_indices.shape)
         token_embed = repeat(self.token_embed_weight, 'q c d-> b c d q', b=bs)
         gather_indices = repeat(all_indices[..., :-1], 'b n q -> b n d q', d=token_embed.shape[2])
-        # print(token_embed.shape, gather_indices.shape)
-        all_codes = token_embed.gather(1, gather_indices)  # (b, n, d, q-1)
+        all_codes = token_embed.gather(1, gather_indices)
+        cumsum_codes = torch.cumsum(all_codes, dim=-1)
 
-        cumsum_codes = torch.cumsum(all_codes, dim=-1) #(b, n, d, q-1)
-
-        active_indices = all_indices[torch.arange(bs), :, active_q_layers]  # (b, n)
+        active_indices = all_indices[torch.arange(bs), :, active_q_layers]
         history_sum = cumsum_codes[torch.arange(bs), :, :, active_q_layers - 1]
 
-        force_mask = False
-        if self.cond_mode == 'text':
-            # Only disable gradients if CLIP is frozen
-            if self.finetune_clip:
-                cond_vector = self.encode_text(y)
-            else:
-                with torch.no_grad():
-                    cond_vector = self.encode_text(y)
-        elif self.cond_mode == 'action':
-            cond_vector = self.enc_action(y).to(device).float()
-        elif self.cond_mode == 'uncond':
-            cond_vector = torch.zeros(bs, self.latent_dim).float().to(device)
-            force_mask = True
-        else:
-            raise NotImplementedError("Unsupported condition mode!!!")
+        cond_vector, force_mask, cond_mask = self.encode_condition(y, bs, device)
 
-        logits = self.trans_forward(history_sum, active_q_layers, cond_vector, ~non_pad_mask, force_mask, frame_emb=frame_emb, has_frames=has_frames)
-        logits = self.output_project(logits, active_q_layers-1)
+        logits = self.trans_forward(history_sum, active_q_layers, cond_vector, ~non_pad_mask,
+                                    force_mask, frame_emb=frame_emb, has_frames=has_frames,
+                                    cond_mask=cond_mask)
+        logits = self.output_project(logits, active_q_layers - 1)
         ce_loss, pred_id, acc = cal_performance(logits, active_indices, ignore_index=self.pad_id)
-
         return ce_loss, pred_id, acc
 
     @torch.no_grad()
     @eval_decorator
-    def generate(self,
-                 motion_ids,
-                 conds,
-                 m_lens,
-                 temperature=1,
-                 topk_filter_thres=0.9,
-                 cond_scale=2,
-                 num_res_layers=-1, # If it's -1, use all.
-                 ):
+    def generate(self, motion_ids, conds, m_lens, temperature=1,
+                 topk_filter_thres=0.9, cond_scale=2, num_res_layers=-1):
 
-        # print(self.opt.num_quantizers)
-        # assert len(timesteps) >= len(cond_scales) == self.opt.num_quantizers
         self.process_embed_proj_weight()
 
         device = next(self.parameters()).device
         seq_len = motion_ids.shape[1]
         batch_size = len(conds)
 
-        if self.cond_mode == 'text':
-            # Only disable gradients if CLIP is frozen
-            if self.finetune_clip:
-                cond_vector = self.encode_text(conds)
-            else:
-                with torch.no_grad():
-                    cond_vector = self.encode_text(conds)
-        elif self.cond_mode == 'action':
-            cond_vector = self.enc_action(conds).to(device)
-        elif self.cond_mode == 'uncond':
-            cond_vector = torch.zeros(batch_size, self.latent_dim).float().to(device)
-        else:
-            raise NotImplementedError("Unsupported condition mode!!!")
+        cond_vector, _, cond_mask = self.encode_condition(conds, batch_size, device)
 
-        # token_embed = repeat(self.token_embed_weight, 'c d -> b c d', b=batch_size)
-        # gathered_ids = repeat(motion_ids, 'b n -> b n d', d=token_embed.shape[-1])
-        # history_sum = token_embed.gather(1, gathered_ids)
-
-        # print(pa, seq_len)
         padding_mask = ~lengths_to_mask(m_lens, seq_len)
-        # print(padding_mask.shape, motion_ids.shape)
         motion_ids = torch.where(padding_mask, self.pad_id, motion_ids)
         all_indices = [motion_ids]
         history_sum = 0
-        num_quant_layers = self.opt.num_quantizers if num_res_layers==-1 else num_res_layers+1
+        num_quant_layers = self.opt.num_quantizers if num_res_layers == -1 else num_res_layers + 1
 
         for i in range(1, num_quant_layers):
-            # print(f"--> Working on {i}-th quantizer")
-            # Start from all tokens being masked
-            # qids = torch.full((batch_size,), i, dtype=torch.long, device=motion_ids.device)
-            token_embed = self.token_embed_weight[i-1].to(device)
+            token_embed = self.token_embed_weight[i - 1].to(device)
             token_embed = repeat(token_embed, 'c d -> b c d', b=batch_size)
             gathered_ids = repeat(motion_ids, 'b n -> b n d', d=token_embed.shape[-1])
             history_sum += token_embed.gather(1, gathered_ids)
 
-            logits = self.forward_with_cond_scale(history_sum, i, cond_vector, padding_mask, cond_scale=cond_scale)
-            # logits = self.trans_forward(history_sum, qids, cond_vector, padding_mask)
-
-            logits = logits.permute(0, 2, 1)  # (b, seqlen, ntoken)
-            # clean low prob token
+            logits = self.forward_with_cond_scale(history_sum, i, cond_vector, padding_mask,
+                                                  cond_scale=cond_scale, cond_mask=cond_mask)
+            logits = logits.permute(0, 2, 1)
             filtered_logits = top_k(logits, topk_filter_thres, dim=-1)
-
-            pred_ids = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)  # (b, seqlen)
-
-            # probs = F.softmax(filtered_logits, dim=-1)  # (b, seqlen, ntoken)
-            # # print(temperature, starting_temperature, steps_until_x0, timesteps)
-            # # print(probs / temperature)
-            # pred_ids = Categorical(probs / temperature).sample()  # (b, seqlen)
+            pred_ids = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
 
             ids = torch.where(padding_mask, self.pad_id, pred_ids)
-
             motion_ids = ids
             all_indices.append(ids)
 
         all_indices = torch.stack(all_indices, dim=-1)
-        # padding_mask = repeat(padding_mask, 'b n -> b n q', q=all_indices.shape[-1])
-        # all_indices = torch.where(padding_mask, -1, all_indices)
-        all_indices = torch.where(all_indices==self.pad_id, -1, all_indices)
-        # all_indices = all_indices.masked_fill()
+        all_indices = torch.where(all_indices == self.pad_id, -1, all_indices)
         return all_indices
 
     @torch.no_grad()
     @eval_decorator
-    def edit(self,
-            motion_ids,
-            conds,
-            m_lens,
-            temperature=1,
-            topk_filter_thres=0.9,
-            cond_scale=2
-            ):
+    def edit(self, motion_ids, conds, m_lens, temperature=1,
+             topk_filter_thres=0.9, cond_scale=2):
 
-        # print(self.opt.num_quantizers)
-        # assert len(timesteps) >= len(cond_scales) == self.opt.num_quantizers
         self.process_embed_proj_weight()
 
         device = next(self.parameters()).device
         seq_len = motion_ids.shape[1]
         batch_size = len(conds)
 
-        if self.cond_mode == 'text':
-            # Only disable gradients if CLIP is frozen
-            if self.finetune_clip:
-                cond_vector = self.encode_text(conds)
-            else:
-                with torch.no_grad():
-                    cond_vector = self.encode_text(conds)
-        elif self.cond_mode == 'action':
-            cond_vector = self.enc_action(conds).to(device)
-        elif self.cond_mode == 'uncond':
-            cond_vector = torch.zeros(batch_size, self.latent_dim).float().to(device)
-        else:
-            raise NotImplementedError("Unsupported condition mode!!!")
+        cond_vector, _, cond_mask = self.encode_condition(conds, batch_size, device)
 
-        # token_embed = repeat(self.token_embed_weight, 'c d -> b c d', b=batch_size)
-        # gathered_ids = repeat(motion_ids, 'b n -> b n d', d=token_embed.shape[-1])
-        # history_sum = token_embed.gather(1, gathered_ids)
-
-        # print(pa, seq_len)
         padding_mask = ~lengths_to_mask(m_lens, seq_len)
-        # print(padding_mask.shape, motion_ids.shape)
         motion_ids = torch.where(padding_mask, self.pad_id, motion_ids)
         all_indices = [motion_ids]
         history_sum = 0
 
         for i in range(1, self.opt.num_quantizers):
-            # print(f"--> Working on {i}-th quantizer")
-            # Start from all tokens being masked
-            # qids = torch.full((batch_size,), i, dtype=torch.long, device=motion_ids.device)
-            token_embed = self.token_embed_weight[i-1]
+            token_embed = self.token_embed_weight[i - 1]
             token_embed = repeat(token_embed, 'c d -> b c d', b=batch_size)
             gathered_ids = repeat(motion_ids, 'b n -> b n d', d=token_embed.shape[-1])
             history_sum += token_embed.gather(1, gathered_ids)
 
-            logits = self.forward_with_cond_scale(history_sum, i, cond_vector, padding_mask, cond_scale=cond_scale)
-            # logits = self.trans_forward(history_sum, qids, cond_vector, padding_mask)
-
-            logits = logits.permute(0, 2, 1)  # (b, seqlen, ntoken)
-            # clean low prob token
+            logits = self.forward_with_cond_scale(history_sum, i, cond_vector, padding_mask,
+                                                  cond_scale=cond_scale, cond_mask=cond_mask)
+            logits = logits.permute(0, 2, 1)
             filtered_logits = top_k(logits, topk_filter_thres, dim=-1)
-
-            pred_ids = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)  # (b, seqlen)
-
-            # probs = F.softmax(filtered_logits, dim=-1)  # (b, seqlen, ntoken)
-            # # print(temperature, starting_temperature, steps_until_x0, timesteps)
-            # # print(probs / temperature)
-            # pred_ids = Categorical(probs / temperature).sample()  # (b, seqlen)
+            pred_ids = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
 
             ids = torch.where(padding_mask, self.pad_id, pred_ids)
-
             motion_ids = ids
             all_indices.append(ids)
 
         all_indices = torch.stack(all_indices, dim=-1)
-        # padding_mask = repeat(padding_mask, 'b n -> b n q', q=all_indices.shape[-1])
-        # all_indices = torch.where(padding_mask, -1, all_indices)
-        all_indices = torch.where(all_indices==self.pad_id, -1, all_indices)
-        # all_indices = all_indices.masked_fill()
+        all_indices = torch.where(all_indices == self.pad_id, -1, all_indices)
         return all_indices

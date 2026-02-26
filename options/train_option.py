@@ -18,6 +18,13 @@ class TrainT2MOptions(BaseOptions):
         '''Condition'''
         self.parser.add_argument('--cond_drop_prob', type=float, default=0.1, help='Drop ratio of condition, for classifier-free guidance')
         self.parser.add_argument("--seed", default=3407, type=int, help="Seed")
+        self.parser.add_argument('--conditioning_mode', type=str, default='clip',
+                                choices=['clip', 't5', 'id_embedding'],
+                                help='Conditioning encoder: clip (default), t5 (token-level), id_embedding (per-sample learnable)')
+        self.parser.add_argument('--num_id_samples', type=int, default=50,
+                                help='Number of learnable sample embeddings for id_embedding mode')
+        self.parser.add_argument('--t5_model_name', type=str, default='t5-base',
+                                help='HuggingFace T5 model name for t5 conditioning mode')
 
         self.parser.add_argument('--is_continue', action="store_true", help='Is this trial continuing previous state?')
         self.parser.add_argument('--gumbel_sample', action="store_true", help='Strategy for token sampling, True: Gumbel sampling, False: Categorical sampling')
@@ -27,16 +34,6 @@ class TrainT2MOptions(BaseOptions):
         # self.parser.add_argument('--save_every_e', type=int, default=100, help='Frequency of printing training progress')
         self.parser.add_argument('--eval_every_e', type=int, default=5, help='Frequency of animating eval results, (epoch)')
         self.parser.add_argument('--save_latest', type=int, default=500, help='Frequency of saving checkpoint, (iteration)')
-
-        '''Visual Consistency Module'''
-        self.parser.add_argument('--use_visual_consistency', action="store_true", help='Enable visual consistency module with LPIPS loss')
-        self.parser.add_argument('--no_video_data', action="store_true", help='Disable visual consistency if no video data available')
-        self.parser.add_argument('--visual_consistency_weight', type=float, default=0.01, help='Weight for LPIPS visual consistency loss (γ)')
-        self.parser.add_argument('--visual_consistency_freq', type=int, default=10, help='Compute visual consistency every N steps')
-        self.parser.add_argument('--visual_consistency_image_size', type=int, default=256, help='Image size for rendering and LPIPS computation')
-        self.parser.add_argument('--lpips_net', type=str, default='alex', choices=['alex', 'vgg', 'squeeze'], help='Network backbone for LPIPS')
-        self.parser.add_argument('--num_keyframes', type=int, default=4, help='Number of keyframes to render for visual consistency')
-        self.parser.add_argument('--keyframe_strategy', type=str, default='uniform', choices=['uniform', 'motion_based'], help='Keyframe selection strategy')
 
         '''Frame Conditioning'''
         self.parser.add_argument('--use_frames', action="store_true", help='Enable sparse keyframe conditioning with ResNet')
@@ -77,16 +74,16 @@ class TrainLenEstOptions():
         self.parser.add_argument("--unit_length", type=int, default=4, help="Length of motion")
         self.parser.add_argument("--max_text_len", type=int, default=20, help="Length of motion")
 
-        self.parser.add_argument('--max_epoch', type=int, default=300, help='Training iterations')
+        self.parser.add_argument('--max_epoch', type=int, default=300, help='Maximum number of training epochs')
 
-        self.parser.add_argument('--lr', type=float, default=1e-4, help='Layers of GRU')
+        self.parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
 
-        self.parser.add_argument('--is_continue', action="store_true", help='Training iterations')
+        self.parser.add_argument('--is_continue', action="store_true", help='Resume training from latest checkpoint')
 
-        self.parser.add_argument('--log_every', type=int, default=50, help='Frequency of printing training progress')
-        self.parser.add_argument('--save_every_e', type=int, default=5, help='Frequency of printing training progress')
-        self.parser.add_argument('--eval_every_e', type=int, default=3, help='Frequency of printing training progress')
-        self.parser.add_argument('--save_latest', type=int, default=500, help='Frequency of printing training progress')
+        self.parser.add_argument('--log_every', type=int, default=50, help='Frequency of printing training progress (iterations)')
+        self.parser.add_argument('--save_every_e', type=int, default=5, help='Frequency of saving model checkpoint (epochs)')
+        self.parser.add_argument('--eval_every_e', type=int, default=3, help='Frequency of running evaluation (epochs)')
+        self.parser.add_argument('--save_latest', type=int, default=500, help='Frequency of saving latest checkpoint (iterations)')
 
     def parse(self):
         self.opt = self.parser.parse_args()
