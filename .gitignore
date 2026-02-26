@@ -17,6 +17,7 @@ dataset_structure.txt
 camera_prompts.txt
 dataset_vis/
 rvq_dataset_comparison/
+tests/
 
 # dataset split
 scene_partitions*
@@ -25,6 +26,7 @@ partition_scenes.py
 dataset_config.md
 dataset_stats.json
 sample_scenes.py
+curate_overfit_dataset.py
 
 # AI doc
 claude_summary/

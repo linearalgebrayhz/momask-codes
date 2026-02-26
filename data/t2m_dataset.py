@@ -198,7 +198,34 @@ class MotionDataset(data.Dataset):
                 np.save(pjoin(opt.meta_dir, 'mean.npy'), mean)
                 np.save(pjoin(opt.meta_dir, 'std.npy'), std)
             assert mean.shape[-1] == 6, f"Expected 6 features for realestate10k_6 dataset, got {mean.shape[-1]}"
+        elif opt.dataset_name == "realestate10k_quat":
+            # 10D quaternion format: [x, y, z, dx, dy, dz, qw, qx, qy, qz]
+            if opt.is_train:
+                # Only normalize position & velocity (first 6 dimensions)
+                # Quaternion (last 4 dimensions) has unit constraint, no normalization needed
+                # Set mean=0, std=1 for quaternion to skip normalization
+                mean_quat = np.concatenate([mean[:6], np.zeros(4)])
+                std_quat = np.concatenate([std[:6], np.ones(4)])
+                np.save(pjoin(opt.meta_dir, 'mean.npy'), mean_quat)
+                np.save(pjoin(opt.meta_dir, 'std.npy'), std_quat)
+                mean = mean_quat
+                std = std_quat
+            assert mean.shape[-1] == 10, f"Expected 10 features for realestate10k_quat dataset, got {mean.shape[-1]}"
+        elif opt.dataset_name == "realestate10k_rotmat":
+            # 12D rotation matrix format: [x, y, z, dx, dy, dz, r1x, r1y, r1z, r2x, r2y, r2z]
+            if opt.is_train:
+                # Only normalize position & velocity (first 6 dimensions)
+                # Rotation matrix columns (last 6 dimensions) have orthonormal constraint, no normalization needed
+                # Set mean=0, std=1 for rotation to skip normalization
+                mean_rot = np.concatenate([mean[:6], np.zeros(6)])
+                std_rot = np.concatenate([std[:6], np.ones(6)])
+                np.save(pjoin(opt.meta_dir, 'mean.npy'), mean_rot)
+                np.save(pjoin(opt.meta_dir, 'std.npy'), std_rot)
+                mean = mean_rot
+                std = std_rot
+            assert mean.shape[-1] == 12, f"Expected 12 features for realestate10k_rotmat dataset, got {mean.shape[-1]}"
         elif opt.dataset_name == "realestate10k_12":
+            # 12D Euler format (existing): [x, y, z, dx, dy, dz, pitch, yaw, roll, dpitch, dyaw, droll]. The Euler Angle is really not a good representation
             if opt.is_train:
                 # Save updated mean and std to meta_dir for realestate10k_12
                 np.save(pjoin(opt.meta_dir, 'mean.npy'), mean)
@@ -314,7 +341,7 @@ class Text2MotionDatasetEval(data.Dataset):
         
         new_name_list = []
         length_list = []
-        if opt.dataset_name == "cam" or opt.dataset_name == "realestate10k_6" or opt.dataset_name == "realestate10k_12":
+        if opt.dataset_name == "cam" or opt.dataset_name == "realestate10k_6" or opt.dataset_name == "realestate10k_12" or opt.dataset_name == "realestate10k_quat" or opt.dataset_name == "realestate10k_rotmat":
             for name in tqdm(id_list):
                 try:
                     # import pdb; pdb.set_trace()
@@ -483,7 +510,7 @@ class Text2MotionDatasetEval(data.Dataset):
         return frames_tensor  # (max_frames, 3, 224, 224)
 
     def __len__(self):
-        return len(self.data_dict) - self.pointer
+        return len(self.name_list) - self.pointer
 
     def __getitem__(self, item):
         idx = self.pointer + item
@@ -589,7 +616,7 @@ class Text2MotionDataset(data.Dataset):
 
         new_name_list = []
         length_list = []
-        if opt.dataset_name == "cam" or opt.dataset_name == "realestate10k_6" or opt.dataset_name == "realestate10k_12":
+        if opt.dataset_name == "cam" or opt.dataset_name == "realestate10k_6" or opt.dataset_name == "realestate10k_12" or opt.dataset_name == "realestate10k_quat" or opt.dataset_name == "realestate10k_rotmat":
             # Camera dataset: text files have format "caption#tokens" (2 fields)
             for name in tqdm(id_list, desc="Loading motion & text data"):
                 try:
@@ -723,7 +750,7 @@ class Text2MotionDataset(data.Dataset):
         return frame_files
 
     def __len__(self):
-        return len(self.data_dict) - self.pointer
+        return len(self.name_list) - self.pointer
 
     def __getitem__(self, item):
         idx = self.pointer + item
@@ -771,3 +798,81 @@ class Text2MotionDataset(data.Dataset):
         assert length <= self.max_motion_length
         self.pointer = np.searchsorted(self.length_arr, length)
         print("Pointer Pointing at %d" % self.pointer)
+
+
+# ──────────────────── ID-Embedding Dataset Wrapper ────────────────────
+
+class Text2MotionDatasetIDWrapped(data.Dataset):
+    """Wraps a Text2MotionDataset to additionally return the sample index.
+
+    For id_embedding conditioning, the model needs a per-sample integer index
+    instead of (or alongside) the text caption.  This wrapper replaces the
+    caption string with the integer index in the returned batch.
+
+    The sample index runs from 0 to len(base_dataset)-1.  When the dataset
+    has more samples than ``num_id_samples`` in the embedding table, indices
+    are taken modulo ``num_id_samples``.
+
+    Returned tuple:  (sample_idx: int, motion, m_length [, frame_paths])
+    """
+
+    def __init__(self, base_dataset: Text2MotionDataset, num_id_samples: int = None):
+        self.base = base_dataset
+        self.num_id_samples = num_id_samples
+
+    # Forward dataset attributes expected by the training pipeline
+    @property
+    def opt(self):
+        return self.base.opt
+
+    @property
+    def mean(self):
+        return self.base.mean
+
+    @property
+    def std(self):
+        return self.base.std
+
+    def inv_transform(self, data):
+        return self.base.inv_transform(data)
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, item):
+        out = self.base[item]
+        # out is (caption, motion, m_length) or (caption, motion, m_length, frame_paths)
+        sample_idx = item
+        if self.num_id_samples is not None:
+            sample_idx = item % self.num_id_samples
+        # Replace caption with sample_idx
+        return (sample_idx, *out[1:])
+
+
+def collate_fn_text2motion_id_train(batch):
+    """Collate function for id_embedding mode.
+
+    Expected format: (sample_idx, motion, m_length)
+    Returns: (sample_indices_tensor, motions_tensor, m_lengths_tensor)
+    """
+    batch.sort(key=lambda x: x[2], reverse=True)
+    max_len = batch[0][2]
+
+    sample_indices = []
+    motions = []
+    m_lengths = []
+
+    for item in batch:
+        sample_idx, motion, m_length = item[:3]
+        if motion.shape[0] < max_len:
+            padding = np.zeros((max_len - motion.shape[0], motion.shape[1]))
+            motion = np.concatenate([motion, padding], axis=0)
+        sample_indices.append(sample_idx)
+        motions.append(motion)
+        m_lengths.append(m_length)
+
+    sample_indices = torch.tensor(sample_indices, dtype=torch.long)
+    motions = torch.from_numpy(np.stack(motions, axis=0))
+    m_lengths = torch.tensor(m_lengths)
+
+    return sample_indices, motions, m_lengths
