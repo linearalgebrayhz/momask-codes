@@ -326,6 +326,10 @@ class MaskTransformer(BaseCondTransformer):
         self._init_clip(clip_version)
 
         self.noise_schedule = cosine_schedule
+        # BERT-style token noise probabilities (controllable for overfitting experiments)
+        self.mask_replace_prob = getattr(opt, 'mask_replace_prob', 0.1)
+        print(f'Token noise: mask_replace_prob={self.mask_replace_prob} '
+              f'({"pure masking" if self.mask_replace_prob == 0.0 else f"{self.mask_replace_prob*100:.0f}% replace + 88% of rest masked"})')
 
     def load_and_freeze_token_emb(self, codebook):
         '''
@@ -411,13 +415,17 @@ class MaskTransformer(BaseCondTransformer):
         labels = torch.where(mask, ids, self.mask_id)
         x_ids = ids.clone()
 
-        # 10% random replace
-        mask_rid = get_mask_subset_prob(mask, 0.1)
-        rand_id = torch.randint_like(x_ids, high=self.opt.num_tokens)
-        x_ids = torch.where(mask_rid, rand_id, x_ids)
-        # 79.2% mask token
-        mask_mid = get_mask_subset_prob(mask & ~mask_rid, 0.88)
-        x_ids = torch.where(mask_mid, self.mask_id, x_ids)
+        if self.mask_replace_prob > 0.0:
+            # BERT-style noise: replace_prob% random token, 88% of rest → mask, ~12% of rest → keep unchanged
+            mask_rid = get_mask_subset_prob(mask, self.mask_replace_prob)
+            rand_id = torch.randint_like(x_ids, high=self.opt.num_tokens)
+            x_ids = torch.where(mask_rid, rand_id, x_ids)
+            # 88% of un-replaced masked positions → mask_id
+            mask_mid = get_mask_subset_prob(mask & ~mask_rid, 0.88)
+            x_ids = torch.where(mask_mid, self.mask_id, x_ids)
+        else:
+            # Pure masking: all masked positions → mask_id (no replacement, no keep-unchanged trick)
+            x_ids = torch.where(mask, self.mask_id, x_ids)
 
         logits = self.trans_forward(x_ids, cond_vector, ~non_pad_mask, force_mask,
                                     frame_emb=frame_emb, has_frames=has_frames,

@@ -29,6 +29,7 @@ CUDA_VISIBLE_DEVICES=3 python train_t2m_transformer.py \
     --vq_name rvq_window64_overfit50 \
     --conditioning_mode t5 \
     --cond_drop_prob 0.0 \
+    --mask_replace_prob 0.0 \
     --latent_dim 384 \
     --ff_size 1024 \
     --n_layers 8 \

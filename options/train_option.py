@@ -17,6 +17,10 @@ class TrainT2MOptions(BaseOptions):
 
         '''Condition'''
         self.parser.add_argument('--cond_drop_prob', type=float, default=0.1, help='Drop ratio of condition, for classifier-free guidance')
+        self.parser.add_argument('--mask_replace_prob', type=float, default=0.1,
+                                help='Fraction of masked tokens to randomly replace with a random token (BERT-style noise). '
+                                     'Set to 0.0 to disable replacement and keep-unchanged tricks (pure masking, recommended for overfitting experiments). '
+                                     'Default 0.1 = 10%% replace + ~79%% mask + ~11%% keep-unchanged.')
         self.parser.add_argument("--seed", default=3407, type=int, help="Seed")
         self.parser.add_argument('--conditioning_mode', type=str, default='clip',
                                 choices=['clip', 't5', 'id_embedding'],

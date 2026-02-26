@@ -6,6 +6,7 @@ generation
 jobs/
 download_clip*
 dataset/
+dataset
 glove/
 log/
 log
