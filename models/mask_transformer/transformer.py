@@ -84,6 +84,72 @@ class OutputProcess(nn.Module):
         return output
 
 
+# ──────────────────── Cross-Attention Block ────────────────────
+
+class CrossAttentionBlock(nn.Module):
+    """Pre-Norm Transformer block with Self-Attention → Cross-Attention → FFN.
+
+    Dimension convention (mirrors nn.TransformerEncoder default): seq-first.
+      x    : (S, B, D)  — motion tokens
+      cond : (T, B, D)  — conditioning tokens already projected to D
+
+    Masks (True = IGNORE / padding, matching nn.MultiheadAttention convention):
+      motion_key_padding_mask : (B, S)  — motion padding positions
+      cond_key_padding_mask   : (B, T)  — T5 padding / null-token positions
+    """
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float = 0.1):
+        super().__init__()
+
+        # ── Sub-layer 1: Self-Attention ──
+        self.self_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=False)
+        self.norm1 = nn.LayerNorm(d_model)
+
+        # ── Sub-layer 2: Cross-Attention ──
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=False)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        # ── Sub-layer 3: Feed-Forward Network ──
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+        self.norm3 = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cond: torch.Tensor,
+        motion_key_padding_mask: Optional[torch.Tensor] = None,
+        cond_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # ── 1. Self-Attention (temporal consistency among motion tokens) ──
+        x = x + self.self_attn(
+            self.norm1(x), self.norm1(x), self.norm1(x),
+            key_padding_mask=motion_key_padding_mask,
+            need_weights=False,
+        )[0]
+
+        # ── 2. Cross-Attention (inject T5 / ID semantics into motion) ──
+        x_norm = self.norm2(x)
+        cond_norm = self.norm2(cond)          # reuse same norm weights (tied)
+        x = x + self.cross_attn(
+            x_norm, cond_norm, cond_norm,
+            key_padding_mask=cond_key_padding_mask,
+            need_weights=False,
+        )[0]
+
+        # ── 3. Feed-Forward ──
+        x = x + self.ff(self.norm3(x))
+
+        return x
+
+
 # ──────────────────── Shared Base Class ────────────────────
 
 class BaseCondTransformer(nn.Module):
@@ -148,10 +214,16 @@ class BaseCondTransformer(nn.Module):
         self.input_process = InputProcess(self.code_dim, self.latent_dim)
         self.position_enc = PositionalEncoding(self.latent_dim, self.dropout)
 
-        seqTransEncoderLayer = nn.TransformerEncoderLayer(
-            d_model=self.latent_dim, nhead=num_heads,
-            dim_feedforward=ff_size, dropout=dropout, activation='gelu')
-        self.seqTransEncoder = nn.TransformerEncoder(seqTransEncoderLayer, num_layers=num_layers)
+        # Cross-attention stack — replaces the old prefix-based encoder.
+        self.cross_attn_blocks = nn.ModuleList([
+            CrossAttentionBlock(
+                d_model=self.latent_dim,
+                nhead=num_heads,
+                dim_feedforward=ff_size,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        ])
 
         self.encode_action = partial(F.one_hot, num_classes=self.num_actions)
 
@@ -282,6 +354,44 @@ class BaseCondTransformer(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
+    def _prepare_crossattn_cond(
+        self,
+        cond: torch.Tensor,
+        cond_mask: Optional[torch.Tensor],
+        force_mask: bool,
+    ):
+        """Project and format the conditioning signal for cross-attention.
+
+        Returns
+        -------
+        cond_seq : Tensor  (T_cond, B, D)  — seq-first, projected to latent_dim.
+            T_cond = 1  for CLIP / ID / null branches.
+            T_cond = T_text  for T5 conditional branches.
+        cond_kp : Optional[Tensor]  (B, T_cond)  — True = ignore (key_padding_mask).
+            None when every position should be attended to (all modes except T5
+            conditional branch with variable-length text).
+
+        Mask routing summary
+        --------------------
+        motion tokens  → motion_key_padding_mask (B, S)  fed to self-attention.
+        cond tokens    → cond_key_padding_mask   (B, T)  fed to cross-attention.
+        These two masks are NEVER mixed together; each sub-layer sees only its
+        own mask, eliminating the old seq-length dilution from prefix concat.
+        """
+        if self._use_new_provider:
+            # project_and_prepare handles:
+            #   clip / id  → (1, B, D), no mask
+            #   t5 cond    → (T_text, B, D), (B, T_text) True=pad
+            #   t5 null    → (1, B, D) learned t5_null_proj, no mask
+            prefix, prefix_kp, _ = self.cond_provider.project_and_prepare(
+                cond, cond_mask, force_mask=force_mask)
+            return prefix, prefix_kp  # (T, B, D), Optional (B, T)
+        else:
+            # Legacy path: CLIP / action / uncond
+            cond = self.mask_cond(cond, force_mask=force_mask)   # (B, D)
+            cond_seq = self.cond_emb(cond).unsqueeze(0)          # (1, B, D)
+            return cond_seq, None
+
     def parameters_wo_clip(self):
         """Return parameters excluding frozen encoders (CLIP / T5)."""
         if self._use_new_provider:
@@ -345,47 +455,46 @@ class MaskTransformer(BaseCondTransformer):
     def trans_forward(self, motion_ids, cond, padding_mask, force_mask=False,
                       frame_emb=None, has_frames=False, cond_mask=None):
         '''
-        :param motion_ids: (b, seqlen)
-        :param cond: (b, embed_dim)  OR  (b, T_text, t5_dim)  for t5 mode
-        :param padding_mask: (b, seqlen), pad positions are TRUE
-        :param frame_emb: (seqlen, b, latent_dim) optional
-        :param cond_mask: (b, T_text) optional — T5 attention mask
-        :return: logits (b, num_token, seqlen)
+        Cross-attention forward pass — no prefix tokens.
+
+        :param motion_ids:   (B, S)  — VQ token indices
+        :param cond:         (B, raw_cond_dim) or (B, T_text, t5_dim)
+        :param padding_mask: (B, S)  — True = padding (motion_key_padding_mask)
+        :param force_mask:   bool   — True activates CFG null branch
+        :param frame_emb:    (S, B, D) optional sparse keyframe embeddings
+        :param cond_mask:    (B, T_text) bool optional — True = VALID T5 token
+                             Inverted internally to cond_key_padding_mask.
+        :return: logits (B, num_tokens, S)
         '''
-        x = self.token_emb(motion_ids)   # (b, seqlen, code_dim)
-        x = self.input_process(x)        # (seqlen, b, latent_dim)
+        # ── Motion token embedding ──────────────────────────────────────────
+        x = self.token_emb(motion_ids)      # (B, S, code_dim)
+        x = self.input_process(x)           # (S, B, D)  seq-first
         x = self.position_enc(x)
 
-        # Sparse keyframe fusion
+        # Sparse keyframe fusion (additive, no extra sequence positions)
         if self.use_frames and frame_emb is not None and has_frames:
             f = frame_emb + self.modality_emb_frame
             f = self.position_enc(f)
             x = x + f
 
-        # ── Build prefix conditioning ──
-        if self._use_new_provider:
-            # ConditioningProvider handles projection + CFG masking
-            prefix, prefix_kp, n_prefix = self.cond_provider.project_and_prepare(
-                cond, cond_mask, force_mask=force_mask)
-            # prefix: (N_prefix, B, D),  prefix_kp: (B, N_prefix) or None
-        else:
-            # Legacy CLIP path: project + CFG mask + unsqueeze
-            cond = self.mask_cond(cond, force_mask=force_mask)
-            prefix = self.cond_emb(cond).unsqueeze(0)    # (1, B, D)
-            prefix_kp = None
-            n_prefix = 1
+        # ── Conditioning: project to (T_cond, B, D) ─────────────────────────
+        # cond_seq : (T_cond, B, D)   — 1 token for CLIP/ID/null, T_text for T5
+        # cond_kp  : (B, T_cond) bool — True = ignore in cross-attn key
+        #            None             — attend to all cond positions
+        cond_seq, cond_kp = self._prepare_crossattn_cond(cond, cond_mask, force_mask)
 
-        xseq = torch.cat([prefix, x], dim=0)             # (n_prefix+S, B, D)
+        # ── Cross-attention stack ────────────────────────────────────────────
+        # motion_key_padding_mask (B, S)  → self-attention
+        # cond_key_padding_mask   (B, T)  → cross-attention
+        # The two masks never mix, eliminating prefix-length dilution.
+        for block in self.cross_attn_blocks:
+            x = block(
+                x, cond_seq,
+                motion_key_padding_mask=padding_mask,
+                cond_key_padding_mask=cond_kp,
+            )   # (S, B, D)
 
-        # Build key-padding mask for the full sequence
-        if prefix_kp is not None:
-            padding_mask = torch.cat([prefix_kp, padding_mask], dim=1)
-        else:
-            padding_mask = torch.cat(
-                [torch.zeros_like(padding_mask[:, :1]).expand(-1, n_prefix), padding_mask], dim=1)
-
-        output = self.seqTransEncoder(xseq, src_key_padding_mask=padding_mask)[n_prefix:]
-        logits = self.output_process(output)  # (b, ntoken, seqlen)
+        logits = self.output_process(x)     # (B, num_tokens, S)
         return logits
 
     def forward(self, ids, y, m_lens, frame_emb=None, has_frames=False, return_logits=False):
@@ -691,52 +800,49 @@ class ResidualTransformer(BaseCondTransformer):
     def trans_forward(self, motion_codes, qids, cond, padding_mask, force_mask=False,
                       frame_emb=None, has_frames=False, cond_mask=None):
         '''
-        :param motion_codes: (b, seqlen, d)
-        :param qids: (b), quantizer layer ids
-        :param cond: (b, embed_dim) or (b, T_text, t5_dim)
-        :param padding_mask: (b, seqlen), pad positions are TRUE
-        :param cond_mask: (b, T_text) optional — T5 attention mask
-        :return: logits (b, code_dim, seqlen)
-        '''
-        x = self.input_process(motion_codes)  # (seqlen, b, latent_dim)
-        q_onehot = self.encode_quant(qids).float().to(x.device)
-        q_emb = self.quant_emb(q_onehot).unsqueeze(0)  # (1, b, latent_dim)
+        Cross-attention forward pass — no prefix tokens.
 
+        :param motion_codes: (B, S, code_dim)  — cumulative VQ code sums
+        :param qids:         (B,)              — current quantizer layer index
+        :param cond:         (B, raw_cond_dim) or (B, T_text, t5_dim)
+        :param padding_mask: (B, S)            — True = padding
+        :param force_mask:   bool              — True activates CFG null branch
+        :param frame_emb:    (S, B, D) optional sparse keyframe embeddings
+        :param cond_mask:    (B, T_text) bool optional — True = VALID T5 token
+        :return: logits (B, code_dim, S)
+        '''
+        # ── Motion feature embedding ────────────────────────────────────────
+        x = self.input_process(motion_codes)    # (S, B, D)  seq-first
         x = self.position_enc(x)
 
-        # Sparse keyframe fusion
+        # Quantizer-level embedding: broadcast-add over sequence positions.
+        # This injects the "which codebook residual layer" signal into every
+        # motion token, replacing the old prepended q_emb prefix token.
+        q_onehot = self.encode_quant(qids).float().to(x.device)   # (B, num_q)
+        q_emb = self.quant_emb(q_onehot)                          # (B, D)
+        x = x + q_emb.unsqueeze(0)                                # (S, B, D)
+
+        # Sparse keyframe fusion (additive, no extra sequence positions)
         if self.use_frames and frame_emb is not None and has_frames:
             f = frame_emb + self.modality_emb_frame
             f = self.position_enc(f)
             x = x + f
 
-        # ── Build prefix conditioning ──
-        if self._use_new_provider:
-            prefix, prefix_kp, n_prefix = self.cond_provider.project_and_prepare(
-                cond, cond_mask, force_mask=force_mask)
-        else:
-            cond = self.mask_cond(cond, force_mask=force_mask)
-            prefix = self.cond_emb(cond).unsqueeze(0)  # (1, b, latent_dim)
-            prefix_kp = None
-            n_prefix = 1
+        # ── Conditioning: project to (T_cond, B, D) ─────────────────────────
+        # Exactly the same routing as MaskTransformer; the ResidualTransformer
+        # now also explicitly re-queries the T5/ID sequence at every layer,
+        # eliminating the exposure-bias / signal-dilution from prefix concat.
+        cond_seq, cond_kp = self._prepare_crossattn_cond(cond, cond_mask, force_mask)
 
-        xseq = torch.cat([prefix, q_emb, x], dim=0)  # (n_prefix+1+seqlen, b, latent_dim)
-        n_strip = n_prefix + 1  # strip prefix + q_emb from output
+        # ── Cross-attention stack ────────────────────────────────────────────
+        for block in self.cross_attn_blocks:
+            x = block(
+                x, cond_seq,
+                motion_key_padding_mask=padding_mask,
+                cond_key_padding_mask=cond_kp,
+            )   # (S, B, D)
 
-        if prefix_kp is not None:
-            padding_mask = torch.cat([
-                prefix_kp,
-                torch.zeros_like(padding_mask[:, :1]),  # q_emb is never padded
-                padding_mask
-            ], dim=1)
-        else:
-            padding_mask = torch.cat([
-                torch.zeros_like(padding_mask[:, :1]).expand(-1, n_prefix + 1),
-                padding_mask
-            ], dim=1)
-
-        output = self.seqTransEncoder(xseq, src_key_padding_mask=padding_mask)[n_strip:]
-        logits = self.output_process(output)
+        logits = self.output_process(x)         # (B, code_dim, S)
         return logits
 
     def forward_with_cond_scale(self, motion_codes, q_id, cond_vector, padding_mask,
