@@ -25,7 +25,7 @@ CUDA_VISIBLE_DEVICES=3 python train_t2m_transformer.py \
     --gpu_id 0 \
     --dataset_name ${DATASET_NAME} \
     --data_root ./dataset/RealEstate10K_rotmat_3k \
-    --batch_size 32 \
+    --batch_size 64 \
     --vq_name rvq_window64_3k \
     --conditioning_mode clip \
     --cond_drop_prob 0.1 \

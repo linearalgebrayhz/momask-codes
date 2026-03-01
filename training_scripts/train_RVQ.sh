@@ -8,7 +8,7 @@ echo "Starting Camera RVQ Training..."
 DATASET_NAME="realestate10k_rotmat"
 
 # overfitting experiment on one sample
-EXPERIMENT_NAME="rvq_window64_3k"
+EXPERIMENT_NAME="rvq_window128_3k"
 TENSORBOARD_DIR="./log/vq/${DATASET_NAME}/${EXPERIMENT_NAME}"
 CHECKPOINT_DIR="./checkpoints/${DATASET_NAME}/${EXPERIMENT_NAME}"
 
@@ -32,25 +32,26 @@ CUDA_VISIBLE_DEVICES=3 python train_vq.py \
     --gpu_id 0 \
     --dataset_name ${DATASET_NAME} \
     --data_root ./dataset/RealEstate10K_rotmat_3k \
-    --batch_size 32 \
-    --num_quantizers 8 \
+    --batch_size 128 \
+    --num_quantizers 6 \
     --max_epoch 400 \
-    --quantize_dropout_prob 0.1 \
-    --gamma 0.8 \
+    --quantize_dropout_prob 0.2 \
+    --gamma 0.05 \
     --lr 1e-4 \
     --warm_up_iter 500 \
     --commit 0.02 \
-    --loss_vel 1.0 \
+    --loss_vel 0.5 \
     --recons_loss l1_smooth \
-    --log_every 50 \
+    --log_every 100 \
     --log_codebook_usage \
     --log_gradients \
-    --window_size 64 \
+    --window_size 128 \
     --loss_smoothness 0.0 \
     --num_vis_samples 2 \
+    --code_dim 512 \
     # --is_continue \
     # --loss_orthogonality 0.1 \
-    # --code_dim 256 \
+
     # --nb_code 384 \
     # --is_continue \
     # --eval_on \
