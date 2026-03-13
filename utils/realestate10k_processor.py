@@ -48,23 +48,46 @@ from .unified_data_format import CameraDataFormat, UnifiedCameraData
 class QwenVideoCaptioner:
     """Qwen VL-based video captioning for camera motion analysis."""
 
-    PROMPT_TEMPLATE = (
+    # --- Prompt without scene description (pipeline verification) ---
+    PROMPT_TEMPLATE_NO_SCENE = (
         "Analyze this camera trajectory ({n_frames} frames from {total_frames}, uniformly sampled).\n\n"
         "Reference: {guidance}\n\n"
-        "Describe the complete motion in ONE sentence. If direction changes, describe in order."
+        "Describe every motion stage in 1-2 sentences using 'then' or 'finally' to separate stages. "
         "If the visual motion clearly conflicts with the reference "
         "(e.g., forward vs backward), prioritize what you see and append [CONFLICT].\n\n"
-        "Include: movement type (pan/tilt/dolly/track/arc), direction, pace (slow/medium/fast), "
-        "quality (smooth/shaky), and purpose. Always moving, never static.\n\n"
+        "For each stage include: movement type (pan/tilt/dolly/truck/arc/pedestal), "
+        "direction, pace (slow/medium/fast), and quality (smooth/shaky). "
+        "Always moving, never static.\n\n"
         "Examples:\n"
-        '- "The camera pans left slowly, then reverses right, smoothly revealing the building."\n'
-        '- "The camera dollies forward while tilting up, emphasizing the building\'s height."\n'
-        '- "The camera tracks right steadily then arcs left, exploring the architecture."\n\n'
-        "Description:"
+        '- "The camera pans left slowly, then reverses right, smoothly."\n'
+        '- "The camera dollies forward while tilting up, then arcs left at medium pace."\n'
+        '- "The camera trucks right steadily, then tilts down, finally pulls back slowly."\n\n'
+        "Motion description:"
     )
 
+    # --- Prompt with scene description (future feature) ---
+    PROMPT_TEMPLATE_WITH_SCENE = (
+        "Analyze this real estate camera trajectory ({n_frames} frames from {total_frames}, uniformly sampled).\n\n"
+        "Reference: {guidance}\n\n"
+        "Describe every motion stage and what is revealed in 1-2 sentences using 'then' or "
+        "'finally' to separate stages. "
+        "If the visual motion clearly conflicts with the reference "
+        "(e.g., forward vs backward), prioritize what you see and append [CONFLICT].\n\n"
+        "For each stage include: movement type (pan/tilt/dolly/truck/arc/pedestal), "
+        "direction, pace (slow/medium/fast), quality (smooth/shaky), and what the camera "
+        "reveals or focuses on. Always moving, never static.\n\n"
+        "Examples:\n"
+        '- "The camera pans left across the living room, then dollies forward toward the fireplace, highlighting the decor."\n'
+        '- "The camera tilts up from the garden path while dollying forward, then arcs right to reveal the house facade."\n'
+        '- "The camera trucks right along the kitchen counter, then pulls back steadily revealing the open-plan space."\n\n'
+        "Scene and motion description:"
+    )
+
+    # Default template alias (no-scene, used when with_scene=False)
+    PROMPT_TEMPLATE = PROMPT_TEMPLATE_NO_SCENE
+
     GENERATE_KWARGS = dict(
-        max_new_tokens=64,
+        max_new_tokens=128,
         temperature=0.7,
         do_sample=True,
         top_p=0.9,
@@ -76,10 +99,12 @@ class QwenVideoCaptioner:
         model_name: str = "Qwen/Qwen3-VL-8B-Instruct",
         max_frames: int = 32,
         device: Optional[str] = None,
+        with_scene: bool = False,
     ):
         self.model_name = model_name
         self.max_frames = max_frames
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.with_scene = with_scene
         self.model = None
         self.processor = None
         self.model_loaded = False
@@ -87,7 +112,8 @@ class QwenVideoCaptioner:
         self.process_vision_info = None
         self._temp_dirs: List[str] = []
 
-        print(f"QwenVideoCaptioner: {model_name} (device={self.device}, qwen3={self.is_qwen3})")
+        mode = "with-scene" if with_scene else "no-scene"
+        print(f"QwenVideoCaptioner: {model_name} (device={self.device}, qwen3={self.is_qwen3}, mode={mode})")
 
     # ------------------------------------------------------------------
     # Model loading
@@ -216,7 +242,10 @@ class QwenVideoCaptioner:
     # ------------------------------------------------------------------
 
     def _build_prompt(self, n_frames: int, total_frames: int, guidance: str) -> str:
-        return self.PROMPT_TEMPLATE.format(
+        template = (
+            self.PROMPT_TEMPLATE_WITH_SCENE if self.with_scene else self.PROMPT_TEMPLATE_NO_SCENE
+        )
+        return template.format(
             n_frames=n_frames,
             total_frames=total_frames,
             guidance=guidance,
@@ -457,6 +486,7 @@ class RealEstate10KProcessor:
         ai_batch_size: int = 2,
         resume: bool = False,
         filter_min_frames: int = 0,
+        ai_with_scene: bool = False,
     ):
         self.output_format = output_format
         self.min_sequence_length = min_sequence_length
@@ -486,7 +516,7 @@ class RealEstate10KProcessor:
 
         # AI captioner (single-GPU batched)
         self.ai_captioner = QwenVideoCaptioner(
-            model_name=ai_model_name, max_frames=ai_max_frames
+            model_name=ai_model_name, max_frames=ai_max_frames, with_scene=ai_with_scene
         )
 
     # ------------------------------------------------------------------

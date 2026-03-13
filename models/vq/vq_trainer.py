@@ -11,6 +11,7 @@ import numpy as np
 from collections import OrderedDict, defaultdict
 from utils.eval_t2m import evaluation_vqvae
 from utils.camera_eval import evaluation_camera_vqvae
+from utils.clatr_camera_eval import evaluation_camera_vqvae_clatr
 from utils.utils import print_current_loss
 from utils.logging_utils import VQLogger, create_loss_dict, aggregate_losses
 
@@ -296,9 +297,11 @@ class RVQTokenizerTrainer:
         
         # if self.opt.eval_on:
         is_camera_dataset = any(name in self.opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+        use_clatr = is_camera_dataset and hasattr(eval_wrapper, 'traj_encoder')  # CLaTrEvalWrapper
         if is_camera_dataset:
+            eval_fn = evaluation_camera_vqvae_clatr if use_clatr else evaluation_camera_vqvae
             # Use camera-specific evaluation (now includes FID and other motion metrics)
-            best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_recon, best_smoothness, best_position_error, best_orientation_error, writer = evaluation_camera_vqvae(
+            best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_recon, best_smoothness, best_position_error, best_orientation_error, writer = eval_fn(
                 self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, 
                 best_recon=best_recon, best_smoothness=best_smoothness,
                 best_position_error=best_position_error, best_orientation_error=best_orientation_error,
@@ -426,9 +429,11 @@ class RVQTokenizerTrainer:
             #     print('Best Validation Model So Far!~')
             # if self.opt.eval_on:
             is_camera_dataset = any(name in self.opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+            use_clatr = is_camera_dataset and hasattr(eval_wrapper, 'traj_encoder')  # CLaTrEvalWrapper
             if is_camera_dataset:
+                eval_fn = evaluation_camera_vqvae_clatr if use_clatr else evaluation_camera_vqvae
                 # Use camera-specific evaluation (now includes FID and other motion metrics)
-                best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_recon, best_smoothness, best_position_error, best_orientation_error, writer = evaluation_camera_vqvae(
+                best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_recon, best_smoothness, best_position_error, best_orientation_error, writer = eval_fn(
                     self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, 
                     best_recon=best_recon, best_smoothness=best_smoothness,
                     best_position_error=best_position_error, best_orientation_error=best_orientation_error,

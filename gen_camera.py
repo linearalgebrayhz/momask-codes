@@ -93,7 +93,7 @@ def load_trans_model(model_opt, opt, which_model):
     model_key = 't2m_transformer' if 't2m_transformer' in ckpt else 'trans'
     missing_keys, unexpected_keys = t2m_transformer.load_state_dict(ckpt[model_key], strict=False)
     assert len(unexpected_keys) == 0
-    assert all([k.startswith('clip_model.') for k in missing_keys])
+    assert all([k.startswith('clip_model.') or k.startswith('cond_provider.') for k in missing_keys])
     print(f'Loading Transformer {opt.name} from epoch {ckpt["ep"]}!')
     return t2m_transformer
 
@@ -144,7 +144,7 @@ def load_res_model(res_opt, vq_opt, opt):
                           map_location=opt.device)
     missing_keys, unexpected_keys = res_transformer.load_state_dict(ckpt['res_transformer'], strict=False)
     assert len(unexpected_keys) == 0
-    assert all([k.startswith('clip_model.') for k in missing_keys])
+    assert all([k.startswith('clip_model.') or k.startswith('cond_provider.') for k in missing_keys])
     print(f'Loading Residual Transformer {res_opt.name} from epoch {ckpt["ep"]}!')
     return res_transformer
 
@@ -908,7 +908,11 @@ if __name__ == '__main__':
     #######################
     vq_opt_path = pjoin(opt.checkpoints_dir, opt.dataset_name, model_opt.vq_name, 'opt.txt')
     vq_opt = get_opt(vq_opt_path, device=opt.device)
-    vq_opt.dim_pose = dim_pose
+    # get_opt() already sets dim_pose correctly from its internal dataset defaults table.
+    # Do NOT override with auto-detected dim_pose — auto-detection may fail when data
+    # directory doesn't exist (e.g., running inference on a different machine),
+    # causing it to fall back to 6 even for 12D datasets like realestate10k_rotmat.
+    print(f'VQ model dim_pose = {vq_opt.dim_pose}')
     vq_model, vq_opt = load_vq_model(vq_opt)
 
     model_opt.num_tokens = vq_opt.nb_code
@@ -1282,17 +1286,17 @@ Usage Examples:
 
 CUDA_VISIBLE_DEVICES=3 python gen_camera.py \
     --dataset_name realestate10k_rotmat \
-    --name mtrans_overfit50_idcond \
-    --res_name rtrans_overfit50_idcond \
-    --conditioning_mode id_embedding \
+    --text_path camera_prompts.txt \
+    --name mtrans_3k_clip_crossattn_reduce \
+    --res_name rtrans_3k_clip_crossattn_reduce \
+    --conditioning_mode clip \
     --gpu_id 0 \
-    --sample_ids "0,1,2,3,4,5,6,7,8,9" \
     --repeat_times 2 \
     --time_steps 10 \
     --cond_scale 3 \
-    --temperature 1.0 \
+    --temperature 0.3 \
     --topkr 0.9 \
-    --ext camera_overfit50_idcond
+    --ext camera_3k_clip_crossattn_reduce_1
 
 python gen_camera.py \
     --dataset_name realestate10k_quat \

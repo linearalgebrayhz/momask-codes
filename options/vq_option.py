@@ -56,6 +56,10 @@ def arg_parse(is_train=False):
     parser.add_argument('--save_latest', default=500, type=int, help='iter save latest model frequency')
     parser.add_argument('--eval_every_e', default=1, type=int, help='save eval results every n epoch')
     parser.add_argument('--eval_on', action="store_true", help='turn off evaluation when there is no pretrained evaluator')
+    parser.add_argument('--evaluator_ckpt', type=str, default=None,
+                        help='Path to pre-trained CLaTr evaluator checkpoint (from train_evaluator.py). '
+                             'When set, replaces the legacy GloVe+BiGRU evaluator with CLaTr metrics '
+                             '(FID, R-Precision, Matching Score in a CLIP-trajectory contrastive space).')
     # parser.add_argument('--early_stop_e', default=5, type=int, help='early stopping epoch')
     parser.add_argument('--feat_bias', type=float, default=5, help='feature bias scaling factor for normalization')
     

@@ -12,6 +12,7 @@ from utils import paramUtil
 import numpy as np
 
 from models.t2m_eval_wrapper import EvaluatorModelWrapper
+from models.evaluator.clatr_models import CLaTrEvalWrapper
 from utils.get_opt import get_opt
 from motion_loaders.dataset_motion_loader import get_dataset_motion_loader
 
@@ -145,10 +146,31 @@ if __name__ == "__main__":
 
     wrapper_opt = get_opt(dataset_opt_path, torch.device('cuda'))
     wrapper_opt.eval_on = opt.eval_on
-    eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
+
+    # Use CLaTr evaluator if checkpoint provided, otherwise fall back to legacy
+    evaluator_ckpt = getattr(opt, 'evaluator_ckpt', None)
+    is_camera_dataset = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
+    if evaluator_ckpt and is_camera_dataset:
+        eval_wrapper = CLaTrEvalWrapper(
+            ckpt_path=evaluator_ckpt,
+            device=opt.device,
+            input_dim=dim_pose,
+        )
+        print(f"[CLaTr] Using CLaTr evaluator from {evaluator_ckpt}")
+    else:
+        eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
+        if is_camera_dataset and not evaluator_ckpt:
+            print("[Warning] No --evaluator_ckpt provided for camera dataset. "
+                  "Using legacy evaluator (metrics may be unreliable). "
+                  "Run train_evaluator.py first to get a CLaTr checkpoint.")
 
     mean = np.load(pjoin(opt.data_root, 'Mean.npy'), allow_pickle=False)
     std = np.load(pjoin(opt.data_root, 'Std.npy'), allow_pickle=False)
+
+    # Register pipeline normalization stats with CLaTr evaluator
+    if evaluator_ckpt and is_camera_dataset and hasattr(eval_wrapper, 'set_pipeline_stats'):
+        eval_wrapper.set_pipeline_stats(
+            torch.from_numpy(mean), torch.from_numpy(std))
 
     train_split_file = pjoin(opt.data_root, 'train.txt')
     val_split_file = pjoin(opt.data_root, 'val.txt')

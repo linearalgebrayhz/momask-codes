@@ -6,6 +6,9 @@ from tqdm import tqdm
 from torch.utils.data._utils.collate import default_collate
 import random
 import codecs as cs
+from pathlib import Path
+from PIL import Image
+import torchvision.transforms as transforms
 
 
 def collate_fn(batch):
@@ -158,6 +161,91 @@ def collate_fn_text2motion_camera_train_frames(batch):
     m_lengths = torch.tensor(m_lengths)
     
     return captions, motions, m_lengths, frame_paths_list  # frame_paths_list is List[List[Path]]
+
+
+def collate_fn_text2motion_camera_train_first_frame(batch):
+    """Collate for first-frame conditioning.
+
+    Expected format: (caption, motion, m_length, first_frame_tensor)
+    where first_frame_tensor is (3, 224, 224) or None.
+    Returns: (captions, motions, m_lengths, first_frame_batch)
+    where first_frame_batch is (B, 3, 224, 224).
+    """
+    batch.sort(key=lambda x: x[2], reverse=True)
+    max_len = batch[0][2]
+
+    captions = []
+    motions = []
+    m_lengths = []
+    first_frames = []
+
+    for item in batch:
+        caption, motion, m_length, first_frame = item
+
+        if motion.shape[0] < max_len:
+            padding = np.zeros((max_len - motion.shape[0], motion.shape[1]))
+            motion = np.concatenate([motion, padding], axis=0)
+
+        captions.append(caption)
+        motions.append(motion)
+        m_lengths.append(m_length)
+        first_frames.append(first_frame)
+
+    motions = torch.from_numpy(np.stack(motions, axis=0))
+    m_lengths = torch.tensor(m_lengths)
+    first_frame_batch = torch.stack(first_frames, dim=0)  # (B, 3, 224, 224)
+
+    return captions, motions, m_lengths, first_frame_batch
+
+
+def collate_fn_text2motion_camera_train_sparse_frames(batch):
+    """Collate for sparse keyframe conditioning (0-4 frames).
+
+    Expected format: (caption, motion, m_length, sparse_frames, visual_valid_mask, visual_indices)
+    where:
+        sparse_frames: (4, 3, 224, 224) tensor with K valid frames + zeros
+        visual_valid_mask: (4,) bool tensor — True for valid frames
+        visual_indices: (4,) int tensor — frame indices in trajectory
+
+    Returns:
+        captions: list of strings
+        motions: (B, max_len, D) tensor
+        m_lengths: (B,) tensor
+        sparse_frames_batch: (B, 4, 3, 224, 224) tensor
+        visual_valid_mask_batch: (B, 4) bool tensor
+        visual_indices_batch: (B, 4) long tensor
+    """
+    batch.sort(key=lambda x: x[2], reverse=True)
+    max_len = batch[0][2]
+
+    captions = []
+    motions = []
+    m_lengths = []
+    sparse_frames_list = []
+    visual_valid_masks = []
+    visual_indices_list = []
+
+    for item in batch:
+        caption, motion, m_length, sparse_frames, visual_valid_mask, visual_indices = item
+
+        if motion.shape[0] < max_len:
+            padding = np.zeros((max_len - motion.shape[0], motion.shape[1]))
+            motion = np.concatenate([motion, padding], axis=0)
+
+        captions.append(caption)
+        motions.append(motion)
+        m_lengths.append(m_length)
+        sparse_frames_list.append(sparse_frames)
+        visual_valid_masks.append(visual_valid_mask)
+        visual_indices_list.append(visual_indices)
+
+    motions = torch.from_numpy(np.stack(motions, axis=0))
+    m_lengths = torch.tensor(m_lengths)
+    sparse_frames_batch = torch.stack(sparse_frames_list, dim=0)      # (B, 4, 3, 224, 224)
+    visual_valid_mask_batch = torch.stack(visual_valid_masks, dim=0)  # (B, 4)
+    visual_indices_batch = torch.stack(visual_indices_list, dim=0)    # (B, 4)
+
+    return captions, motions, m_lengths, sparse_frames_batch, visual_valid_mask_batch, visual_indices_batch
 
 
 class MotionDataset(data.Dataset):
@@ -576,7 +664,8 @@ class Text2MotionDatasetEval(data.Dataset):
 
 
 class Text2MotionDataset(data.Dataset):
-    def __init__(self, opt, mean, std, split_file, load_frames=False):
+    def __init__(self, opt, mean, std, split_file, load_frames=False, load_first_frame=False,
+                 load_sparse_frames=False):
         self.opt = opt
         self.max_length = 20
         self.pointer = 0
@@ -585,9 +674,12 @@ class Text2MotionDataset(data.Dataset):
         
         # Frame loading configuration
         self.load_frames = load_frames
-        if load_frames:
+        self.load_first_frame = load_first_frame
+        self.load_sparse_frames = load_sparse_frames
+        self.max_sparse_frames = 4  # Maximum number of sparse keyframes
+        
+        if load_frames or load_first_frame or load_sparse_frames:
             import json
-            from pathlib import Path
             
             # Use configurable frame directory
             frame_dir_str = getattr(opt, 'frame_dir', 
@@ -600,6 +692,22 @@ class Text2MotionDataset(data.Dataset):
             
             print(f"Frame loading enabled. Frame dir: {self.frame_dir}")
             print(f"Scene ID mapping: {len(self.scene_id_mapping)} scenes")
+            
+            if load_first_frame or load_sparse_frames:
+                # CLIP-standard preprocessing for visual conditioning
+                self.first_frame_transform = transforms.Compose([
+                    transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+                    transforms.CenterCrop(224),
+                    transforms.ToTensor(),
+                    transforms.Normalize(
+                        mean=[0.48145466, 0.4578275, 0.40821073],
+                        std=[0.26862954, 0.26130258, 0.27577711],
+                    ),
+                ])
+                if load_first_frame:
+                    print(f"First-frame (frame-0) conditioning: ENABLED")
+                if load_sparse_frames:
+                    print(f"Sparse keyframe conditioning (0-{self.max_sparse_frames} frames): ENABLED")
 
         data_dict = {}
         id_list = []
@@ -749,6 +857,108 @@ class Text2MotionDataset(data.Dataset):
         # SparseKeyframeEncoder will randomly sample N∈[0,4] indices and load those images
         return frame_files
 
+    def load_first_frame_image(self, scene_id):
+        """Load and preprocess the first (index-0) frame for a scene.
+
+        Args:
+            scene_id: Sequential scene ID (e.g., '000000').
+
+        Returns:
+            Tensor (3, 224, 224) — CLIP-preprocessed RGB image,
+            or zeros if the frame is unavailable.
+        """
+        if scene_id not in self.scene_id_mapping:
+            return torch.zeros(3, 224, 224)
+
+        hash_id = self.scene_id_mapping[scene_id]
+        scene_frame_dir = self.frame_dir / hash_id
+
+        if not scene_frame_dir.exists():
+            return torch.zeros(3, 224, 224)
+
+        frame_files = sorted(scene_frame_dir.glob('frame_*.jpg'))
+        if len(frame_files) == 0:
+            return torch.zeros(3, 224, 224)
+
+        # Always take the first frame (index 0)
+        try:
+            img = Image.open(frame_files[0]).convert('RGB')
+            return self.first_frame_transform(img)
+        except Exception as e:
+            print(f"Warning: failed to load first frame for {scene_id}: {e}")
+            return torch.zeros(3, 224, 224)
+
+    def load_sparse_frames_data(self, scene_id, motion_length, motion_start_idx=0):
+        """Load 0-4 sparse keyframes for a scene.
+
+        Randomly samples K ∈ [0, max_sparse_frames] unique frame indices from the
+        trajectory, loads and preprocesses them. Returns fixed-shape tensors for
+        PyTorch batching.
+
+        Args:
+            scene_id: Sequential scene ID (e.g., '000000').
+            motion_length: Actual trajectory length (number of frames in motion).
+            motion_start_idx: Starting index of the motion crop (for alignment).
+
+        Returns:
+            sparse_frames: (4, 3, 224, 224) tensor — K valid frames + (4-K) zeros.
+            visual_valid_mask: (4,) bool tensor — True for valid frame slots.
+            visual_indices: (4,) long tensor — frame indices in [0, motion_length),
+                            0 for invalid slots.
+        """
+        max_k = self.max_sparse_frames  # 4
+        
+        # Initialize outputs with zeros/False
+        sparse_frames = torch.zeros(max_k, 3, 224, 224)
+        visual_valid_mask = torch.zeros(max_k, dtype=torch.bool)
+        visual_indices = torch.zeros(max_k, dtype=torch.long)
+        
+        # Check if scene has frames
+        if scene_id not in self.scene_id_mapping:
+            return sparse_frames, visual_valid_mask, visual_indices
+        
+        hash_id = self.scene_id_mapping[scene_id]
+        scene_frame_dir = self.frame_dir / hash_id
+        
+        if not scene_frame_dir.exists():
+            return sparse_frames, visual_valid_mask, visual_indices
+        
+        frame_files = sorted(scene_frame_dir.glob('frame_*.jpg'))
+        num_available_frames = len(frame_files)
+        if num_available_frames == 0:
+            return sparse_frames, visual_valid_mask, visual_indices
+        
+        # Randomly determine K ∈ [0, min(max_k, available_frames, motion_length)]
+        max_possible_k = min(max_k, num_available_frames, motion_length)
+        K = random.randint(0, max_possible_k)
+        
+        if K == 0:
+            return sparse_frames, visual_valid_mask, visual_indices
+        
+        # Sample K unique frame indices from [0, motion_length)
+        # These indices are relative to the cropped motion segment
+        sampled_indices = sorted(random.sample(range(motion_length), K))
+        
+        # Load the sampled frames
+        for slot_idx, frame_idx in enumerate(sampled_indices):
+            # Map motion index to actual frame file index
+            # (accounting for the motion crop start)
+            actual_frame_idx = motion_start_idx + frame_idx
+            
+            # Clamp to available frames
+            actual_frame_idx = min(actual_frame_idx, num_available_frames - 1)
+            
+            try:
+                img = Image.open(frame_files[actual_frame_idx]).convert('RGB')
+                sparse_frames[slot_idx] = self.first_frame_transform(img)
+                visual_valid_mask[slot_idx] = True
+                visual_indices[slot_idx] = frame_idx  # Index relative to motion
+            except Exception as e:
+                print(f"Warning: failed to load frame {actual_frame_idx} for {scene_id}: {e}")
+                # Leave as zeros/False
+        
+        return sparse_frames, visual_valid_mask, visual_indices
+
     def __len__(self):
         return len(self.name_list) - self.pointer
 
@@ -789,6 +999,19 @@ class Text2MotionDataset(data.Dataset):
             
             # Return frame paths as list (will be loaded in SparseKeyframeEncoder after sampling)
             return caption, motion, m_length, frame_paths
+        
+        # Load sparse keyframes (0-4 frames) for sparse keyframe conditioning
+        if self.load_sparse_frames:
+            scene_id = self.name_list[idx]
+            sparse_frames, visual_valid_mask, visual_indices = self.load_sparse_frames_data(
+                scene_id, m_length, motion_start_idx)
+            return caption, motion, m_length, sparse_frames, visual_valid_mask, visual_indices
+        
+        # Load first frame for first-frame conditioning
+        if self.load_first_frame:
+            scene_id = self.name_list[idx]
+            first_frame = self.load_first_frame_image(scene_id)  # (3, 224, 224)
+            return caption, motion, m_length, first_frame
         
         # print(word_embeddings.shape, motion.shape)
         # print(tokens)

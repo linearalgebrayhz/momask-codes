@@ -113,6 +113,13 @@ def main():
         help="Batch size for AI captioning (default: 2)",
     )
 
+    parser.add_argument(
+        "--ai-with-scene",
+        action="store_true",
+        help="Use scene-aware prompt (describes what the camera reveals); "
+             "default is motion-only prompt for pipeline verification",
+    )
+
     # Resume
     parser.add_argument(
         "--resume",
@@ -143,6 +150,7 @@ def main():
         ai_batch_size=args.ai_batch_size,
         resume=args.resume,
         filter_min_frames=args.filter_min_frames,
+        ai_with_scene=args.ai_with_scene,
     )
 
     # Print config

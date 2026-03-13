@@ -19,9 +19,10 @@ from utils.fixseed import fixseed
 from utils.paramUtil import t2m_kinematic_chain, kit_kinematic_chain
 from utils.dataset_config import get_unified_dataset_config
 
-from data.t2m_dataset import Text2MotionDataset, Text2MotionDatasetIDWrapped, collate_fn_text2motion_camera_train, collate_fn_text2motion_camera_train_frames, collate_fn_text2motion_id_train
+from data.t2m_dataset import Text2MotionDataset, Text2MotionDatasetIDWrapped, collate_fn_text2motion_camera_train, collate_fn_text2motion_camera_train_frames, collate_fn_text2motion_id_train, collate_fn_text2motion_camera_train_first_frame, collate_fn_text2motion_camera_train_sparse_frames
 from motion_loaders.dataset_motion_loader import get_dataset_motion_loader
 from models.t2m_eval_wrapper import EvaluatorModelWrapper
+from models.evaluator.clatr_models import CLaTrEvalWrapper
 
 
 def plot_t2m(data, save_dir, captions, m_lengths):
@@ -143,6 +144,11 @@ if __name__ == '__main__':
 
     opt.num_tokens = vq_opt.nb_code
 
+    use_first_frame = getattr(opt, 'use_first_frame', False)
+    use_sparse_frames = getattr(opt, 'use_sparse_frames', False)
+    max_sparse_frames = getattr(opt, 'max_sparse_frames', 4)
+    visual_drop_prob = getattr(opt, 'visual_drop_prob', 0.0)
+
     t2m_transformer = MaskTransformer(code_dim=vq_opt.code_dim,
                                       cond_mode='text',
                                       latent_dim=opt.latent_dim,
@@ -160,6 +166,10 @@ if __name__ == '__main__':
                                       conditioning_mode=conditioning_mode,
                                       num_id_samples=getattr(opt, 'num_id_samples', 50),
                                       t5_model_name=getattr(opt, 't5_model_name', 't5-base'),
+                                      use_first_frame=use_first_frame,
+                                      use_sparse_frames=use_sparse_frames,
+                                      max_sparse_frames=max_sparse_frames,
+                                      visual_drop_prob=visual_drop_prob,
                                       opt=opt)
 
     # if opt.fix_token_emb:
@@ -181,9 +191,13 @@ if __name__ == '__main__':
     val_split_file = pjoin(opt.data_root, 'val.txt')
 
     train_dataset = Text2MotionDataset(opt, mean, std, train_split_file, 
-                                       load_frames=getattr(opt, 'use_frames', False))
+                                       load_frames=getattr(opt, 'use_frames', False),
+                                       load_first_frame=use_first_frame,
+                                       load_sparse_frames=use_sparse_frames)
     val_dataset = Text2MotionDataset(opt, mean, std, val_split_file,
-                                     load_frames=getattr(opt, 'use_frames', False))
+                                     load_frames=getattr(opt, 'use_frames', False),
+                                     load_first_frame=use_first_frame,
+                                     load_sparse_frames=use_sparse_frames)
 
     # Wrap datasets for id_embedding mode (adds sample index to each batch)
     if conditioning_mode == 'id_embedding':
@@ -206,7 +220,14 @@ if __name__ == '__main__':
         val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, 
                                  collate_fn=collate_fn, pin_memory=True)
     elif is_camera_dataset:
-        collate_fn = collate_fn_text2motion_camera_train_frames if getattr(opt, 'use_frames', False) else collate_fn_text2motion_camera_train
+        if use_sparse_frames:
+            collate_fn = collate_fn_text2motion_camera_train_sparse_frames
+        elif use_first_frame:
+            collate_fn = collate_fn_text2motion_camera_train_first_frame
+        elif getattr(opt, 'use_frames', False):
+            collate_fn = collate_fn_text2motion_camera_train_frames
+        else:
+            collate_fn = collate_fn_text2motion_camera_train
         train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, 
                                    collate_fn=collate_fn, pin_memory=True)
         val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, 
@@ -237,7 +258,27 @@ if __name__ == '__main__':
     # Add eval_on attribute - set to False for camera datasets or id_embedding mode
     # (id_embedding has no text to evaluate, and typically uses tiny datasets)
     wrapper_opt.eval_on = False if (is_camera_dataset or conditioning_mode == 'id_embedding') else True
-    eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
+
+    # Use CLaTr evaluator if checkpoint provided, otherwise fall back to legacy
+    evaluator_ckpt = getattr(opt, 'evaluator_ckpt', None)
+    if evaluator_ckpt and is_camera_dataset:
+        eval_wrapper = CLaTrEvalWrapper(
+            ckpt_path=evaluator_ckpt,
+            device=opt.device,
+            input_dim=dim_pose,
+        )
+        # Register pipeline normalization stats so the evaluator can
+        # de-normalize from the pipeline's Z-space and re-normalize into
+        # its own Z-space (they may differ).
+        eval_wrapper.set_pipeline_stats(
+            torch.from_numpy(mean), torch.from_numpy(std))
+        print(f"[CLaTr] Using CLaTr evaluator from {evaluator_ckpt}")
+    else:
+        eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
+        if is_camera_dataset and not evaluator_ckpt:
+            print("[Warning] No --evaluator_ckpt provided for camera dataset. "
+                  "Using legacy evaluator (metrics may be unreliable). "
+                  "Run train_evaluator.py first to get a CLaTr checkpoint.")
 
     trainer = MaskTransformerTrainer(opt, t2m_transformer, vq_model)
 

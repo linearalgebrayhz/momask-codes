@@ -91,21 +91,23 @@ def calculate_activation_statistics(activations):
     return mu, cov
 
 
-def calculate_diversity(activation, diversity_times):
+def calculate_diversity(activation, diversity_times, seed=None):
     assert len(activation.shape) == 2
     num_samples = activation.shape[0]
     
+    rng = np.random.RandomState(seed) if seed is not None else np.random
+
     # Handle case where we have fewer samples than diversity_times (debugging scenarios)
     if num_samples <= diversity_times:
         print(f"Warning: Only {num_samples} samples available, but {diversity_times} requested for diversity calculation. Using all available samples.")
         if num_samples <= 1:
             return 0.0  # No diversity with 0 or 1 sample
         # Use all available samples with replacement if necessary
-        first_indices = np.random.choice(num_samples, num_samples, replace=True)
-        second_indices = np.random.choice(num_samples, num_samples, replace=True)
+        first_indices = rng.choice(num_samples, num_samples, replace=True)
+        second_indices = rng.choice(num_samples, num_samples, replace=True)
     else:
-        first_indices = np.random.choice(num_samples, diversity_times, replace=False)
-        second_indices = np.random.choice(num_samples, diversity_times, replace=False)
+        first_indices = rng.choice(num_samples, diversity_times, replace=False)
+        second_indices = rng.choice(num_samples, diversity_times, replace=False)
     
     dist = linalg.norm(activation[first_indices] - activation[second_indices], axis=1)
     return dist.mean()

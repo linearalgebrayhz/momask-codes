@@ -6,6 +6,7 @@ from collections import OrderedDict
 from utils.utils import *
 from os.path import join as pjoin
 from utils.eval_t2m import evaluation_mask_transformer, evaluation_res_transformer
+from utils.clatr_camera_eval import evaluation_mask_transformer_clatr, evaluation_res_transformer_clatr
 from models.mask_transformer.tools import *
 
 from einops import rearrange, repeat
@@ -109,11 +110,34 @@ class BaseTransformerTrainer:
         """Unpack batch, VQ encode, encode frames, downsample m_lens.
 
         Returns:
-            conds, code_idx, m_lens (downsampled), frame_emb, has_frames_flag
+            conds, code_idx, m_lens (downsampled), frame_emb, has_frames_flag,
+            first_frame_pixels (or None),
+            sparse_frames (or None), visual_indices (or None), visual_valid_mask (or None)
         """
-        if len(batch_data) == 4:
-            conds, motion, m_lens, frames_batch = batch_data
-            has_frames = True
+        first_frame_pixels = None
+        sparse_frames = None
+        visual_indices = None
+        visual_valid_mask = None
+        
+        if len(batch_data) == 6:
+            # Sparse keyframe conditioning: (caption, motion, m_len, sparse_frames, visual_valid_mask, visual_indices)
+            conds, motion, m_lens, sparse_frames_data, visual_valid_mask_data, visual_indices_data = batch_data
+            sparse_frames = sparse_frames_data.float().to(self.device)        # (B, 4, 3, 224, 224)
+            visual_valid_mask = visual_valid_mask_data.to(self.device)        # (B, 4) bool
+            visual_indices = visual_indices_data.long().to(self.device)       # (B, 4)
+            has_frames = False
+            frames_batch = None
+        elif len(batch_data) == 4:
+            conds, motion, m_lens, fourth = batch_data
+            # Distinguish first-frame tensor (B,3,224,224) from frame paths (list of lists)
+            if torch.is_tensor(fourth) and fourth.dim() == 4:
+                # First-frame conditioning mode
+                first_frame_pixels = fourth.float().to(self.device)
+                has_frames = False
+                frames_batch = None
+            else:
+                has_frames = True
+                frames_batch = fourth
         else:
             conds, motion, m_lens = batch_data
             frames_batch = None
@@ -134,12 +158,19 @@ class BaseTransformerTrainer:
 
         # Downsample m_lens for VQ tokens
         m_lens = torch.div(m_lens, 4, rounding_mode='floor')
+        
+        # Also downsample visual_indices if using sparse frames
+        # (frame indices need to be mapped to VQ token indices)
+        if visual_indices is not None:
+            visual_indices = torch.div(visual_indices, 4, rounding_mode='floor')
+        
         if torch.is_tensor(conds):
             # id_embedding mode: keep as LongTensor; text mode: float
             conds = conds.to(self.device)
         # else: conds is a list of strings (text mode) — leave as-is
 
-        return conds, code_idx, m_lens, frame_emb, has_frames_flag
+        return (conds, code_idx, m_lens, frame_emb, has_frames_flag, 
+                first_frame_pixels, sparse_frames, visual_indices, visual_valid_mask)
 
     # ── Direction loss ─────────────────────────────────────
 
@@ -284,6 +315,10 @@ class BaseTransformerTrainer:
         t5_weights = [e for e in state_dict.keys() if 'cond_provider.t5_encoder.' in e]
         for e in t5_weights:
             del state_dict[e]
+        # Exclude frozen CLIP image encoder weights (always frozen)
+        clip_vision_weights = [e for e in state_dict.keys() if e.startswith('clip_image_encoder.')]
+        for e in clip_vision_weights:
+            del state_dict[e]
 
         state = {
             self.MODEL_KEY: state_dict,
@@ -311,6 +346,8 @@ class BaseTransformerTrainer:
         # T5 encoder weights are always stripped from checkpoints
         expected_missing.extend([k for k in missing_keys if 'cond_provider.t5_encoder.' in k])
         expected_missing.extend([k for k in missing_keys if k.startswith('frame_')])
+        # CLIP image encoder weights are always stripped from checkpoints
+        expected_missing.extend([k for k in missing_keys if k.startswith('clip_image_encoder.')])
         unexpected_missing = [k for k in missing_keys if k not in expected_missing]
 
         if unexpected_keys:
@@ -507,11 +544,16 @@ class MaskTransformerTrainer(BaseTransformerTrainer):
         self.t2m_transformer = t2m_transformer
 
     def forward(self, batch_data, step=None):
-        conds, code_idx, m_lens, frame_emb, has_frames_flag = self._prepare_batch(batch_data, step)
+        (conds, code_idx, m_lens, frame_emb, has_frames_flag, 
+         first_frame_pixels, sparse_frames, visual_indices, visual_valid_mask) = self._prepare_batch(batch_data, step)
 
         _loss, _pred_ids, _acc = self._model(
             code_idx[..., 0], conds, m_lens,
-            frame_emb=frame_emb, has_frames=has_frames_flag)
+            frame_emb=frame_emb, has_frames=has_frames_flag,
+            first_frame_pixels=first_frame_pixels,
+            sparse_frames=sparse_frames,
+            visual_indices=visual_indices,
+            visual_valid_mask=visual_valid_mask)
 
         base_recon_loss = _loss.item()
 
@@ -533,6 +575,17 @@ class MaskTransformerTrainer(BaseTransformerTrainer):
     def _run_evaluation(self, eval_val_loader, epoch, best_fid, best_div,
                         best_top1, best_top2, best_top3, best_matching,
                         eval_wrapper, plot_eval, save_ckpt, save_anim):
+        is_camera = any(name in self.opt.dataset_name.lower()
+                        for name in ["cam", "estate", "realestate"])
+        use_clatr = is_camera and hasattr(eval_wrapper, 'traj_encoder')
+        if use_clatr:
+            return evaluation_mask_transformer_clatr(
+                self.opt.save_root, eval_val_loader, self._model, self.vq_model,
+                self.logger, epoch,
+                best_fid=best_fid, best_div=best_div,
+                best_top1=best_top1, best_top2=best_top2, best_top3=best_top3,
+                best_matching=best_matching, eval_wrapper=eval_wrapper,
+                plot_func=plot_eval, save_ckpt=save_ckpt, save_anim=save_anim)
         return evaluation_mask_transformer(
             self.opt.save_root, eval_val_loader, self._model, self.vq_model,
             self.logger, epoch,
@@ -554,11 +607,16 @@ class ResidualTransformerTrainer(BaseTransformerTrainer):
         self.res_transformer = res_transformer
 
     def forward(self, batch_data, step=None):
-        conds, code_idx, m_lens, frame_emb, has_frames_flag = self._prepare_batch(batch_data, step)
+        (conds, code_idx, m_lens, frame_emb, has_frames_flag, 
+         first_frame_pixels, sparse_frames, visual_indices, visual_valid_mask) = self._prepare_batch(batch_data, step)
 
         ce_loss, pred_ids, acc = self._model(
             code_idx, conds, m_lens,
-            frame_emb=frame_emb, has_frames=has_frames_flag)
+            frame_emb=frame_emb, has_frames=has_frames_flag,
+            first_frame_pixels=first_frame_pixels,
+            sparse_frames=sparse_frames,
+            visual_indices=visual_indices,
+            visual_valid_mask=visual_valid_mask)
 
         base_recon_loss = ce_loss.item()
 
@@ -580,6 +638,17 @@ class ResidualTransformerTrainer(BaseTransformerTrainer):
     def _run_evaluation(self, eval_val_loader, epoch, best_fid, best_div,
                         best_top1, best_top2, best_top3, best_matching,
                         eval_wrapper, plot_eval, save_ckpt, save_anim):
+        is_camera = any(name in self.opt.dataset_name.lower()
+                        for name in ["cam", "estate", "realestate"])
+        use_clatr = is_camera and hasattr(eval_wrapper, 'traj_encoder')
+        if use_clatr:
+            return evaluation_res_transformer_clatr(
+                self.opt.save_root, eval_val_loader, self._model, self.vq_model,
+                self.logger, epoch,
+                best_fid=best_fid, best_div=best_div,
+                best_top1=best_top1, best_top2=best_top2, best_top3=best_top3,
+                best_matching=best_matching, eval_wrapper=eval_wrapper,
+                plot_func=plot_eval, save_ckpt=save_ckpt, save_anim=save_anim)
         return evaluation_res_transformer(
             self.opt.save_root, eval_val_loader, self._model, self.vq_model,
             self.logger, epoch,

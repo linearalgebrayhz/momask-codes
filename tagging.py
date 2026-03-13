@@ -5,8 +5,8 @@ from pathlib import Path
 nlp = spacy.load("en_core_web_sm")
 
 # Define input and output directories
-input_dir = Path("/home/haozhe/CamTraj/momask-codes/dataset/RealEstate10K_rotmat/untagged_text")
-output_dir = Path("/home/haozhe/CamTraj/momask-codes/dataset/RealEstate10K_rotmat/texts")
+input_dir = Path("/home/haozhe/CamTraj/momask-codes/dataset/RealEstate10K_rotmat_merged/untagged_text")
+output_dir = Path("/home/haozhe/CamTraj/momask-codes/dataset/RealEstate10K_rotmat_merged/texts")
 output_dir.mkdir(exist_ok=True)
 
 # Process each .txt file in the input directory

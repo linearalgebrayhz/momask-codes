@@ -37,14 +37,17 @@ class DatasetConfig:
         self.max_motion_length = 500 if self._is_camera_dataset() else 196
         self.kinematic_chain = paramUtil.kit_kinematic_chain if self._is_camera_dataset() else paramUtil.t2m_kinematic_chain
         
-        # Set dim_pose based on dataset type
-        if self.dataset_name == "t2m":
-            self.dim_pose = 263
-        elif self.dataset_name == "kit":
-            self.dim_pose = 251
-        else:
-            # Camera datasets - will be detected automatically or set to default
-            self.dim_pose = 6  # Default to 6-feature format
+        # Set dim_pose based on dataset type (known defaults per dataset name)
+        _dim_defaults = {
+            't2m': 263,
+            'kit': 251,
+            'cam': 5,
+            'realestate10k_6': 6,
+            'realestate10k_12': 12,
+            'realestate10k_quat': 10,
+            'realestate10k_rotmat': 12,
+        }
+        self.dim_pose = _dim_defaults.get(self.dataset_name, 6)
     
     def _is_camera_dataset(self) -> bool:
         """Check if this is a camera trajectory dataset"""

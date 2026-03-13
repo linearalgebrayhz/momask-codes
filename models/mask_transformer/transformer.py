@@ -161,6 +161,7 @@ class BaseCondTransformer(nn.Module):
       - Condition masking (classifier-free guidance)
       - Weight initialization
       - Frame conditioning modules
+      - First-frame CLIP image conditioning
       - Core transformer encoder
     """
 
@@ -169,7 +170,9 @@ class BaseCondTransformer(nn.Module):
                  clip_version=None, opt=None, use_frames=False, frame_dim=512,
                  finetune_clip=False, finetune_clip_layers=2,
                  conditioning_mode='clip', num_id_samples=50,
-                 t5_model_name='t5-base', **kargs):
+                 t5_model_name='t5-base', use_first_frame=False,
+                 use_sparse_frames=False, max_sparse_frames=4,
+                 visual_drop_prob=0.0, **kargs):
         super().__init__()
         print(f'latent_dim: {latent_dim}, ff_size: {ff_size}, nlayers: {num_layers}, nheads: {num_heads}, dropout: {dropout}')
 
@@ -189,7 +192,14 @@ class BaseCondTransformer(nn.Module):
         self.num_id_samples = num_id_samples
         self.t5_model_name = t5_model_name
         self._use_new_provider = conditioning_mode in ('t5', 'id_embedding')
+        self.use_first_frame = use_first_frame
+        self.use_sparse_frames = use_sparse_frames
+        self.max_sparse_frames = max_sparse_frames
+        self.visual_drop_prob = visual_drop_prob
         print(f'Conditioning mode: {conditioning_mode}')
+        if visual_drop_prob > 0:
+            print(f'Visual CFG dropout: {visual_drop_prob:.2f} '
+                  f'(force_mask=True always drops visual for true unconditional)')
 
         if self._use_new_provider:
             self.cond_provider = ConditioningProvider(
@@ -248,6 +258,44 @@ class BaseCondTransformer(nn.Module):
             self.modality_emb_frame = nn.Parameter(torch.randn(1, 1, self.latent_dim))
             print(f'  Sparse keyframe fusion: enabled')
 
+        # ── First-Frame CLIP Image Conditioning ──
+        if self.use_first_frame:
+            print('First-Frame conditioning: ENABLED')
+            # Frozen CLIP Vision Encoder (lazy import to avoid hard dep on new transformers)
+            from transformers import CLIPVisionModel
+            self.clip_image_encoder = CLIPVisionModel.from_pretrained('openai/clip-vit-base-patch32')
+            for p in self.clip_image_encoder.parameters():
+                p.requires_grad = False
+            self.clip_image_encoder.eval()
+            # CLIP ViT-B/32 pooler_output dim = 768
+            clip_vision_dim = self.clip_image_encoder.config.hidden_size  # 768
+            self.frame_proj = nn.Linear(clip_vision_dim, self.latent_dim)
+            self.frame_ln = nn.LayerNorm(self.latent_dim)
+            print(f'  CLIP Vision: openai/clip-vit-base-patch32 (frozen)')
+            print(f'  Projection: {clip_vision_dim} -> {self.latent_dim} + LayerNorm')
+
+        # ── Sparse Keyframe CLIP Image Conditioning (0-4 frames) ──
+        if self.use_sparse_frames:
+            print(f'Sparse Keyframe conditioning: ENABLED (0-{max_sparse_frames} frames)')
+            # Frozen CLIP Vision Encoder (lazy import)
+            from transformers import CLIPVisionModel
+            if not hasattr(self, 'clip_image_encoder'):
+                self.clip_image_encoder = CLIPVisionModel.from_pretrained('openai/clip-vit-base-patch32')
+                for p in self.clip_image_encoder.parameters():
+                    p.requires_grad = False
+                self.clip_image_encoder.eval()
+            # Trainable projection layers (may already exist from use_first_frame)
+            clip_vision_dim = self.clip_image_encoder.config.hidden_size  # 768
+            if not hasattr(self, 'frame_proj'):
+                self.frame_proj = nn.Linear(clip_vision_dim, self.latent_dim)
+                self.frame_ln = nn.LayerNorm(self.latent_dim)
+            # Learnable temporal positional embedding for visual tokens
+            max_motion_len = getattr(opt, 'max_motion_length', 196)
+            self.visual_pos_embed = nn.Embedding(max_motion_len, self.latent_dim)
+            print(f'  CLIP Vision: openai/clip-vit-base-patch32 (frozen)')
+            print(f'  Projection: {clip_vision_dim} -> {self.latent_dim} + LayerNorm')
+            print(f'  Visual Positional Embedding: {max_motion_len} -> {self.latent_dim}')
+
     # ── CLIP ────────────────────────────────────────────────
 
     def _init_clip(self, clip_version):
@@ -300,6 +348,65 @@ class BaseCondTransformer(nn.Module):
             with torch.no_grad():
                 feat_clip_text = self.clip_model.encode_text(text).float()
         return feat_clip_text
+
+    def encode_first_frame(self, first_frame_pixels):
+        """Encode the first frame via frozen CLIP Vision + trainable projection.
+
+        Args:
+            first_frame_pixels: (B, 3, 224, 224) preprocessed RGB tensor.
+
+        Returns:
+            visual_token: (1, B, D) seq-first, projected and layer-normed.
+        """
+        with torch.no_grad():
+            vision_out = self.clip_image_encoder(pixel_values=first_frame_pixels)
+            # pooler_output: (B, hidden_size=768) — CLS pooled representation
+            pooled = vision_out.pooler_output.float()  # (B, 768)
+        projected = self.frame_proj(pooled)      # (B, latent_dim)
+        projected = self.frame_ln(projected)     # (B, latent_dim)
+        return projected.unsqueeze(0)            # (1, B, latent_dim)
+
+    def encode_sparse_frames(self, sparse_frames, visual_indices, visual_valid_mask):
+        """Encode 0-4 sparse keyframes via frozen CLIP Vision + trainable projection + positional embedding.
+
+        Args:
+            sparse_frames: (B, 4, 3, 224, 224) preprocessed RGB tensor — K valid frames + zeros.
+            visual_indices: (B, 4) long tensor — frame indices in [0, max_motion_length).
+            visual_valid_mask: (B, 4) bool tensor — True for valid frame slots.
+
+        Returns:
+            visual_tokens: (4, B, D) seq-first, projected, layer-normed, and positionally embedded.
+            visual_ignore_mask: (B, 4) bool tensor — True for positions to IGNORE in attention.
+        """
+        B, K, C, H, W = sparse_frames.shape  # K = max_sparse_frames = 4
+        device = sparse_frames.device
+
+        # Reshape for batch encoding: (B*4, 3, 224, 224)
+        flat_frames = sparse_frames.view(B * K, C, H, W)
+
+        with torch.no_grad():
+            vision_out = self.clip_image_encoder(pixel_values=flat_frames)
+            pooled = vision_out.pooler_output.float()  # (B*4, 768)
+
+        # Project and normalize
+        projected = self.frame_proj(pooled)      # (B*4, latent_dim)
+        projected = self.frame_ln(projected)     # (B*4, latent_dim)
+
+        # Reshape back: (B, 4, latent_dim)
+        visual_tokens = projected.view(B, K, self.latent_dim)
+
+        # Add temporal positional embeddings based on frame indices
+        # visual_indices: (B, 4) contains the temporal position of each keyframe
+        pos_emb = self.visual_pos_embed(visual_indices)  # (B, 4, latent_dim)
+        visual_tokens = visual_tokens + pos_emb
+
+        # Convert to seq-first: (4, B, latent_dim)
+        visual_tokens = visual_tokens.permute(1, 0, 2)
+
+        # Convert valid mask to ignore mask (True = IGNORE in PyTorch attention)
+        visual_ignore_mask = ~visual_valid_mask  # (B, 4)
+
+        return visual_tokens, visual_ignore_mask
 
     def encode_condition(self, y, bs, device):
         """Encode condition vector from text / action / uncond.
@@ -359,14 +466,30 @@ class BaseCondTransformer(nn.Module):
         cond: torch.Tensor,
         cond_mask: Optional[torch.Tensor],
         force_mask: bool,
+        visual_token: Optional[torch.Tensor] = None,
+        visual_tokens: Optional[torch.Tensor] = None,
+        visual_ignore_mask: Optional[torch.Tensor] = None,
     ):
         """Project and format the conditioning signal for cross-attention.
+
+        Parameters
+        ----------
+        visual_token : Optional[Tensor]  (1, B, D)
+            First-frame visual token, already projected.  When provided, it is
+            prepended to the conditioning sequence and its mask position is set
+            to *attend* (never masked out).
+        visual_tokens : Optional[Tensor]  (K, B, D) where K = max_sparse_frames
+            Sparse keyframe visual tokens, already projected and positionally embedded.
+            Prepended to the conditioning sequence.
+        visual_ignore_mask : Optional[Tensor]  (B, K)
+            Mask for sparse visual tokens — True = IGNORE (padding position).
+            Required when visual_tokens is provided.
 
         Returns
         -------
         cond_seq : Tensor  (T_cond, B, D)  — seq-first, projected to latent_dim.
-            T_cond = 1  for CLIP / ID / null branches.
-            T_cond = T_text  for T5 conditional branches.
+            T_cond = 1  for CLIP / ID / null branches (possibly +1 with visual).
+            T_cond = T_text  for T5 conditional branches (possibly +K with visual).
         cond_kp : Optional[Tensor]  (B, T_cond)  — True = ignore (key_padding_mask).
             None when every position should be attended to (all modes except T5
             conditional branch with variable-length text).
@@ -379,29 +502,72 @@ class BaseCondTransformer(nn.Module):
         own mask, eliminating the old seq-length dilution from prefix concat.
         """
         if self._use_new_provider:
-            # project_and_prepare handles:
-            #   clip / id  → (1, B, D), no mask
-            #   t5 cond    → (T_text, B, D), (B, T_text) True=pad
-            #   t5 null    → (1, B, D) learned t5_null_proj, no mask
             prefix, prefix_kp, _ = self.cond_provider.project_and_prepare(
                 cond, cond_mask, force_mask=force_mask)
+
+            # Prepend sparse visual tokens if provided (priority over single visual_token)
+            if visual_tokens is not None and visual_ignore_mask is not None:
+                # visual_tokens: (K, B, D)  prefix: (T, B, D)
+                prefix = torch.cat([visual_tokens, prefix], dim=0)  # (K+T, B, D)
+                # Concatenate ignore masks
+                if prefix_kp is not None:
+                    prefix_kp = torch.cat([visual_ignore_mask, prefix_kp], dim=1)  # (B, K+T)
+                else:
+                    # All text tokens were attended; use visual_ignore_mask for visual part
+                    B = visual_tokens.shape[1]
+                    T = prefix.shape[0] - visual_tokens.shape[0]  # text seq len
+                    text_attend_mask = torch.zeros(B, T, dtype=torch.bool, device=visual_tokens.device)
+                    prefix_kp = torch.cat([visual_ignore_mask, text_attend_mask], dim=1)  # (B, K+T)
+
+            # Prepend single visual token if provided (for first_frame mode)
+            elif visual_token is not None:
+                # visual_token: (1, B, D)  prefix: (T, B, D)
+                prefix = torch.cat([visual_token, prefix], dim=0)  # (1+T, B, D)
+                B = visual_token.shape[1]
+                # Visual token is ALWAYS valid (False = attend in key_padding_mask)
+                vis_mask = torch.zeros(B, 1, dtype=torch.bool, device=visual_token.device)
+                if prefix_kp is not None:
+                    prefix_kp = torch.cat([vis_mask, prefix_kp], dim=1)  # (B, 1+T)
+                else:
+                    # All text tokens were attended; add False for visual too → still all-attend
+                    # Return None to keep the "attend all" semantics
+                    pass
+
             return prefix, prefix_kp  # (T, B, D), Optional (B, T)
         else:
             # Legacy path: CLIP / action / uncond
             cond = self.mask_cond(cond, force_mask=force_mask)   # (B, D)
             cond_seq = self.cond_emb(cond).unsqueeze(0)          # (1, B, D)
-            return cond_seq, None
+
+            cond_kp = None
+            
+            # Prepend sparse visual tokens if provided
+            if visual_tokens is not None and visual_ignore_mask is not None:
+                cond_seq = torch.cat([visual_tokens, cond_seq], dim=0)  # (K+1, B, D)
+                # Need to create mask: visual_ignore_mask + attend for text token
+                B = visual_tokens.shape[1]
+                text_mask = torch.zeros(B, 1, dtype=torch.bool, device=visual_tokens.device)
+                cond_kp = torch.cat([visual_ignore_mask, text_mask], dim=1)  # (B, K+1)
+            # Prepend single visual token if provided
+            elif visual_token is not None:
+                cond_seq = torch.cat([visual_token, cond_seq], dim=0)  # (2, B, D)
+                # Both tokens always valid → cond_kp stays None
+
+            return cond_seq, cond_kp
 
     def parameters_wo_clip(self):
-        """Return parameters excluding frozen encoders (CLIP / T5)."""
+        """Return parameters excluding frozen encoders (CLIP text / T5 / CLIP vision)."""
+        frozen_prefixes = ('clip_model.', 'clip_image_encoder.')
         if self._use_new_provider:
             return self.cond_provider.parameters_wo_clip() + [
                 p for n, p in self.named_parameters()
-                if not n.startswith('cond_provider.')]
+                if not n.startswith('cond_provider.') and not any(n.startswith(fp) for fp in frozen_prefixes)]
         if self.finetune_clip:
-            return list(self.parameters())
+            return [p for name, p in self.named_parameters()
+                    if not name.startswith('clip_image_encoder.')]
         else:
-            return [p for name, p in self.named_parameters() if not name.startswith('clip_model.')]
+            return [p for name, p in self.named_parameters()
+                    if not any(name.startswith(fp) for fp in frozen_prefixes)]
 
 
 # ──────────────────── Mask Transformer ────────────────────
@@ -412,7 +578,9 @@ class MaskTransformer(BaseCondTransformer):
                  clip_version=None, opt=None, use_frames=False, frame_dim=512,
                  finetune_clip=False, finetune_clip_layers=2,
                  conditioning_mode='clip', num_id_samples=50,
-                 t5_model_name='t5-base', **kargs):
+                 t5_model_name='t5-base', use_first_frame=False,
+                 use_sparse_frames=False, max_sparse_frames=4,
+                 visual_drop_prob=0.0, **kargs):
         super().__init__(
             code_dim, cond_mode, latent_dim=latent_dim, ff_size=ff_size,
             num_layers=num_layers, num_heads=num_heads, dropout=dropout,
@@ -422,7 +590,11 @@ class MaskTransformer(BaseCondTransformer):
             finetune_clip_layers=finetune_clip_layers,
             conditioning_mode=conditioning_mode,
             num_id_samples=num_id_samples,
-            t5_model_name=t5_model_name, **kargs)
+            t5_model_name=t5_model_name,
+            use_first_frame=use_first_frame,
+            use_sparse_frames=use_sparse_frames,
+            max_sparse_frames=max_sparse_frames,
+            visual_drop_prob=visual_drop_prob, **kargs)
 
         # ── Mask-specific layers ──
         _num_tokens = opt.num_tokens + 2  # mask + pad dummies
@@ -453,17 +625,23 @@ class MaskTransformer(BaseCondTransformer):
         print("Token embedding initialized!")
 
     def trans_forward(self, motion_ids, cond, padding_mask, force_mask=False,
-                      frame_emb=None, has_frames=False, cond_mask=None):
+                      frame_emb=None, has_frames=False, cond_mask=None,
+                      first_frame_pixels=None,
+                      sparse_frames=None, visual_indices=None, visual_valid_mask=None):
         '''
         Cross-attention forward pass — no prefix tokens.
 
-        :param motion_ids:   (B, S)  — VQ token indices
-        :param cond:         (B, raw_cond_dim) or (B, T_text, t5_dim)
-        :param padding_mask: (B, S)  — True = padding (motion_key_padding_mask)
-        :param force_mask:   bool   — True activates CFG null branch
-        :param frame_emb:    (S, B, D) optional sparse keyframe embeddings
-        :param cond_mask:    (B, T_text) bool optional — True = VALID T5 token
-                             Inverted internally to cond_key_padding_mask.
+        :param motion_ids:          (B, S)  — VQ token indices
+        :param cond:                (B, raw_cond_dim) or (B, T_text, t5_dim)
+        :param padding_mask:        (B, S)  — True = padding (motion_key_padding_mask)
+        :param force_mask:          bool   — True activates CFG null branch (drops ALL conditioning
+                                    including visual, for a truly unconditional baseline)
+        :param frame_emb:           (S, B, D) optional sparse keyframe embeddings (legacy ResNet)
+        :param cond_mask:           (B, T_text) bool optional — True = VALID T5 token
+        :param first_frame_pixels:  (B, 3, 224, 224) optional — preprocessed RGB for frame-0
+        :param sparse_frames:       (B, K, 3, 224, 224) optional — sparse keyframe images
+        :param visual_indices:      (B, K) long optional — VQ-level temporal indices of keyframes
+        :param visual_valid_mask:   (B, K) bool optional — True for valid frame slots
         :return: logits (B, num_tokens, S)
         '''
         # ── Motion token embedding ──────────────────────────────────────────
@@ -471,22 +649,54 @@ class MaskTransformer(BaseCondTransformer):
         x = self.input_process(x)           # (S, B, D)  seq-first
         x = self.position_enc(x)
 
-        # Sparse keyframe fusion (additive, no extra sequence positions)
+        # Sparse keyframe fusion (additive, no extra sequence positions) — legacy ResNet path
         if self.use_frames and frame_emb is not None and has_frames:
             f = frame_emb + self.modality_emb_frame
             f = self.position_enc(f)
             x = x + f
 
+        # ── Visual tokens (first-frame and/or sparse CLIP) ──────────────────
+        # When force_mask=True (CFG null branch) we skip ALL visual encoding so
+        # the unconditional baseline is truly unconditioned (no text, no visual).
+        visual_token = None
+        visual_tokens_sparse = None
+        visual_ignore_mask = None
+
+        if not force_mask:
+            # ── First-frame conditioning ──
+            if self.use_first_frame and first_frame_pixels is not None:
+                visual_token = self.encode_first_frame(first_frame_pixels)  # (1, B, D)
+                # Independent per-sample stochastic dropout (training only)
+                if self.training and self.visual_drop_prob > 0:
+                    B = visual_token.shape[1]
+                    keep = torch.bernoulli(
+                        torch.full((B,), 1.0 - self.visual_drop_prob,
+                                   device=visual_token.device)
+                    ).view(1, B, 1)  # 1 = keep, 0 = drop
+                    visual_token = visual_token * keep
+
+            # ── Sparse keyframe conditioning ──
+            if self.use_sparse_frames and sparse_frames is not None:
+                visual_tokens_sparse, visual_ignore_mask = self.encode_sparse_frames(
+                    sparse_frames, visual_indices, visual_valid_mask)  # (K, B, D), (B, K)
+                # Per-sample stochastic dropout: randomly invalidate all K slots for a sample
+                if self.training and self.visual_drop_prob > 0:
+                    B = visual_tokens_sparse.shape[1]
+                    drop = torch.bernoulli(
+                        torch.full((B,), self.visual_drop_prob,
+                                   device=visual_tokens_sparse.device)
+                    ).bool()  # True = drop all frames for that sample
+                    visual_ignore_mask = visual_ignore_mask.clone()
+                    visual_ignore_mask[drop] = True  # mark all K slots as padding
+
         # ── Conditioning: project to (T_cond, B, D) ─────────────────────────
-        # cond_seq : (T_cond, B, D)   — 1 token for CLIP/ID/null, T_text for T5
-        # cond_kp  : (B, T_cond) bool — True = ignore in cross-attn key
-        #            None             — attend to all cond positions
-        cond_seq, cond_kp = self._prepare_crossattn_cond(cond, cond_mask, force_mask)
+        cond_seq, cond_kp = self._prepare_crossattn_cond(
+            cond, cond_mask, force_mask,
+            visual_token=visual_token,
+            visual_tokens=visual_tokens_sparse,
+            visual_ignore_mask=visual_ignore_mask)
 
         # ── Cross-attention stack ────────────────────────────────────────────
-        # motion_key_padding_mask (B, S)  → self-attention
-        # cond_key_padding_mask   (B, T)  → cross-attention
-        # The two masks never mix, eliminating prefix-length dilution.
         for block in self.cross_attn_blocks:
             x = block(
                 x, cond_seq,
@@ -497,11 +707,17 @@ class MaskTransformer(BaseCondTransformer):
         logits = self.output_process(x)     # (B, num_tokens, S)
         return logits
 
-    def forward(self, ids, y, m_lens, frame_emb=None, has_frames=False, return_logits=False):
+    def forward(self, ids, y, m_lens, frame_emb=None, has_frames=False, return_logits=False,
+                first_frame_pixels=None,
+                sparse_frames=None, visual_indices=None, visual_valid_mask=None):
         '''
         :param ids: (b, n)
         :param y: raw text for text, (b,) for action, LongTensor for id_embedding
         :param m_lens: (b,)
+        :param first_frame_pixels: (b, 3, 224, 224) optional first-frame image tensor
+        :param sparse_frames: (b, K, 3, 224, 224) optional sparse keyframe images
+        :param visual_indices: (b, K) long optional temporal indices (VQ-level)
+        :param visual_valid_mask: (b, K) bool optional valid mask
         :param return_logits: if True, also returns logits tensor
         '''
         bs, ntokens = ids.shape
@@ -538,7 +754,11 @@ class MaskTransformer(BaseCondTransformer):
 
         logits = self.trans_forward(x_ids, cond_vector, ~non_pad_mask, force_mask,
                                     frame_emb=frame_emb, has_frames=has_frames,
-                                    cond_mask=cond_mask)
+                                    cond_mask=cond_mask,
+                                    first_frame_pixels=first_frame_pixels,
+                                    sparse_frames=sparse_frames,
+                                    visual_indices=visual_indices,
+                                    visual_valid_mask=visual_valid_mask)
         ce_loss, pred_id, acc = cal_performance(logits, labels, ignore_index=self.mask_id)
 
         if return_logits:
@@ -546,16 +766,24 @@ class MaskTransformer(BaseCondTransformer):
         return ce_loss, pred_id, acc
 
     def forward_with_cond_scale(self, motion_ids, cond_vector, padding_mask,
-                                cond_scale=3, force_mask=False, cond_mask=None):
+                                cond_scale=3, force_mask=False, cond_mask=None,
+                                first_frame_pixels=None,
+                                sparse_frames=None, visual_indices=None, visual_valid_mask=None):
         if force_mask:
+            # Unconditional: no text, no visual
             return self.trans_forward(motion_ids, cond_vector, padding_mask,
                                       force_mask=True, cond_mask=cond_mask)
 
         logits = self.trans_forward(motion_ids, cond_vector, padding_mask,
-                                    cond_mask=cond_mask)
+                                    cond_mask=cond_mask,
+                                    first_frame_pixels=first_frame_pixels,
+                                    sparse_frames=sparse_frames,
+                                    visual_indices=visual_indices,
+                                    visual_valid_mask=visual_valid_mask)
         if cond_scale == 1:
             return logits
 
+        # Null branch: force_mask=True drops text AND visual (true unconditional baseline)
         aux_logits = self.trans_forward(motion_ids, cond_vector, padding_mask,
                                         force_mask=True, cond_mask=cond_mask)
         scaled_logits = aux_logits + (logits - aux_logits) * cond_scale
@@ -564,7 +792,9 @@ class MaskTransformer(BaseCondTransformer):
     @torch.no_grad()
     @eval_decorator
     def generate(self, conds, m_lens, timesteps: int, cond_scale: int,
-                 temperature=1, topk_filter_thres=0.9, gsample=False, force_mask=False):
+                 temperature=1, topk_filter_thres=0.9, gsample=False, force_mask=False,
+                 first_frame_pixels=None,
+                 sparse_frames=None, visual_indices=None, visual_valid_mask=None):
 
         device = next(self.parameters()).device
         seq_len = max(m_lens)
@@ -591,7 +821,11 @@ class MaskTransformer(BaseCondTransformer):
                                                   padding_mask=padding_mask,
                                                   cond_scale=cond_scale,
                                                   force_mask=force_mask,
-                                                  cond_mask=cond_mask)
+                                                  cond_mask=cond_mask,
+                                                  first_frame_pixels=first_frame_pixels,
+                                                  sparse_frames=sparse_frames,
+                                                  visual_indices=visual_indices,
+                                                  visual_valid_mask=visual_valid_mask)
             logits = logits.permute(0, 2, 1)  # (b, seqlen, ntoken)
             filtered_logits = top_k(logits, topk_filter_thres, dim=-1)
 
@@ -607,6 +841,87 @@ class MaskTransformer(BaseCondTransformer):
             probs_without_temperature = logits.softmax(dim=-1)
             scores = probs_without_temperature.gather(2, pred_ids.unsqueeze(dim=-1)).squeeze(-1)
             scores = scores.masked_fill(~is_mask, 1e5)
+
+        ids = torch.where(padding_mask, -1, ids)
+        return ids
+
+    @torch.no_grad()
+    @eval_decorator
+    def generate_infill(self, conds, m_lens, timesteps, cond_scale,
+                        gt_tokens, anchor_mask,
+                        temperature=1, topk_filter_thres=0.9,
+                        gsample=False, force_mask=False):
+        """Generate tokens with fixed GT anchors (oracle infilling).
+
+        The iterative demasking loop proceeds exactly like ``generate()``,
+        but anchor positions are **never** overwritten: they keep their GT
+        token values and are always treated as "high-confidence / unmasked".
+
+        Args:
+            conds:        text conditions (list[str] or LongTensor for id_embedding)
+            m_lens:       (B,) token-level lengths
+            timesteps:    number of iterative demasking steps
+            cond_scale:   classifier-free guidance scale
+            gt_tokens:    (B, S) ground-truth VQ token indices
+            anchor_mask:  (B, S) bool — True = anchor (immutable GT token)
+            temperature, topk_filter_thres, gsample, force_mask: same as generate()
+
+        Returns:
+            ids: (B, S) generated token indices (-1 for padding)
+        """
+        device = next(self.parameters()).device
+        seq_len = max(m_lens)
+        batch_size = len(m_lens)
+
+        cond_vector, _, cond_mask = self.encode_condition(conds, batch_size, device)
+
+        padding_mask = ~lengths_to_mask(m_lens, seq_len)
+
+        # Initialize: anchors get GT values, everything else is masked
+        ids = torch.where(padding_mask, self.pad_id, self.mask_id)
+        ids = torch.where(anchor_mask, gt_tokens, ids)
+
+        # Anchors start with maximum confidence so they are never re-masked
+        scores = torch.where(padding_mask | anchor_mask, 1e5, 0.)
+        starting_temperature = temperature
+
+        for timestep, steps_until_x0 in zip(
+                torch.linspace(0, 1, timesteps, device=device),
+                reversed(range(timesteps))):
+
+            rand_mask_prob = self.noise_schedule(timestep)
+            num_token_masked = torch.round(rand_mask_prob * m_lens).clamp(min=1)
+
+            # Rank by confidence — anchors always have 1e5 so they stay unmasked
+            sorted_indices = scores.argsort(dim=1)
+            ranks = sorted_indices.argsort(dim=1)
+            is_mask = (ranks < num_token_masked.unsqueeze(-1))
+            # Never mask anchors
+            is_mask = is_mask & ~anchor_mask
+            ids = torch.where(is_mask, self.mask_id, ids)
+
+            logits = self.forward_with_cond_scale(ids, cond_vector=cond_vector,
+                                                  padding_mask=padding_mask,
+                                                  cond_scale=cond_scale,
+                                                  force_mask=force_mask,
+                                                  cond_mask=cond_mask)
+            logits = logits.permute(0, 2, 1)
+            filtered_logits = top_k(logits, topk_filter_thres, dim=-1)
+
+            temperature = starting_temperature
+            if gsample:
+                pred_ids = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
+            else:
+                probs = F.softmax(filtered_logits / temperature, dim=-1)
+                pred_ids = Categorical(probs).sample()
+
+            # Only update non-anchor masked positions
+            ids = torch.where(is_mask, pred_ids, ids)
+
+            probs_without_temperature = logits.softmax(dim=-1)
+            scores = probs_without_temperature.gather(2, pred_ids.unsqueeze(dim=-1)).squeeze(-1)
+            # Keep anchors and padding at max confidence
+            scores = scores.masked_fill(~is_mask | anchor_mask, 1e5)
 
         ids = torch.where(padding_mask, -1, ids)
         return ids
@@ -714,7 +1029,9 @@ class ResidualTransformer(BaseCondTransformer):
                  clip_version=None, opt=None, use_frames=False, finetune_clip=False,
                  finetune_clip_layers=2,
                  conditioning_mode='clip', num_id_samples=50,
-                 t5_model_name='t5-base', **kargs):
+                 t5_model_name='t5-base', use_first_frame=False,
+                 use_sparse_frames=False, max_sparse_frames=4,
+                 visual_drop_prob=0.0, **kargs):
         super().__init__(
             code_dim, cond_mode, latent_dim=latent_dim, ff_size=ff_size,
             num_layers=num_layers, num_heads=num_heads, dropout=dropout,
@@ -723,7 +1040,11 @@ class ResidualTransformer(BaseCondTransformer):
             finetune_clip=finetune_clip, finetune_clip_layers=finetune_clip_layers,
             conditioning_mode=conditioning_mode,
             num_id_samples=num_id_samples,
-            t5_model_name=t5_model_name, **kargs)
+            t5_model_name=t5_model_name,
+            use_first_frame=use_first_frame,
+            use_sparse_frames=use_sparse_frames,
+            max_sparse_frames=max_sparse_frames,
+            visual_drop_prob=visual_drop_prob, **kargs)
 
         # ── Residual-specific layers ──
         self.encode_quant = partial(F.one_hot, num_classes=self.opt.num_quantizers)
@@ -794,11 +1115,13 @@ class ResidualTransformer(BaseCondTransformer):
 
         output = torch.einsum('bnc, bcs->bns', output_proj_weight, logits)
         if output_proj_bias is not None:
-            output += output + output_proj_bias.unsqueeze(-1)
+            output += output_proj_bias.unsqueeze(-1)
         return output
 
     def trans_forward(self, motion_codes, qids, cond, padding_mask, force_mask=False,
-                      frame_emb=None, has_frames=False, cond_mask=None):
+                      frame_emb=None, has_frames=False, cond_mask=None,
+                      first_frame_pixels=None,
+                      sparse_frames=None, visual_indices=None, visual_valid_mask=None):
         '''
         Cross-attention forward pass — no prefix tokens.
 
@@ -806,33 +1129,69 @@ class ResidualTransformer(BaseCondTransformer):
         :param qids:         (B,)              — current quantizer layer index
         :param cond:         (B, raw_cond_dim) or (B, T_text, t5_dim)
         :param padding_mask: (B, S)            — True = padding
-        :param force_mask:   bool              — True activates CFG null branch
-        :param frame_emb:    (S, B, D) optional sparse keyframe embeddings
+        :param force_mask:   bool              — True activates CFG null branch (drops ALL
+                             conditioning including visual, for a truly unconditional baseline)
+        :param frame_emb:    (S, B, D) optional sparse keyframe embeddings (legacy ResNet)
         :param cond_mask:    (B, T_text) bool optional — True = VALID T5 token
+        :param first_frame_pixels: (B, 3, 224, 224) optional first-frame image
+        :param sparse_frames:    (B, K, 3, 224, 224) optional sparse keyframe images
+        :param visual_indices:   (B, K) long optional — VQ-level temporal indices
+        :param visual_valid_mask:(B, K) bool optional — True for valid frame slots
         :return: logits (B, code_dim, S)
         '''
         # ── Motion feature embedding ────────────────────────────────────────
         x = self.input_process(motion_codes)    # (S, B, D)  seq-first
         x = self.position_enc(x)
 
-        # Quantizer-level embedding: broadcast-add over sequence positions.
-        # This injects the "which codebook residual layer" signal into every
-        # motion token, replacing the old prepended q_emb prefix token.
+        # Quantizer-level embedding
         q_onehot = self.encode_quant(qids).float().to(x.device)   # (B, num_q)
         q_emb = self.quant_emb(q_onehot)                          # (B, D)
         x = x + q_emb.unsqueeze(0)                                # (S, B, D)
 
-        # Sparse keyframe fusion (additive, no extra sequence positions)
+        # Sparse keyframe fusion (additive, no extra sequence positions) — legacy ResNet path
         if self.use_frames and frame_emb is not None and has_frames:
             f = frame_emb + self.modality_emb_frame
             f = self.position_enc(f)
             x = x + f
 
+        # ── Visual tokens (first-frame and/or sparse CLIP) ──────────────────
+        # When force_mask=True (CFG null branch) we skip ALL visual encoding so
+        # the unconditional baseline is truly unconditioned (no text, no visual).
+        visual_token = None
+        visual_tokens_sparse = None
+        visual_ignore_mask = None
+
+        if not force_mask:
+            # ── First-frame conditioning ──
+            if self.use_first_frame and first_frame_pixels is not None:
+                visual_token = self.encode_first_frame(first_frame_pixels)  # (1, B, D)
+                if self.training and self.visual_drop_prob > 0:
+                    B = visual_token.shape[1]
+                    keep = torch.bernoulli(
+                        torch.full((B,), 1.0 - self.visual_drop_prob,
+                                   device=visual_token.device)
+                    ).view(1, B, 1)
+                    visual_token = visual_token * keep
+
+            # ── Sparse keyframe conditioning ──
+            if self.use_sparse_frames and sparse_frames is not None:
+                visual_tokens_sparse, visual_ignore_mask = self.encode_sparse_frames(
+                    sparse_frames, visual_indices, visual_valid_mask)
+                if self.training and self.visual_drop_prob > 0:
+                    B = visual_tokens_sparse.shape[1]
+                    drop = torch.bernoulli(
+                        torch.full((B,), self.visual_drop_prob,
+                                   device=visual_tokens_sparse.device)
+                    ).bool()
+                    visual_ignore_mask = visual_ignore_mask.clone()
+                    visual_ignore_mask[drop] = True
+
         # ── Conditioning: project to (T_cond, B, D) ─────────────────────────
-        # Exactly the same routing as MaskTransformer; the ResidualTransformer
-        # now also explicitly re-queries the T5/ID sequence at every layer,
-        # eliminating the exposure-bias / signal-dilution from prefix concat.
-        cond_seq, cond_kp = self._prepare_crossattn_cond(cond, cond_mask, force_mask)
+        cond_seq, cond_kp = self._prepare_crossattn_cond(
+            cond, cond_mask, force_mask,
+            visual_token=visual_token,
+            visual_tokens=visual_tokens_sparse,
+            visual_ignore_mask=visual_ignore_mask)
 
         # ── Cross-attention stack ────────────────────────────────────────────
         for block in self.cross_attn_blocks:
@@ -846,30 +1205,43 @@ class ResidualTransformer(BaseCondTransformer):
         return logits
 
     def forward_with_cond_scale(self, motion_codes, q_id, cond_vector, padding_mask,
-                                cond_scale=3, force_mask=False, cond_mask=None):
+                                cond_scale=3, force_mask=False, cond_mask=None,
+                                first_frame_pixels=None,
+                                sparse_frames=None, visual_indices=None, visual_valid_mask=None):
         bs = motion_codes.shape[0]
         qids = torch.full((bs,), q_id, dtype=torch.long, device=motion_codes.device)
         if force_mask:
+            # Unconditional: no text, no visual
             logits = self.trans_forward(motion_codes, qids, cond_vector, padding_mask,
                                         force_mask=True, cond_mask=cond_mask)
             return self.output_project(logits, qids - 1)
 
         logits = self.trans_forward(motion_codes, qids, cond_vector, padding_mask,
-                                    cond_mask=cond_mask)
+                                    cond_mask=cond_mask,
+                                    first_frame_pixels=first_frame_pixels,
+                                    sparse_frames=sparse_frames,
+                                    visual_indices=visual_indices,
+                                    visual_valid_mask=visual_valid_mask)
         logits = self.output_project(logits, qids - 1)
         if cond_scale == 1:
             return logits
 
+        # Null branch: force_mask=True drops text AND visual (true unconditional baseline)
         aux_logits = self.trans_forward(motion_codes, qids, cond_vector, padding_mask,
                                         force_mask=True, cond_mask=cond_mask)
         aux_logits = self.output_project(aux_logits, qids - 1)
         return aux_logits + (logits - aux_logits) * cond_scale
 
-    def forward(self, all_indices, y, m_lens, frame_emb=None, has_frames=False):
+    def forward(self, all_indices, y, m_lens, frame_emb=None, has_frames=False,
+                first_frame_pixels=None,
+                sparse_frames=None, visual_indices=None, visual_valid_mask=None):
         '''
         :param all_indices: (b, n, q)
         :param y: raw text or action labels
         :param m_lens: (b,)
+        :param sparse_frames: (b, 4, 3, 224, 224) optional sparse keyframe images
+        :param visual_indices: (b, 4) long optional temporal indices
+        :param visual_valid_mask: (b, 4) bool optional valid mask
         '''
         self.process_embed_proj_weight()
 
@@ -894,7 +1266,11 @@ class ResidualTransformer(BaseCondTransformer):
 
         logits = self.trans_forward(history_sum, active_q_layers, cond_vector, ~non_pad_mask,
                                     force_mask, frame_emb=frame_emb, has_frames=has_frames,
-                                    cond_mask=cond_mask)
+                                    cond_mask=cond_mask,
+                                    first_frame_pixels=first_frame_pixels,
+                                    sparse_frames=sparse_frames,
+                                    visual_indices=visual_indices,
+                                    visual_valid_mask=visual_valid_mask)
         logits = self.output_project(logits, active_q_layers - 1)
         ce_loss, pred_id, acc = cal_performance(logits, active_indices, ignore_index=self.pad_id)
         return ce_loss, pred_id, acc
@@ -902,7 +1278,9 @@ class ResidualTransformer(BaseCondTransformer):
     @torch.no_grad()
     @eval_decorator
     def generate(self, motion_ids, conds, m_lens, temperature=1,
-                 topk_filter_thres=0.9, cond_scale=2, num_res_layers=-1):
+                 topk_filter_thres=0.9, cond_scale=2, num_res_layers=-1,
+                 first_frame_pixels=None,
+                 sparse_frames=None, visual_indices=None, visual_valid_mask=None):
 
         self.process_embed_proj_weight()
 
@@ -925,7 +1303,11 @@ class ResidualTransformer(BaseCondTransformer):
             history_sum += token_embed.gather(1, gathered_ids)
 
             logits = self.forward_with_cond_scale(history_sum, i, cond_vector, padding_mask,
-                                                  cond_scale=cond_scale, cond_mask=cond_mask)
+                                                  cond_scale=cond_scale, cond_mask=cond_mask,
+                                                  first_frame_pixels=first_frame_pixels,
+                                                  sparse_frames=sparse_frames,
+                                                  visual_indices=visual_indices,
+                                                  visual_valid_mask=visual_valid_mask)
             logits = logits.permute(0, 2, 1)
             filtered_logits = top_k(logits, topk_filter_thres, dim=-1)
             pred_ids = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
