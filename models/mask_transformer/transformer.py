@@ -127,7 +127,17 @@ class CrossAttentionBlock(nn.Module):
         cond: torch.Tensor,
         motion_key_padding_mask: Optional[torch.Tensor] = None,
         cond_key_padding_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_cross_attn_weights: bool = False,
+    ) -> tuple:
+        """Forward pass.
+
+        Returns
+        -------
+        x : Tensor (S, B, D)
+        attn_weights : Optional[Tensor] (B, query_len, key_len)
+            Attention weights averaged over heads.  ``None`` when
+            ``return_cross_attn_weights=False`` (default).
+        """
         # ── 1. Self-Attention (temporal consistency among motion tokens) ──
         x = x + self.self_attn(
             self.norm1(x), self.norm1(x), self.norm1(x),
@@ -138,16 +148,18 @@ class CrossAttentionBlock(nn.Module):
         # ── 2. Cross-Attention (inject T5 / ID semantics into motion) ──
         x_norm = self.norm2(x)
         cond_norm = self.norm2(cond)          # reuse same norm weights (tied)
-        x = x + self.cross_attn(
+        ca_out, ca_weights = self.cross_attn(
             x_norm, cond_norm, cond_norm,
             key_padding_mask=cond_key_padding_mask,
-            need_weights=False,
-        )[0]
+            need_weights=return_cross_attn_weights,
+        )
+        x = x + ca_out
 
         # ── 3. Feed-Forward ──
         x = x + self.ff(self.norm3(x))
 
-        return x
+        # ca_weights shape (when not None): (B, query_len, key_len)
+        return x, ca_weights
 
 
 # ──────────────────── Shared Base Class ────────────────────
@@ -160,20 +172,21 @@ class BaseCondTransformer(nn.Module):
       - Condition encoding (text / action / uncond)
       - Condition masking (classifier-free guidance)
       - Weight initialization
-      - Frame conditioning modules
-      - First-frame CLIP image conditioning
+      - First-frame / sparse CLIP image conditioning
       - Core transformer encoder
     """
 
     def __init__(self, code_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8,
                  num_heads=4, dropout=0.1, clip_dim=512, cond_drop_prob=0.1,
-                 clip_version=None, opt=None, use_frames=False, frame_dim=512,
+                 clip_version=None, opt=None,
                  finetune_clip=False, finetune_clip_layers=2,
                  conditioning_mode='clip', num_id_samples=50,
                  t5_model_name='t5-base', use_first_frame=False,
                  use_sparse_frames=False, max_sparse_frames=4,
                  visual_drop_prob=0.0, **kargs):
         super().__init__()
+        kargs.pop('use_frames', None)
+        kargs.pop('frame_dim', None)
         print(f'latent_dim: {latent_dim}, ff_size: {ff_size}, nlayers: {num_layers}, nheads: {num_heads}, dropout: {dropout}')
 
         self.code_dim = code_dim
@@ -181,7 +194,6 @@ class BaseCondTransformer(nn.Module):
         self.clip_dim = clip_dim
         self.dropout = dropout
         self.opt = opt
-        self.use_frames = use_frames
         self.finetune_clip = finetune_clip
         self.finetune_clip_layers = finetune_clip_layers
         self.cond_mode = cond_mode
@@ -216,10 +228,6 @@ class BaseCondTransformer(nn.Module):
             assert 'num_actions' in kargs
         self.num_actions = kargs.get('num_actions', 1)
 
-        print(f'Frame conditioning: {use_frames}')
-        if use_frames:
-            print(f'  Frame dim: {frame_dim} -> latent_dim: {latent_dim}')
-
         # ── Core network layers ──
         self.input_process = InputProcess(self.code_dim, self.latent_dim)
         self.position_enc = PositionalEncoding(self.latent_dim, self.dropout)
@@ -252,11 +260,6 @@ class BaseCondTransformer(nn.Module):
             # but we still keep a dummy for action/uncond fallback
             if self.cond_mode == 'action':
                 self.cond_emb = nn.Linear(self.num_actions, self.latent_dim)
-
-        # ── Sparse keyframe conditioning ──
-        if self.use_frames:
-            self.modality_emb_frame = nn.Parameter(torch.randn(1, 1, self.latent_dim))
-            print(f'  Sparse keyframe fusion: enabled')
 
         # ── First-Frame CLIP Image Conditioning ──
         if self.use_first_frame:
@@ -569,13 +572,67 @@ class BaseCondTransformer(nn.Module):
             return [p for name, p in self.named_parameters()
                     if not any(name.startswith(fp) for fp in frozen_prefixes)]
 
+    def _run_cross_attn_blocks(
+        self,
+        x: torch.Tensor,
+        cond_seq: torch.Tensor,
+        motion_key_padding_mask: Optional[torch.Tensor],
+        cond_key_padding_mask: Optional[torch.Tensor],
+        return_attn_weights: bool = False,
+        num_capture_layers: int = 2,
+    ) -> tuple:
+        """Run the cross-attention block stack.
+
+        Optionally captures cross-attention weight tensors from the last
+        ``num_capture_layers`` blocks.  This is used for modality-collapse
+        diagnostics — the caller should pass ``return_attn_weights=False``
+        (the default) during normal training / inference so there is zero
+        overhead.
+
+        Parameters
+        ----------
+        x : Tensor (S, B, D)
+        cond_seq : Tensor (T_cond, B, D)
+        motion_key_padding_mask : Optional[Tensor] (B, S)
+        cond_key_padding_mask : Optional[Tensor] (B, T_cond)
+        return_attn_weights : bool
+            When True, capture cross-attention weights from the last
+            ``num_capture_layers`` blocks.
+        num_capture_layers : int
+            How many tail blocks to capture weights from (default 2).
+
+        Returns
+        -------
+        x : Tensor (S, B, D)
+        captured_weights : Optional[List[Tensor]]
+            ``None`` when ``return_attn_weights=False``.
+            Otherwise a list of length ``min(num_capture_layers, num_blocks)``
+            where each element is a Tensor of shape (B, S, T_cond) —
+            cross-attention weights averaged over heads.
+        """
+        n = len(self.cross_attn_blocks)
+        captured_weights: Optional[List] = [] if return_attn_weights else None
+
+        for i, block in enumerate(self.cross_attn_blocks):
+            capture = return_attn_weights and (i >= n - num_capture_layers)
+            x, w = block(
+                x, cond_seq,
+                motion_key_padding_mask=motion_key_padding_mask,
+                cond_key_padding_mask=cond_key_padding_mask,
+                return_cross_attn_weights=capture,
+            )
+            if capture and w is not None:
+                captured_weights.append(w)
+
+        return x, captured_weights
+
 
 # ──────────────────── Mask Transformer ────────────────────
 
 class MaskTransformer(BaseCondTransformer):
     def __init__(self, code_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8,
                  num_heads=4, dropout=0.1, clip_dim=512, cond_drop_prob=0.1,
-                 clip_version=None, opt=None, use_frames=False, frame_dim=512,
+                 clip_version=None, opt=None,
                  finetune_clip=False, finetune_clip_layers=2,
                  conditioning_mode='clip', num_id_samples=50,
                  t5_model_name='t5-base', use_first_frame=False,
@@ -585,8 +642,7 @@ class MaskTransformer(BaseCondTransformer):
             code_dim, cond_mode, latent_dim=latent_dim, ff_size=ff_size,
             num_layers=num_layers, num_heads=num_heads, dropout=dropout,
             clip_dim=clip_dim, cond_drop_prob=cond_drop_prob,
-            clip_version=clip_version, opt=opt, use_frames=use_frames,
-            frame_dim=frame_dim, finetune_clip=finetune_clip,
+            clip_version=clip_version, opt=opt, finetune_clip=finetune_clip,
             finetune_clip_layers=finetune_clip_layers,
             conditioning_mode=conditioning_mode,
             num_id_samples=num_id_samples,
@@ -625,9 +681,10 @@ class MaskTransformer(BaseCondTransformer):
         print("Token embedding initialized!")
 
     def trans_forward(self, motion_ids, cond, padding_mask, force_mask=False,
-                      frame_emb=None, has_frames=False, cond_mask=None,
+                      cond_mask=None,
                       first_frame_pixels=None,
-                      sparse_frames=None, visual_indices=None, visual_valid_mask=None):
+                      sparse_frames=None, visual_indices=None, visual_valid_mask=None,
+                      return_attn_weights=False):
         '''
         Cross-attention forward pass — no prefix tokens.
 
@@ -636,24 +693,21 @@ class MaskTransformer(BaseCondTransformer):
         :param padding_mask:        (B, S)  — True = padding (motion_key_padding_mask)
         :param force_mask:          bool   — True activates CFG null branch (drops ALL conditioning
                                     including visual, for a truly unconditional baseline)
-        :param frame_emb:           (S, B, D) optional sparse keyframe embeddings (legacy ResNet)
         :param cond_mask:           (B, T_text) bool optional — True = VALID T5 token
         :param first_frame_pixels:  (B, 3, 224, 224) optional — preprocessed RGB for frame-0
         :param sparse_frames:       (B, K, 3, 224, 224) optional — sparse keyframe images
         :param visual_indices:      (B, K) long optional — VQ-level temporal indices of keyframes
         :param visual_valid_mask:   (B, K) bool optional — True for valid frame slots
-        :return: logits (B, num_tokens, S)
+        :param return_attn_weights: bool  — When True, also return cross-attention weights
+                                    from the last 2 blocks as a list of (B, S, T_cond) tensors.
+                                    Default False (zero overhead in normal operation).
+        :return: logits (B, num_tokens, S)  [normal]
+                 or (logits, attn_weights_list) when return_attn_weights=True
         '''
         # ── Motion token embedding ──────────────────────────────────────────
         x = self.token_emb(motion_ids)      # (B, S, code_dim)
         x = self.input_process(x)           # (S, B, D)  seq-first
         x = self.position_enc(x)
-
-        # Sparse keyframe fusion (additive, no extra sequence positions) — legacy ResNet path
-        if self.use_frames and frame_emb is not None and has_frames:
-            f = frame_emb + self.modality_emb_frame
-            f = self.position_enc(f)
-            x = x + f
 
         # ── Visual tokens (first-frame and/or sparse CLIP) ──────────────────
         # When force_mask=True (CFG null branch) we skip ALL visual encoding so
@@ -697,17 +751,19 @@ class MaskTransformer(BaseCondTransformer):
             visual_ignore_mask=visual_ignore_mask)
 
         # ── Cross-attention stack ────────────────────────────────────────────
-        for block in self.cross_attn_blocks:
-            x = block(
-                x, cond_seq,
-                motion_key_padding_mask=padding_mask,
-                cond_key_padding_mask=cond_kp,
-            )   # (S, B, D)
+        x, captured_attn_weights = self._run_cross_attn_blocks(
+            x, cond_seq,
+            motion_key_padding_mask=padding_mask,
+            cond_key_padding_mask=cond_kp,
+            return_attn_weights=return_attn_weights,
+        )   # (S, B, D)
 
         logits = self.output_process(x)     # (B, num_tokens, S)
+        if return_attn_weights:
+            return logits, captured_attn_weights
         return logits
 
-    def forward(self, ids, y, m_lens, frame_emb=None, has_frames=False, return_logits=False,
+    def forward(self, ids, y, m_lens, return_logits=False,
                 first_frame_pixels=None,
                 sparse_frames=None, visual_indices=None, visual_valid_mask=None):
         '''
@@ -753,7 +809,6 @@ class MaskTransformer(BaseCondTransformer):
             x_ids = torch.where(mask, self.mask_id, x_ids)
 
         logits = self.trans_forward(x_ids, cond_vector, ~non_pad_mask, force_mask,
-                                    frame_emb=frame_emb, has_frames=has_frames,
                                     cond_mask=cond_mask,
                                     first_frame_pixels=first_frame_pixels,
                                     sparse_frames=sparse_frames,
@@ -770,7 +825,6 @@ class MaskTransformer(BaseCondTransformer):
                                 first_frame_pixels=None,
                                 sparse_frames=None, visual_indices=None, visual_valid_mask=None):
         if force_mask:
-            # Unconditional: no text, no visual
             return self.trans_forward(motion_ids, cond_vector, padding_mask,
                                       force_mask=True, cond_mask=cond_mask)
 
@@ -783,7 +837,6 @@ class MaskTransformer(BaseCondTransformer):
         if cond_scale == 1:
             return logits
 
-        # Null branch: force_mask=True drops text AND visual (true unconditional baseline)
         aux_logits = self.trans_forward(motion_ids, cond_vector, padding_mask,
                                         force_mask=True, cond_mask=cond_mask)
         scaled_logits = aux_logits + (logits - aux_logits) * cond_scale
@@ -1026,7 +1079,7 @@ class ResidualTransformer(BaseCondTransformer):
     def __init__(self, code_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8,
                  cond_drop_prob=0.1, num_heads=4, dropout=0.1, clip_dim=512,
                  shared_codebook=False, share_weight=False,
-                 clip_version=None, opt=None, use_frames=False, finetune_clip=False,
+                 clip_version=None, opt=None, finetune_clip=False,
                  finetune_clip_layers=2,
                  conditioning_mode='clip', num_id_samples=50,
                  t5_model_name='t5-base', use_first_frame=False,
@@ -1036,7 +1089,7 @@ class ResidualTransformer(BaseCondTransformer):
             code_dim, cond_mode, latent_dim=latent_dim, ff_size=ff_size,
             num_layers=num_layers, num_heads=num_heads, dropout=dropout,
             clip_dim=clip_dim, cond_drop_prob=cond_drop_prob,
-            clip_version=clip_version, opt=opt, use_frames=use_frames,
+            clip_version=clip_version, opt=opt,
             finetune_clip=finetune_clip, finetune_clip_layers=finetune_clip_layers,
             conditioning_mode=conditioning_mode,
             num_id_samples=num_id_samples,
@@ -1119,9 +1172,10 @@ class ResidualTransformer(BaseCondTransformer):
         return output
 
     def trans_forward(self, motion_codes, qids, cond, padding_mask, force_mask=False,
-                      frame_emb=None, has_frames=False, cond_mask=None,
+                      cond_mask=None,
                       first_frame_pixels=None,
-                      sparse_frames=None, visual_indices=None, visual_valid_mask=None):
+                      sparse_frames=None, visual_indices=None, visual_valid_mask=None,
+                      return_attn_weights=False):
         '''
         Cross-attention forward pass — no prefix tokens.
 
@@ -1131,13 +1185,16 @@ class ResidualTransformer(BaseCondTransformer):
         :param padding_mask: (B, S)            — True = padding
         :param force_mask:   bool              — True activates CFG null branch (drops ALL
                              conditioning including visual, for a truly unconditional baseline)
-        :param frame_emb:    (S, B, D) optional sparse keyframe embeddings (legacy ResNet)
         :param cond_mask:    (B, T_text) bool optional — True = VALID T5 token
         :param first_frame_pixels: (B, 3, 224, 224) optional first-frame image
         :param sparse_frames:    (B, K, 3, 224, 224) optional sparse keyframe images
         :param visual_indices:   (B, K) long optional — VQ-level temporal indices
         :param visual_valid_mask:(B, K) bool optional — True for valid frame slots
-        :return: logits (B, code_dim, S)
+        :param return_attn_weights: bool — When True, also return cross-attention weights
+                             from the last 2 blocks as a list of (B, S, T_cond) tensors.
+                             Default False (zero overhead in normal operation).
+        :return: logits (B, code_dim, S)  [normal]
+                 or (logits, attn_weights_list) when return_attn_weights=True
         '''
         # ── Motion feature embedding ────────────────────────────────────────
         x = self.input_process(motion_codes)    # (S, B, D)  seq-first
@@ -1147,12 +1204,6 @@ class ResidualTransformer(BaseCondTransformer):
         q_onehot = self.encode_quant(qids).float().to(x.device)   # (B, num_q)
         q_emb = self.quant_emb(q_onehot)                          # (B, D)
         x = x + q_emb.unsqueeze(0)                                # (S, B, D)
-
-        # Sparse keyframe fusion (additive, no extra sequence positions) — legacy ResNet path
-        if self.use_frames and frame_emb is not None and has_frames:
-            f = frame_emb + self.modality_emb_frame
-            f = self.position_enc(f)
-            x = x + f
 
         # ── Visual tokens (first-frame and/or sparse CLIP) ──────────────────
         # When force_mask=True (CFG null branch) we skip ALL visual encoding so
@@ -1194,14 +1245,16 @@ class ResidualTransformer(BaseCondTransformer):
             visual_ignore_mask=visual_ignore_mask)
 
         # ── Cross-attention stack ────────────────────────────────────────────
-        for block in self.cross_attn_blocks:
-            x = block(
-                x, cond_seq,
-                motion_key_padding_mask=padding_mask,
-                cond_key_padding_mask=cond_kp,
-            )   # (S, B, D)
+        x, captured_attn_weights = self._run_cross_attn_blocks(
+            x, cond_seq,
+            motion_key_padding_mask=padding_mask,
+            cond_key_padding_mask=cond_kp,
+            return_attn_weights=return_attn_weights,
+        )   # (S, B, D)
 
         logits = self.output_process(x)         # (B, code_dim, S)
+        if return_attn_weights:
+            return logits, captured_attn_weights
         return logits
 
     def forward_with_cond_scale(self, motion_codes, q_id, cond_vector, padding_mask,
@@ -1211,7 +1264,6 @@ class ResidualTransformer(BaseCondTransformer):
         bs = motion_codes.shape[0]
         qids = torch.full((bs,), q_id, dtype=torch.long, device=motion_codes.device)
         if force_mask:
-            # Unconditional: no text, no visual
             logits = self.trans_forward(motion_codes, qids, cond_vector, padding_mask,
                                         force_mask=True, cond_mask=cond_mask)
             return self.output_project(logits, qids - 1)
@@ -1226,13 +1278,12 @@ class ResidualTransformer(BaseCondTransformer):
         if cond_scale == 1:
             return logits
 
-        # Null branch: force_mask=True drops text AND visual (true unconditional baseline)
         aux_logits = self.trans_forward(motion_codes, qids, cond_vector, padding_mask,
                                         force_mask=True, cond_mask=cond_mask)
         aux_logits = self.output_project(aux_logits, qids - 1)
         return aux_logits + (logits - aux_logits) * cond_scale
 
-    def forward(self, all_indices, y, m_lens, frame_emb=None, has_frames=False,
+    def forward(self, all_indices, y, m_lens,
                 first_frame_pixels=None,
                 sparse_frames=None, visual_indices=None, visual_valid_mask=None):
         '''
@@ -1265,8 +1316,7 @@ class ResidualTransformer(BaseCondTransformer):
         cond_vector, force_mask, cond_mask = self.encode_condition(y, bs, device)
 
         logits = self.trans_forward(history_sum, active_q_layers, cond_vector, ~non_pad_mask,
-                                    force_mask, frame_emb=frame_emb, has_frames=has_frames,
-                                    cond_mask=cond_mask,
+                                    force_mask, cond_mask=cond_mask,
                                     first_frame_pixels=first_frame_pixels,
                                     sparse_frames=sparse_frames,
                                     visual_indices=visual_indices,

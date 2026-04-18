@@ -323,6 +323,62 @@ def orthogonalize_rotation(R: np.ndarray) -> np.ndarray:
     return R_clean
 
 
+def integrate_velocity_to_positions(
+    features: np.ndarray,
+    smooth: bool = True,
+    smooth_sigma: float = 1.5,
+) -> np.ndarray:
+    """Reconstruct camera positions by time-integrating velocity channels.
+
+    Assumes the 12-D feature layout  [x, y, z, dx, dy, dz, rot6d(6)].
+    The first frame's direct position is used as the integration anchor so
+    the reconstructed trajectory shares the same global origin as the
+    position-channel trajectory.
+
+    Integration rule:
+        pos[0]  = features[0, 0:3]          (anchor from position channels)
+        pos[t]  = pos[t-1] + features[t, 3:6]   for t >= 1
+
+    Optionally applies per-axis Gaussian smoothing to remove high-frequency
+    jitter introduced by the discrete summation.
+
+    Args:
+        features:     (N, D) array with D >= 6.  Channels 3-5 must hold the
+                      per-frame velocity (first-order finite difference of
+                      position, as produced by build_12d_features).
+        smooth:       If True, apply 1-D Gaussian smoothing after integration.
+        smooth_sigma: Standard deviation (in frames) for the Gaussian kernel.
+
+    Returns:
+        positions: (N, 3) integrated (and optionally smoothed) positions.
+
+    Raises:
+        ValueError: if features has fewer than 6 channels.
+    """
+    if features.ndim != 2 or features.shape[1] < 6:
+        raise ValueError(
+            f"integrate_velocity_to_positions requires (N, D>=6) features; "
+            f"got shape {features.shape}"
+        )
+    from scipy.ndimage import gaussian_filter1d
+
+    N = len(features)
+    velocities = features[:, 3:6]  # (N, 3)
+
+    positions = np.zeros((N, 3), dtype=np.float64)
+    positions[0] = features[0, :3]  # anchor at measured first-frame position
+    for t in range(1, N):
+        positions[t] = positions[t - 1] + velocities[t]
+
+    if smooth and N > 1:
+        for dim in range(3):
+            positions[:, dim] = gaussian_filter1d(
+                positions[:, dim], sigma=smooth_sigma, mode='nearest'
+            )
+
+    return positions
+
+
 def validate_rotation(R: np.ndarray, tol: float = 0.01) -> np.ndarray:
     """Validate and optionally repair a rotation matrix. SO(3)
 

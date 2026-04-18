@@ -8,6 +8,12 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
+from utils.unified_data_format import (
+    UnifiedCameraData,
+    CameraDataFormat,
+    detect_format_from_dataset_name,
+    gram_schmidt_orthogonalize,
+)
 
 # Add CLaTr to Python path
 CLATR_PATH = "/home/haozhe/CamTraj/CLaTr"
@@ -60,27 +66,71 @@ def euler_to_rotation_6d(euler_angles):
     return rot6d
 
 
-def tkcam_to_clatr_format(tkcam_trajectories):
+def _normalize_format_type(format_type):
+    """Normalize format_type from enum/string/None into CameraDataFormat."""
+    if format_type is None:
+        return None
+    if isinstance(format_type, CameraDataFormat):
+        return format_type
+    if isinstance(format_type, str):
+        key = format_type.strip().upper()
+        if key in CameraDataFormat.__members__:
+            return CameraDataFormat[key]
+    raise ValueError(f"Unsupported format_type: {format_type}")
+
+
+def tkcam_to_clatr_format(tkcam_trajectories, format_type=None, dataset_type=None):
     """
-    Convert TKCAM 6D format (x,y,z,pitch,yaw,roll) to CLaTr 9D format (rot6d[6], trans[3])
+    Convert TKCAM trajectories to CLaTr 9D format (rot6d[6], trans[3]).
     
     Args:
-        tkcam_trajectories: [B, N, 6] tensor with (x, y, z, pitch, yaw, roll)
+        tkcam_trajectories: [B, N, D] tensor
+        format_type: Optional CameraDataFormat / enum name string
+        dataset_type: Optional dataset name string for fallback detection
     
     Returns:
         clatr_trajectories: [B, N, 9] tensor with (rot6d[6], x, y, z)
     """
-    # Split position and rotation
-    position = tkcam_trajectories[..., :3]  # [B, N, 3]
-    euler = tkcam_trajectories[..., 3:]     # [B, N, 3]
-    
-    # Convert Euler angles to 6D rotation
-    rot6d = euler_to_rotation_6d(euler)  # [B, N, 6]
-    
-    # Concatenate: [rot6d (6), translation (3)]
-    clatr_trajectories = torch.cat([rot6d, position], dim=-1)  # [B, N, 9]
-    
-    return clatr_trajectories
+    if tkcam_trajectories.dim() != 3:
+        raise ValueError(f"Expected [B, N, D] trajectories, got {tuple(tkcam_trajectories.shape)}")
+
+    B, N, D = tkcam_trajectories.shape
+    resolved_format = _normalize_format_type(format_type)
+
+    if resolved_format is None and dataset_type:
+        resolved_format = detect_format_from_dataset_name(str(dataset_type))
+
+    # Ambiguous 12D defaults to rotmat for current TKCAM pipeline.
+    if resolved_format is None and D == 12:
+        resolved_format = CameraDataFormat.FULL_12_ROTMAT
+    elif resolved_format is None and D == 10:
+        resolved_format = CameraDataFormat.QUATERNION_10
+    elif resolved_format is None and D == 6:
+        resolved_format = CameraDataFormat.POSITION_ORIENTATION_6
+
+    # Fast path for the canonical format.
+    if resolved_format == CameraDataFormat.FULL_12_ROTMAT:
+        position = tkcam_trajectories[..., :3]
+        rot6d = tkcam_trajectories[..., 6:12]
+        rot6d = gram_schmidt_orthogonalize(rot6d)
+        return torch.cat([rot6d, position], dim=-1)
+
+    # Backward-compatible path for legacy 6D Euler.
+    if resolved_format == CameraDataFormat.POSITION_ORIENTATION_6:
+        position = tkcam_trajectories[..., :3]
+        euler = tkcam_trajectories[..., 3:6]
+        rot6d = euler_to_rotation_6d(euler)
+        return torch.cat([rot6d, position], dim=-1)
+
+    # Generic conversion path for other supported formats.
+    converted = []
+    for i in range(B):
+        unified = UnifiedCameraData(tkcam_trajectories[i], format_type=resolved_format)
+        as_rotmat = unified.to_format(CameraDataFormat.FULL_12_ROTMAT).data
+        position = as_rotmat[:, :3]
+        rot6d = gram_schmidt_orthogonalize(as_rotmat[:, 6:12])
+        converted.append(torch.cat([rot6d, position], dim=-1))
+    return torch.stack(converted, dim=0)
 
 
 class CLaTrEvaluator:
@@ -291,12 +341,14 @@ class CLaTrEvaluator:
         self.frame_model = model
         print("  Frame-trajectory CLaTr model loaded successfully!")
     
-    def convert_tkcam_to_clatr_format(self, trajectories):
+    def convert_tkcam_to_clatr_format(self, trajectories, format_type=None, dataset_type=None):
         """
         Convert TKCAM trajectory format to CLaTr expected format
         
         Args:
-            trajectories: (batch, seq_len, 6) - TKCAM format [x,y,z,pitch,yaw,roll]
+            trajectories: (batch, seq_len, D) - TKCAM format
+            format_type: Optional CameraDataFormat / enum name string
+            dataset_type: Optional dataset name string for fallback detection
         
         Returns:
             Formatted trajectory tensor for CLaTr (batch, seq_len, 9) - [rot6d[6], x, y, z]
@@ -306,12 +358,16 @@ class CLaTrEvaluator:
         
         trajectories = trajectories.to(self.device)
         
-        # Ensure shape is correct (batch, seq_len, 6)
+        # Ensure shape is correct (batch, seq_len, D)
         if len(trajectories.shape) == 2:
             trajectories = trajectories.unsqueeze(0)
         
-        # Convert from TKCAM 6D (x,y,z,pitch,yaw,roll) to CLaTr 9D (rot6d[6], trans[3])
-        trajectories = tkcam_to_clatr_format(trajectories)
+        # Convert from TKCAM trajectory format to CLaTr 9D (rot6d[6], trans[3])
+        trajectories = tkcam_to_clatr_format(
+            trajectories,
+            format_type=format_type,
+            dataset_type=dataset_type,
+        )
         
         return trajectories
     
@@ -320,6 +376,8 @@ class CLaTrEvaluator:
         self,
         trajectories,
         text_features,
+        format_type=None,
+        dataset_type=None,
         masks=None,
         batch_size=64  # Process in smaller batches to avoid OOM
     ):
@@ -328,7 +386,9 @@ class CLaTrEvaluator:
         
         Args:
             trajectories: (N, seq_len, feat_dim) camera trajectories
-            text_features: (N, text_dim) pre-computed CLIP text features  
+            text_features: (N, text_dim) pre-computed CLIP text features
+            format_type: Optional CameraDataFormat / enum name string
+            dataset_type: Optional dataset name string for fallback detection
             masks: (N, seq_len) padding masks (optional)
             batch_size: Batch size for encoding (to avoid OOM)
         
@@ -338,7 +398,11 @@ class CLaTrEvaluator:
         if self.text_model is None:
             raise ValueError("Text model not loaded. Provide text_ckpt_path during init.")
         
-        trajectories = self.convert_tkcam_to_clatr_format(trajectories)
+        trajectories = self.convert_tkcam_to_clatr_format(
+            trajectories,
+            format_type=format_type,
+            dataset_type=dataset_type,
+        )
         
         # Convert to tensors
         if isinstance(text_features, np.ndarray):
@@ -419,6 +483,8 @@ class CLaTrEvaluator:
         self,
         trajectories,
         frame_features,
+        format_type=None,
+        dataset_type=None,
         masks=None,
         batch_size=32  # Process in smaller batches to avoid OOM
     ):
@@ -426,8 +492,10 @@ class CLaTrEvaluator:
         Compute frame-to-trajectory retrieval metrics
         
         Args:
-            trajectories: (N, seq_len, 6) camera trajectories
+            trajectories: (N, seq_len, D) camera trajectories
             frame_features: (N, num_frames, C, H, W) video frames
+            format_type: Optional CameraDataFormat / enum name string
+            dataset_type: Optional dataset name string for fallback detection
             masks: (N, seq_len) padding masks (optional)
             batch_size: Batch size for encoding (to avoid OOM)
         
@@ -438,7 +506,11 @@ class CLaTrEvaluator:
             raise ValueError("Frame model not loaded. Provide frame_ckpt_path during init.")
         
         # Convert trajectories to CLaTr format
-        trajectories = self.convert_tkcam_to_clatr_format(trajectories)
+        trajectories = self.convert_tkcam_to_clatr_format(
+            trajectories,
+            format_type=format_type,
+            dataset_type=dataset_type,
+        )
         
         # Convert to tensors
         if isinstance(trajectories, np.ndarray):
@@ -584,10 +656,10 @@ def evaluate_tkcam_with_clatr(
     clatr_evaluator,
     num_samples=None,
     dataset_type='realestate10k',
+    format_type=None,
     time_steps=18,
     cond_scale=4,
     temperature=1,
-    sparse_keyframe_encoder=None
 ):
     """
     Evaluate TKCAM model using CLaTr metrics
@@ -600,10 +672,10 @@ def evaluate_tkcam_with_clatr(
         clatr_evaluator: CLaTrEvaluator instance
         num_samples: Number of samples to evaluate (None = all)
         dataset_type: Type of dataset for caption handling
+        format_type: Optional CameraDataFormat / enum name string
         time_steps: Number of diffusion steps for generation
         cond_scale: Conditional guidance scale
         temperature: Sampling temperature
-        sparse_keyframe_encoder: SparseKeyframeEncoder for frame-conditioned models (optional)
     
     Returns:
         Dictionary with all CLaTr metrics
@@ -612,9 +684,7 @@ def evaluate_tkcam_with_clatr(
     trans_model.eval()
     if res_model is not None:
         res_model.eval()
-    if sparse_keyframe_encoder is not None:
-        sparse_keyframe_encoder.eval()
-    
+
     all_pred_trajectories = []
     all_gt_trajectories = []
     all_text_features = []
@@ -757,6 +827,8 @@ def evaluate_tkcam_with_clatr(
     gen_metrics, gen_latents = clatr_evaluator.compute_text_trajectory_metrics(
         all_pred_trajectories.numpy(),
         all_text_features.numpy(),
+        format_type=format_type,
+        dataset_type=dataset_type,
         masks=all_masks.numpy()
     )
     clatr_evaluator.print_metrics(gen_metrics, prefix="Generated - ")
@@ -769,6 +841,8 @@ def evaluate_tkcam_with_clatr(
     gt_metrics, gt_latents = clatr_evaluator.compute_text_trajectory_metrics(
         all_gt_trajectories.numpy(),
         all_text_features.numpy(),
+        format_type=format_type,
+        dataset_type=dataset_type,
         masks=all_masks.numpy()
     )
     clatr_evaluator.print_metrics(gt_metrics, prefix="Ground Truth - ")
@@ -810,6 +884,8 @@ def evaluate_tkcam_with_clatr(
             gen_frame_metrics = clatr_evaluator.compute_frame_trajectory_metrics(
                 all_pred_trajectories.numpy(),
                 all_keyframes_tensor.numpy(),
+                format_type=format_type,
+                dataset_type=dataset_type,
                 masks=all_masks.numpy()
             )
             
@@ -818,6 +894,8 @@ def evaluate_tkcam_with_clatr(
             gt_frame_metrics = clatr_evaluator.compute_frame_trajectory_metrics(
                 all_gt_trajectories.numpy(),
                 all_keyframes_tensor.numpy(),
+                format_type=format_type,
+                dataset_type=dataset_type,
                 masks=all_masks.numpy()
             )
             

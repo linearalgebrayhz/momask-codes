@@ -60,7 +60,6 @@ def load_trans_model(model_opt, which_model, clip_version, device):
         clip_dim=512,
         cond_drop_prob=model_opt.cond_drop_prob,
         clip_version=clip_version,
-        use_frames=getattr(model_opt, 'use_frames', False),
         opt=model_opt
     )
     
@@ -72,31 +71,10 @@ def load_trans_model(model_opt, which_model, clip_version, device):
         checkpoint_path = pjoin(model_opt.checkpoints_dir, model_opt.dataset_name, model_opt.name, 'model', base_name + '.tar')
     
     ckpt = torch.load(checkpoint_path, map_location=device)
-    
-    # Check if model was trained with sparse keyframe encoder
-    sparse_keyframe_encoder = None
-    if 'sparse_keyframe_encoder' in ckpt:
-        print("  MaskTransformer was trained with SparseKeyframeEncoder - loading it...")
-        from models.sparse_keyframe_encoder import SparseKeyframeEncoder
-        
-        # Get config from opt if available, otherwise use defaults
-        resnet_arch = getattr(model_opt, 'keyframe_arch', 'resnet18')
-        latent_dim = model_opt.latent_dim
-        
-        sparse_keyframe_encoder = SparseKeyframeEncoder(
-            resnet_arch=resnet_arch,
-            latent_dim=latent_dim,
-            pretrained=False  # Will load from checkpoint
-        ).to(device)
-        
-        sparse_keyframe_encoder.load_state_dict(ckpt['sparse_keyframe_encoder'])
-        sparse_keyframe_encoder.eval()
-        print(f"  ✅ SparseKeyframeEncoder loaded for MaskTransformer ({resnet_arch})")
-    
+
     model_key = 't2m_transformer' if 't2m_transformer' in ckpt else 'trans'
     missing_keys, unexpected_keys = t2m_transformer.load_state_dict(ckpt[model_key], strict=False)
-    
-    # Log any key mismatches but don't fail - filter out modality_emb_frame which is handled by sparse_keyframe_encoder
+
     unexpected_keys_filtered = [k for k in unexpected_keys if k != 'modality_emb_frame']
     
     if len(unexpected_keys_filtered) > 0:
@@ -113,8 +91,8 @@ def load_trans_model(model_opt, which_model, clip_version, device):
                 print(f'  Missing keys: {missing_keys_filtered}')
     
     print(f'Loading Transformer {model_opt.name} from {which_model} (epoch {ckpt.get("ep", "unknown")})')
-    
-    return t2m_transformer, sparse_keyframe_encoder
+
+    return t2m_transformer
 
 
 def load_res_model(res_opt, vq_opt, clip_version, device):
@@ -154,31 +132,9 @@ def load_res_model(res_opt, vq_opt, clip_version, device):
         raise FileNotFoundError(f"No checkpoint found in {model_dir}")
     
     ckpt = torch.load(checkpoint_path, map_location=device)
-    
-    # Check if model was trained with sparse keyframe encoder
-    sparse_keyframe_encoder = None
-    if 'sparse_keyframe_encoder' in ckpt:
-        print("  Model was trained with SparseKeyframeEncoder - loading it...")
-        from models.sparse_keyframe_encoder import SparseKeyframeEncoder
-        
-        # Get config from opt if available, otherwise use defaults
-        resnet_arch = getattr(res_opt, 'keyframe_arch', 'resnet18')
-        latent_dim = res_opt.latent_dim
-        
-        sparse_keyframe_encoder = SparseKeyframeEncoder(
-            resnet_arch=resnet_arch,
-            latent_dim=latent_dim,
-            pretrained=False  # Will load from checkpoint
-        ).to(device)
-        
-        sparse_keyframe_encoder.load_state_dict(ckpt['sparse_keyframe_encoder'])
-        sparse_keyframe_encoder.eval()
-        print(f"  ✅ SparseKeyframeEncoder loaded ({resnet_arch})")
-    
+
     missing_keys, unexpected_keys = res_transformer.load_state_dict(ckpt['res_transformer'], strict=False)
-    
-    # Log any key mismatches but don't fail - this is common with clip_model weights
-    # Filter out the modality_emb_frame which is now handled by sparse_keyframe_encoder
+
     unexpected_keys_filtered = [k for k in unexpected_keys if k != 'modality_emb_frame']
     
     if len(unexpected_keys_filtered) > 0:
@@ -195,8 +151,8 @@ def load_res_model(res_opt, vq_opt, clip_version, device):
                 print(f'  Missing keys: {missing_keys_filtered}')
     
     print(f'Loading Residual Transformer {res_opt.name} from epoch {ckpt["ep"]}')
-    
-    return res_transformer, sparse_keyframe_encoder
+
+    return res_transformer
 
 
 if __name__ == '__main__':
@@ -268,7 +224,6 @@ if __name__ == '__main__':
     
     # Load residual model if specified AND exists
     res_model = None
-    res_sparse_keyframe_encoder = None
     if hasattr(opt, 'res_name') and opt.res_name:
         res_opt_path = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.res_name, 'opt.txt')
         
@@ -278,14 +233,13 @@ if __name__ == '__main__':
             print(f"Loading Residual Transformer: {opt.res_name}")
             print("="*80)
             res_opt = get_opt(res_opt_path, device=opt.device)
-            res_model, res_sparse_keyframe_encoder = load_res_model(res_opt, vq_opt, clip_version, opt.device)
+            res_model = load_res_model(res_opt, vq_opt, clip_version, opt.device)
             assert res_opt.vq_name == model_opt.vq_name
             print(f"✅ Residual model loaded successfully")
         else:
             print(f"\n⚠️  Warning: Residual model '{opt.res_name}' not found at {res_opt_path}")
             print("    Continuing with base transformer only (no residual refinement)")
             res_model = None
-            res_sparse_keyframe_encoder = None
     
     # Initialize CLaTr evaluator
     print("\n" + "="*80)
@@ -347,28 +301,17 @@ if __name__ == '__main__':
         print("="*80)
         
         # Load transformer model
-        t2m_transformer, trans_sparse_keyframe_encoder = load_trans_model(model_opt, file, clip_version, opt.device)
+        t2m_transformer = load_trans_model(model_opt, file, clip_version, opt.device)
         t2m_transformer.eval()
         vq_model.eval()
         if res_model is not None:
             res_model.eval()
-        if trans_sparse_keyframe_encoder is not None:
-            trans_sparse_keyframe_encoder.eval()
-        if res_sparse_keyframe_encoder is not None:
-            res_sparse_keyframe_encoder.eval()
-        
+
         t2m_transformer.to(opt.device)
         vq_model.to(opt.device)
         if res_model is not None:
             res_model.to(opt.device)
-        if trans_sparse_keyframe_encoder is not None:
-            trans_sparse_keyframe_encoder.to(opt.device)
-        if res_sparse_keyframe_encoder is not None:
-            res_sparse_keyframe_encoder.to(opt.device)
-        
-        # Run CLaTr evaluation
-        # Note: For evaluation, we use the transformer's frame encoder (trans_sparse_keyframe_encoder)
-        # The residual transformer's frame encoder (res_sparse_keyframe_encoder) is used during residual refinement
+
         results = evaluate_tkcam_with_clatr(
             eval_val_loader,
             vq_model,
@@ -377,7 +320,7 @@ if __name__ == '__main__':
             clatr_evaluator,
             num_samples=opt.num_eval_samples,
             dataset_type=opt.dataset_name,
-            sparse_keyframe_encoder=trans_sparse_keyframe_encoder  # Use transformer's frame encoder
+            format_type=dataset_config.get('detected_format', None),
         )
         
         # Log results

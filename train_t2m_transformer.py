@@ -19,17 +19,20 @@ from utils.fixseed import fixseed
 from utils.paramUtil import t2m_kinematic_chain, kit_kinematic_chain
 from utils.dataset_config import get_unified_dataset_config
 
-from data.t2m_dataset import Text2MotionDataset, Text2MotionDatasetIDWrapped, collate_fn_text2motion_camera_train, collate_fn_text2motion_camera_train_frames, collate_fn_text2motion_id_train, collate_fn_text2motion_camera_train_first_frame, collate_fn_text2motion_camera_train_sparse_frames
+from data.t2m_dataset import Text2MotionDataset, Text2MotionDatasetIDWrapped, collate_fn_text2motion_camera_train, collate_fn_text2motion_id_train, collate_fn_text2motion_camera_train_first_frame, collate_fn_text2motion_camera_train_sparse_frames
 from motion_loaders.dataset_motion_loader import get_dataset_motion_loader
 from models.t2m_eval_wrapper import EvaluatorModelWrapper
 from models.evaluator.clatr_models import CLaTrEvalWrapper
 
 
-def plot_t2m(data, save_dir, captions, m_lengths):
+def plot_t2m(data, save_dir, captions=None, m_lengths=None):
     data = train_dataset.inv_transform(data)
     
     # Create unified plotting function that handles different camera formats automatically
-    plot_function = create_plotting_function_for_transformer(opt.dataset_name)
+    plot_function = create_plotting_function_for_transformer(
+        opt.dataset_name,
+        vis_vel_integration=getattr(opt, 'vis_vel_integration', False),
+    )
     
     # Call the unified plotting function with all necessary parameters
     plot_function(
@@ -37,7 +40,9 @@ def plot_t2m(data, save_dir, captions, m_lengths):
         fps=fps, 
         radius=radius, 
         joints_num=opt.joints_num,
-        kinematic_chain=kinematic_chain
+        kinematic_chain=kinematic_chain,
+        mean=train_dataset.mean,
+        std=train_dataset.std,
     )
 
 def load_vq_model():
@@ -159,8 +164,6 @@ if __name__ == '__main__':
                                       clip_dim=512,
                                       cond_drop_prob=opt.cond_drop_prob,
                                       clip_version=clip_version,
-                                      use_frames=getattr(opt, 'use_frames', False),
-                                      frame_dim=512,
                                       finetune_clip=getattr(opt, 'finetune_clip', False),
                                       finetune_clip_layers=getattr(opt, 'finetune_clip_layers', 2),
                                       conditioning_mode=conditioning_mode,
@@ -190,12 +193,10 @@ if __name__ == '__main__':
     train_split_file = pjoin(opt.data_root, 'train.txt')
     val_split_file = pjoin(opt.data_root, 'val.txt')
 
-    train_dataset = Text2MotionDataset(opt, mean, std, train_split_file, 
-                                       load_frames=getattr(opt, 'use_frames', False),
+    train_dataset = Text2MotionDataset(opt, mean, std, train_split_file,
                                        load_first_frame=use_first_frame,
                                        load_sparse_frames=use_sparse_frames)
     val_dataset = Text2MotionDataset(opt, mean, std, val_split_file,
-                                     load_frames=getattr(opt, 'use_frames', False),
                                      load_first_frame=use_first_frame,
                                      load_sparse_frames=use_sparse_frames)
 
@@ -224,8 +225,6 @@ if __name__ == '__main__':
             collate_fn = collate_fn_text2motion_camera_train_sparse_frames
         elif use_first_frame:
             collate_fn = collate_fn_text2motion_camera_train_first_frame
-        elif getattr(opt, 'use_frames', False):
-            collate_fn = collate_fn_text2motion_camera_train_frames
         else:
             collate_fn = collate_fn_text2motion_camera_train
         train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True, 
@@ -250,6 +249,13 @@ if __name__ == '__main__':
                                      shuffle=False, drop_last=False,
                                      collate_fn=collate_fn_text2motion_id_train,
                                      pin_memory=True)
+    elif is_camera_dataset and getattr(opt, 'evaluator_ckpt', None):
+        # CLaTr path: same batches as training/val loss so eval matches gen_camera conditioning.
+        eval_val_loader = DataLoader(
+            val_dataset, batch_size=32, num_workers=4,
+            shuffle=False, drop_last=False,
+            collate_fn=collate_fn, pin_memory=True)
+        print("[eval] eval_val_loader: val split + training collate (text / visual aligned with train).")
     else:
         eval_val_loader, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device,
                                                        data_root_override=opt.data_root)

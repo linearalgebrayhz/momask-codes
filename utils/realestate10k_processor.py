@@ -48,6 +48,22 @@ from .unified_data_format import CameraDataFormat, UnifiedCameraData
 class QwenVideoCaptioner:
     """Qwen VL-based video captioning for camera motion analysis."""
 
+    NEW_PROMPT_TEMPLATE = (
+        "You act as a professional cinematographer describing a camera shot."
+        "Given the camera motion sequence reference and frames from the video,"
+        "Your task is to merge the motion sequence with the key scene elements into 1 or 2 fluid sentences.\n\n"
+        "Rules: \n"
+            "1. ABSOLUTE MOTION: You MUST use the provided motion sequence exactly as written. DO NOT alter the directions or sequence."
+            "2. FORMAT: Use 'then' or 'finally' to separate stages. Keep it cinematic but factual.\n\n"
+            "3. For each stage include: movement type (pan/tilt/dolly/truck/arc/pedestal) direction and pace (slow/medium/fast)."
+        "Examples: \n"
+        "- The camera dollies forward with slight shaking, gradually closing the distance between the viewer and the fireplace."
+        "- The camera pans left slowly and smoothly, revealing a stone fireplace. Then it moves along the left wall, maintaining shot angle."
+        "- The camera dollies backward smoothly, revealing a basketball court in the foreground, then continues backward while panning slightly left"
+        "Reference: {guidance}\n\n"
+        "Motion description: "
+    )
+
     # --- Prompt without scene description (pipeline verification) ---
     PROMPT_TEMPLATE_NO_SCENE = (
         "Analyze this camera trajectory ({n_frames} frames from {total_frames}, uniformly sampled).\n\n"
@@ -67,20 +83,19 @@ class QwenVideoCaptioner:
 
     # --- Prompt with scene description (future feature) ---
     PROMPT_TEMPLATE_WITH_SCENE = (
-        "Analyze this real estate camera trajectory ({n_frames} frames from {total_frames}, uniformly sampled).\n\n"
+        "You act as a professional cinematographer describing a camera shot."
+        "Given the camera motion sequence reference and {n_frames} frames from {total_frames} uniformly sampled frames from the video,"
+        "Your task is to merge the motion sequence with the key scene elements into 1 or 2 fluid sentences.\n\n"
+        "Rules: \n"
+            "1. ABSOLUTE MOTION: You MUST use the provided motion sequence exactly as written. DO NOT alter the directions or sequence."
+            "2. FORMAT: Use 'then' or 'finally' to separate stages. Keep it cinematic but factual.\n\n"
+            "3. For each stage include: movement type (pan/tilt/dolly/truck/arc/pedestal) direction and pace (slow/medium/fast)."
+        "Examples: \n"
+        "- The camera dollies forward with slight shaking, gradually closing the distance between the viewer and the fireplace."
+        "- The camera pans left slowly and smoothly, revealing a stone fireplace. Then it moves along the left wall, maintaining shot angle."
+        "- The camera dollies backward smoothly, revealing a basketball court in the foreground, then continues backward while panning slightly left"
         "Reference: {guidance}\n\n"
-        "Describe every motion stage and what is revealed in 1-2 sentences using 'then' or "
-        "'finally' to separate stages. "
-        "If the visual motion clearly conflicts with the reference "
-        "(e.g., forward vs backward), prioritize what you see and append [CONFLICT].\n\n"
-        "For each stage include: movement type (pan/tilt/dolly/truck/arc/pedestal), "
-        "direction, pace (slow/medium/fast), quality (smooth/shaky), and what the camera "
-        "reveals or focuses on. Always moving, never static.\n\n"
-        "Examples:\n"
-        '- "The camera pans left across the living room, then dollies forward toward the fireplace, highlighting the decor."\n'
-        '- "The camera tilts up from the garden path while dollying forward, then arcs right to reveal the house facade."\n'
-        '- "The camera trucks right along the kitchen counter, then pulls back steadily revealing the open-plan space."\n\n'
-        "Scene and motion description:"
+        "Motion description: "
     )
 
     # Default template alias (no-scene, used when with_scene=False)
@@ -682,7 +697,7 @@ class RealEstate10KProcessor:
     def _generate_guidance(self) -> str:
         """Build a deterministic motion description from relative motion data.
 
-        Uses forward-vector analysis instead of Euler angles.
+        Uses integrated local velocity and forward-vector analysis.
         This text is passed to the AI captioner as geometric reference.
         """
         if not self.relative_motion_data or len(self.relative_motion_data) < 2:
@@ -697,30 +712,16 @@ class RealEstate10KProcessor:
 
         parts: List[str] = []
 
-        # --- Translation (OpenGL: +X right, +Y up, -Z forward) ---
-        total_t = translations[-1] - translations[0]
-        abs_t = np.abs(total_t)
-        max_t = float(np.max(abs_t))
+        # --- Translation via integrated local velocity ---
+        # OpenGL camera local axes: +X right, +Y up, -Z forward.
+        v_world = np.diff(translations, axis=0)
+        r_c2w = rotations[:-1]
+        r_w2c = np.transpose(r_c2w, (0, 2, 1))
+        v_local = np.einsum("nij,nj->ni", r_w2c, v_world)
 
-        if max_t > 0.10:
-            cands: List[Tuple[float, str]] = []
-            if abs_t[0] > 0.10 and abs_t[0] >= 0.6 * max_t:
-                cands.append(
-                    (abs_t[0], "tracks right" if total_t[0] > 0 else "tracks left")
-                )
-            if abs_t[1] > 0.10 and abs_t[1] >= 0.6 * max_t:
-                cands.append(
-                    (abs_t[1], "moves up" if total_t[1] > 0 else "moves down")
-                )
-            if abs_t[2] > 0.10 and abs_t[2] >= 0.6 * max_t:
-                cands.append(
-                    (
-                        abs_t[2],
-                        "dollies forward" if total_t[2] < 0 else "dollies backward",
-                    )
-                )
-            cands.sort(key=lambda x: x[0], reverse=True)
-            parts.extend(c[1] for c in cands[:2])
+        # Filter tiny COLMAP jitter before integration.
+        v_local[np.abs(v_local) < 0.005] = 0.0
+        accumulated_local_t = np.sum(v_local, axis=0)
 
         # --- Rotation (from forward vector change, no Euler conversion) ---
         # OpenGL: forward = -col2 of R
@@ -735,9 +736,37 @@ class RealEstate10KProcessor:
         pitch1 = np.arcsin(np.clip(fwd1[1], -1, 1))
         dpitch = pitch1 - pitch0
 
-        if abs(dyaw) > 0.12:
-            parts.append("pans right" if dyaw > 0 else "pans left")
-        if abs(dpitch) > 0.10:
+        t_thresh = 0.10
+        yaw_thresh = 0.12
+        pitch_thresh = 0.10
+
+        is_panning = abs(dyaw) > yaw_thresh
+        is_trucking = abs(accumulated_local_t[0]) > t_thresh
+
+        # Joint kinematic branch: panning + trucking => cinematic arc/orbit.
+        if is_panning and is_trucking:
+            parts.append("arcs right" if dyaw > 0 else "arcs left")
+        else:
+            if is_trucking:
+                parts.append(
+                    "tracks right"
+                    if accumulated_local_t[0] > 0
+                    else "tracks left"
+                )
+            if is_panning:
+                parts.append("pans right" if dyaw > 0 else "pans left")
+
+        if abs(accumulated_local_t[1]) > t_thresh:
+            parts.append(
+                "moves up" if accumulated_local_t[1] > 0 else "moves down"
+            )
+        if abs(accumulated_local_t[2]) > t_thresh:
+            parts.append(
+                "dollies forward"
+                if accumulated_local_t[2] < 0
+                else "dollies backward"
+            )
+        if abs(dpitch) > pitch_thresh:
             parts.append("tilts up" if dpitch > 0 else "tilts down")
 
         if not parts:

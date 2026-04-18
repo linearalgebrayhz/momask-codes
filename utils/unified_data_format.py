@@ -57,9 +57,9 @@ class UnifiedCameraData:
         elif self.num_features == 10:
             return CameraDataFormat.QUATERNION_10
         elif self.num_features == 12:
-            # Ambiguous - could be EULER or ROTMAT. Caller should specify explicitly or use dataset name
-            # Default to EULER for backward compatibility
-            return CameraDataFormat.FULL_12_EULER
+            # Ambiguous in principle, but the active TKCAM pipeline uses 12D rotmat.
+            # Prefer ROTMAT by default; pass format_type explicitly for Euler datasets.
+            return CameraDataFormat.FULL_12_ROTMAT
         else:
             raise ValueError(f"Unsupported data format with {self.num_features} features. "
                            f"Supported formats: 5, 6, 10, or 12 features.")
@@ -344,12 +344,11 @@ def detect_dataset_format(data_root: str, sample_file: str = None) -> CameraData
         elif num_features == 10:
             return CameraDataFormat.QUATERNION_10
         elif num_features == 12:
-            # Disambiguate 12D: check dataset name from path for rotmat vs euler
+            # Disambiguate 12D: check dataset name/path. Default to rotmat.
             path_str = str(data_root).lower()
-            if 'rotmat' in path_str or 'rot_mat' in path_str:
-                return CameraDataFormat.FULL_12_ROTMAT
-            else:
+            if 'euler' in path_str:
                 return CameraDataFormat.FULL_12_EULER
+            return CameraDataFormat.FULL_12_ROTMAT
         else:
             raise ValueError(f"Unsupported format with {num_features} features")
             
@@ -578,6 +577,9 @@ def detect_format_from_dataset_name(dataset_name: str) -> Optional[CameraDataFor
     """
     dataset_name_lower = dataset_name.lower()
     
+    # Check for explicit Euler marker first.
+    if 'euler' in dataset_name_lower:
+        return CameraDataFormat.FULL_12_EULER
     # Check for rotation matrix format first (more specific)
     if 'rotmat' in dataset_name_lower or 'rot_mat' in dataset_name_lower:
         return CameraDataFormat.FULL_12_ROTMAT
@@ -586,7 +588,8 @@ def detect_format_from_dataset_name(dataset_name: str) -> Optional[CameraDataFor
         return CameraDataFormat.QUATERNION_10
     # Check for specific dimension markers
     elif '12' in dataset_name_lower:
-        return CameraDataFormat.FULL_12_EULER
+        # Ambiguous in naming, but pipeline default is now 12D rotmat.
+        return CameraDataFormat.FULL_12_ROTMAT
     elif '10' in dataset_name_lower:
         return CameraDataFormat.QUATERNION_10
     elif '6' in dataset_name_lower:

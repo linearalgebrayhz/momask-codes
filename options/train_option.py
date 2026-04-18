@@ -41,11 +41,18 @@ class TrainT2MOptions(BaseOptions):
         self.parser.add_argument('--evaluator_ckpt', type=str, default=None,
                                 help='Path to pre-trained CLaTr evaluator checkpoint. '
                                      'Replaces legacy GloVe+BiGRU evaluator with CLaTr metrics.')
+        self.parser.add_argument('--eval_time_steps', type=int, default=18,
+                                help='Demasking steps for mask transformer during CLaTr eval (align with gen_camera --time_steps).')
+        self.parser.add_argument('--eval_mask_cond_scale', type=float, default=3.0,
+                                help='CFG scale for mask stage during CLaTr eval.')
+        self.parser.add_argument('--eval_res_cond_scale', type=float, default=5.0,
+                                help='CFG scale for residual stage during CLaTr eval (matches gen_camera default).')
+        self.parser.add_argument('--eval_temperature', type=float, default=1.0,
+                                help='Sampling temperature during CLaTr eval.')
+        self.parser.add_argument('--eval_topkr', type=float, default=0.9,
+                                help='Top-k filtering threshold during CLaTr mask eval.')
 
         '''Frame Conditioning'''
-        self.parser.add_argument('--use_frames', action="store_true", help='Enable sparse keyframe conditioning with ResNet')
-        self.parser.add_argument('--keyframe_arch', type=str, default='resnet18', choices=['resnet18', 'resnet34'], 
-                                help='ResNet architecture for keyframe encoding')
         self.parser.add_argument('--use_first_frame', action="store_true",
                                 help='Enable First-Frame (frame-0) visual conditioning via frozen CLIP image encoder. '
                                      'Concatenates a visual token to T5/CLIP text tokens in cross-attention.')
@@ -66,6 +73,12 @@ class TrainT2MOptions(BaseOptions):
         self.parser.add_argument('--direction_loss_weight', type=float, default=0.1, help='Weight for direction contrastive loss (default: 0.1)')
         self.parser.add_argument('--smooth_loss_weight', type=float, default=0.0, help='Weight for trajectory smoothness regularization (default: 0.0 = disabled)')
         
+        '''Visualization'''
+        self.parser.add_argument('--vis_vel_integration', action="store_true",
+                                help='Also generate visualizations reconstructed via velocity-channel '
+                                     'time-integration (cumulative sum of dx/dy/dz) with Gaussian '
+                                     'smoothing, alongside the standard position-based visualization.')
+
         '''Mixed Precision Training'''
         self.parser.add_argument('--use_amp', action="store_true", help='Enable automatic mixed precision (FP16) training for 2x speedup')
         

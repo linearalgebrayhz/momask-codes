@@ -6,6 +6,21 @@ from torch.utils.data import DataLoader
 from utils.get_opt import get_opt
 
 def get_dataset_motion_loader(opt_path, batch_size, fname, device, load_frames=False, data_root_override=None):
+    """Create evaluation dataloader for motion datasets.
+
+    Mean/std are loaded from opt.meta_dir (e.g. checkpoints/dataset_name/Comp_v6_KLD005/meta).
+    For camera datasets, ensure that meta has format-specific mean.npy, std.npy matching the
+    dataset the evaluator was trained on (e.g. RealEstate10K_rotmat_5k). You can copy meta
+    from the dataset or from a VQ run's meta folder once; no need to override per VQ retrain.
+
+    Args:
+        opt_path: Path to opt.txt (defines dataset_name, checkpoints_dir, name, etc.)
+        batch_size: Batch size for the loader
+        fname: Split name ('train', 'val', 'test')
+        device: Torch device
+        load_frames: Whether to load frame images
+        data_root_override: Override data_root (e.g. for overfit experiments)
+    """
     opt = get_opt(opt_path, device)
 
     # Override data_root if provided (e.g., for overfit experiments)

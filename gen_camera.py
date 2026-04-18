@@ -1,28 +1,52 @@
 import os
 from os.path import join as pjoin
 from pathlib import Path
+import json
+
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend — must be set before any pyplot import
 
 import torch
-import torch.nn.functional as F
 
 from models.mask_transformer.transformer import MaskTransformer, ResidualTransformer
-from models.vq.model import RVQVAE, LengthEstimator
+from models.vq.model import RVQVAE
 
 from options.eval_option import EvalT2MOptions
 from utils.get_opt import get_opt
 
 from utils.fixseed import fixseed
-from utils.plot_script import plot_3d_motion
 from utils.unified_data_format import UnifiedCameraData, CameraDataFormat
 from utils.dataset_config import get_unified_dataset_config
 from utils.camera_geometry import (
-    sixd_to_matrix, forward_from_sixd, to_mpl, matrix_to_sixd,
+    forward_from_sixd, to_mpl,
 )
 
 import numpy as np
 from torch.distributions.categorical import Categorical
 from PIL import Image
 clip_version = 'ViT-B/32'
+
+
+def _resolve_text_conditioning(ckpt_opt, cli_opt, role='model'):
+    """Use text-conditioning settings from checkpoint opt.txt, not only CLI defaults.
+
+    Training often uses ``--conditioning_mode t5`` while EvalT2MOptions defaults to
+    ``clip``. Building the wrong module layout makes ``load_state_dict`` look OK
+    (strict=False) but encodes prompts with the wrong pathway — a common source of
+    collapsed / text-agnostic generations at inference.
+    """
+    cm_saved = getattr(ckpt_opt, 'conditioning_mode', None)
+    cm_cli = getattr(cli_opt, 'conditioning_mode', 'clip')
+    if cm_saved is not None and cm_saved != cm_cli:
+        print(
+            f'[gen_camera] {role}: using conditioning_mode={cm_saved!r} from opt.txt '
+            f'(CLI was {cm_cli!r}).',
+        )
+    cm = cm_saved if cm_saved is not None else cm_cli
+    num_id = getattr(ckpt_opt, 'num_id_samples', getattr(cli_opt, 'num_id_samples', 50))
+    t5_name = getattr(ckpt_opt, 't5_model_name', getattr(cli_opt, 't5_model_name', 't5-base'))
+    return cm, num_id, t5_name
+
 
 def load_vq_model(vq_opt):
     vq_model = RVQVAE(vq_opt,
@@ -72,8 +96,10 @@ def load_vq_model(vq_opt):
     
     return vq_model, vq_opt
 
-def load_trans_model(model_opt, opt, which_model):
-    conditioning_mode = getattr(opt, 'conditioning_mode', 'clip')
+def load_trans_model(model_opt, opt, which_model, text_cond=None):
+    if text_cond is None:
+        text_cond = _resolve_text_conditioning(model_opt, opt, role='mask_transformer')
+    conditioning_mode, num_id_samples, t5_model_name = text_cond
     t2m_transformer = MaskTransformer(code_dim=model_opt.code_dim,
                                       cond_mode='text',
                                       latent_dim=model_opt.latent_dim,
@@ -85,22 +111,38 @@ def load_trans_model(model_opt, opt, which_model):
                                       cond_drop_prob=model_opt.cond_drop_prob,
                                       clip_version=clip_version,
                                       conditioning_mode=conditioning_mode,
-                                      num_id_samples=getattr(opt, 'num_id_samples', 50),
-                                      t5_model_name=getattr(opt, 't5_model_name', 't5-base'),
+                                      num_id_samples=num_id_samples,
+                                      t5_model_name=t5_model_name,
+                                      use_first_frame=getattr(model_opt, 'use_first_frame', False),
+                                      use_sparse_frames=getattr(model_opt, 'use_sparse_frames', False),
+                                      max_sparse_frames=getattr(model_opt, 'max_sparse_frames', 4),
+                                      visual_drop_prob=getattr(model_opt, 'visual_drop_prob', 0.0),
                                       opt=model_opt)
-    ckpt = torch.load(pjoin(model_opt.checkpoints_dir, model_opt.dataset_name, model_opt.name, 'model', which_model),
-                      map_location='cpu')
+    model_path = pjoin(model_opt.checkpoints_dir, model_opt.dataset_name, model_opt.name, 'model', which_model)
+    root_path = pjoin(model_opt.checkpoints_dir, model_opt.dataset_name, model_opt.name, which_model)
+    if os.path.exists(model_path):
+        ckpt_path = model_path
+    elif os.path.exists(root_path):
+        ckpt_path = root_path
+        print(f'  Loading from root (CLaTr eval saves net_best_fid to root): {which_model}')
+    else:
+        raise FileNotFoundError(f'Checkpoint not found: {model_path} or {root_path}')
+    ckpt = torch.load(ckpt_path, map_location='cpu')
     model_key = 't2m_transformer' if 't2m_transformer' in ckpt else 'trans'
     missing_keys, unexpected_keys = t2m_transformer.load_state_dict(ckpt[model_key], strict=False)
-    assert len(unexpected_keys) == 0
-    assert all([k.startswith('clip_model.') or k.startswith('cond_provider.') for k in missing_keys])
+    assert len(unexpected_keys) == 0, f'Unexpected keys in MaskTransformer: {unexpected_keys}'
+    allowed = ('clip_model.', 'cond_provider.', 'clip_image_encoder.')
+    assert all(any(k.startswith(p) for p in allowed) for k in missing_keys), \
+        f'Missing trainable keys in MaskTransformer: {missing_keys}'
     print(f'Loading Transformer {opt.name} from epoch {ckpt["ep"]}!')
     return t2m_transformer
 
-def load_res_model(res_opt, vq_opt, opt):
+def load_res_model(res_opt, vq_opt, opt, text_cond=None):
     res_opt.num_quantizers = vq_opt.num_quantizers
     res_opt.num_tokens = vq_opt.nb_code
-    conditioning_mode = getattr(opt, 'conditioning_mode', 'clip')
+    if text_cond is None:
+        text_cond = _resolve_text_conditioning(res_opt, opt, role='res_transformer')
+    conditioning_mode, num_id_samples, t5_model_name = text_cond
     res_transformer = ResidualTransformer(code_dim=vq_opt.code_dim,
                                             cond_mode='text',
                                             latent_dim=res_opt.latent_dim,
@@ -114,28 +156,53 @@ def load_res_model(res_opt, vq_opt, opt):
                                             share_weight=res_opt.share_weight,
                                             clip_version=clip_version,
                                             conditioning_mode=conditioning_mode,
-                                            num_id_samples=getattr(opt, 'num_id_samples', 50),
-                                            t5_model_name=getattr(opt, 't5_model_name', 't5-base'),
+                                            num_id_samples=num_id_samples,
+                                            t5_model_name=t5_model_name,
+                                            use_first_frame=getattr(res_opt, 'use_first_frame', False),
+                                            use_sparse_frames=getattr(res_opt, 'use_sparse_frames', False),
+                                            max_sparse_frames=getattr(res_opt, 'max_sparse_frames', 4),
+                                            visual_drop_prob=getattr(res_opt, 'visual_drop_prob', 0.0),
                                             opt=res_opt)
 
     # Choose checkpoint file based on dataset type
     is_camera_dataset = any(name in res_opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
-    if is_camera_dataset:
+    res_which = getattr(opt, 'res_which_epoch', None)
+
+    def _res_ckpt_full_path(basename):
+        mp = pjoin(res_opt.checkpoints_dir, res_opt.dataset_name, res_opt.name, 'model', basename)
+        rp = pjoin(res_opt.checkpoints_dir, res_opt.dataset_name, res_opt.name, basename)
+        if os.path.exists(mp):
+            return mp
+        if os.path.exists(rp):
+            print(f'  Loading residual ckpt from run root: {basename}')
+            return rp
+        return None
+
+    if res_which:
+        ckpt_bn = res_which if str(res_which).endswith('.tar') else f'{res_which}.tar'
+        ckpt_path = _res_ckpt_full_path(ckpt_bn)
+        if ckpt_path is None:
+            raise FileNotFoundError(
+                f'res_which_epoch={res_which!r}: no file {ckpt_bn} under model/ or run root '
+                f'for {res_opt.dataset_name}/{res_opt.name}',
+            )
+        ckpt = torch.load(ckpt_path, map_location=opt.device)
+    elif is_camera_dataset:
         # For camera datasets, try different checkpoint files in order of preference
         checkpoint_files = [
             'net_best_acc.tar',        # Best accuracy
             'net_best_loss.tar',       # Best loss
             'latest.tar'               # Latest checkpoint
         ]
-        
+
         checkpoint_loaded = False
         for checkpoint_file in checkpoint_files:
-            checkpoint_path = pjoin(res_opt.checkpoints_dir, res_opt.dataset_name, res_opt.name, 'model', checkpoint_file)
-            if os.path.exists(checkpoint_path):
-                ckpt = torch.load(checkpoint_path, map_location=opt.device)
+            ckpt_path = _res_ckpt_full_path(checkpoint_file)
+            if ckpt_path is not None:
+                ckpt = torch.load(ckpt_path, map_location=opt.device)
                 checkpoint_loaded = True
                 break
-        
+
         if not checkpoint_loaded:
             raise FileNotFoundError(f"No residual transformer checkpoint found in {pjoin(res_opt.checkpoints_dir, res_opt.dataset_name, res_opt.name, 'model')}")
     else:
@@ -143,103 +210,377 @@ def load_res_model(res_opt, vq_opt, opt):
         ckpt = torch.load(pjoin(res_opt.checkpoints_dir, res_opt.dataset_name, res_opt.name, 'model', 'net_best_fid.tar'),
                           map_location=opt.device)
     missing_keys, unexpected_keys = res_transformer.load_state_dict(ckpt['res_transformer'], strict=False)
-    assert len(unexpected_keys) == 0
-    assert all([k.startswith('clip_model.') or k.startswith('cond_provider.') for k in missing_keys])
+    assert len(unexpected_keys) == 0, f'Unexpected keys in ResidualTransformer: {unexpected_keys}'
+    allowed = ('clip_model.', 'cond_provider.', 'clip_image_encoder.')
+    assert all(any(k.startswith(p) for p in allowed) for k in missing_keys), \
+        f'Missing trainable keys in ResidualTransformer: {missing_keys}'
     print(f'Loading Residual Transformer {res_opt.name} from epoch {ckpt["ep"]}!')
     return res_transformer
 
-def load_len_estimator(opt):
-    model = LengthEstimator(512, 50)
-    
-    # Try to load length estimator with smart checkpoint loading
-    estimator_dir = pjoin(opt.checkpoints_dir, opt.dataset_name, 'length_estimator', 'model')
-    
-    # Define checkpoint files to try in order of preference
-    checkpoint_files = ['finest.tar', 'latest.tar']
-    
-    # For camera dataset, also try fallback to t2m length estimator
-    is_camera_dataset = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
-    if is_camera_dataset:
-        t2m_estimator_dir = pjoin(opt.checkpoints_dir, 't2m', 'length_estimator', 'model')
-        checkpoint_files.extend([
-            pjoin(t2m_estimator_dir, 'finest.tar'),
-            pjoin(t2m_estimator_dir, 'latest.tar')
-        ])
-    
-    ckpt = None
-    loaded_file = None
-    
-    # Try each checkpoint file
-    for i, filename in enumerate(checkpoint_files):
-        if i < 2:  # First two are in dataset-specific directory
-            filepath = pjoin(estimator_dir, filename)
-        else:  # Fallback files are already full paths
-            filepath = filename
-            
-        if os.path.exists(filepath):
-            try:
-                ckpt = torch.load(filepath, map_location=opt.device)
-                loaded_file = filepath
-                break
-            except Exception as e:
-                print(f'Failed to load {filepath}: {e}')
-                continue
-    
-    if ckpt is None:
-        raise FileNotFoundError(f'No valid length estimator checkpoint found. Tried: {checkpoint_files}')
-    
-    model.load_state_dict(ckpt['estimator'])
-    epoch = ckpt.get('epoch', 'unknown')
-    
-    is_camera_fallback = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
-    if loaded_file and 't2m' in loaded_file and is_camera_fallback:
-        print(f'Loading Length Estimator from t2m dataset (epoch {epoch}) as fallback for camera dataset!')
-    else:
-        print(f'Loading Length Estimator from epoch {epoch}!')
-    
-    return model
+def prepare_visual_conditioning_for_inference(
+    keyframe_dir: str,
+    keyframe_indices_str: str,
+    model_opt,
+    batch_size: int,
+    token_seq_len: int,
+    device,
+):
+    """Build CLIP-based visual conditioning tensors for inference.
 
-def load_keyframes_for_inference(keyframe_dir, keyframe_indices, target_length):
+    Mirrors the tensor layout produced by
+    ``transformer_trainer.MaskTransformerTrainer._prepare_batch()``.
+
+    Supports both conditioning modes stored in *model_opt*:
+
+    ``use_first_frame=True``
+        Takes the **first** image file in *keyframe_dir* as the single
+        first-frame anchor.  Returns ``first_frame_pixels (B, 3, 224, 224)``.
+
+    ``use_sparse_frames=True``
+        Loads up to ``max_sparse_frames`` images from *keyframe_dir*
+        (sorted alphabetically) and pairs them with raw frame indices
+        from *keyframe_indices_str* (comma-separated).
+        Raw indices are divided by 4 → VQ-level, matching the downsampling
+        applied in the trainer (``visual_indices //= 4``).
+        Returns ``sparse_frames (B,K,3,224,224)``,
+        ``visual_indices (B,K)`` long, ``visual_valid_mask (B,K)`` bool.
+
+    Parameters
+    ----------
+    keyframe_dir : str
+        Directory containing jpg/png frame images (sorted = chronological).
+    keyframe_indices_str : str
+        Comma-separated **raw** frame indices (e.g. ``"0,60,120,180"``).
+        If empty, indices are spread uniformly across the timeline.
+    model_opt :
+        Loaded opt namespace for the MaskTransformer checkpoint.
+    batch_size : int
+    token_seq_len : int
+        VQ token sequence length (= motion_length // 4).
+    device : torch.device
+
+    Returns
+    -------
+    first_frame_pixels : Tensor (B, 3, 224, 224) or None
+    sparse_frames      : Tensor (B, K, 3, 224, 224) or None
+    visual_indices     : Tensor (B, K) long or None  — already VQ-level
+    visual_valid_mask  : Tensor (B, K) bool or None
     """
-    Load keyframe images and prepare them for inference with SparseKeyframeEncoder.
-    
-    Args:
-        keyframe_dir: Directory containing keyframe images (jpg/png)
-        keyframe_indices: List of frame indices where keyframes should be placed
-        target_length: Total trajectory length (in raw frames, not downsampled)
-    
-    Returns:
-        List of Path objects representing a sparse frame sequence with keyframes at specified indices
+    from torchvision import transforms
+
+    preprocess = transforms.Compose([
+        transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],
+            std=[0.26862954, 0.26130258, 0.27577711],
+        ),
+    ])
+
+    frame_dir = Path(keyframe_dir)
+    all_files = sorted([
+        f for f in frame_dir.iterdir()
+        if f.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp')
+    ])
+    if not all_files:
+        raise ValueError(f'No image files found in {frame_dir}')
+
+    use_first_frame   = getattr(model_opt, 'use_first_frame',   False)
+    use_sparse_frames = getattr(model_opt, 'use_sparse_frames', False)
+    max_sparse_frames = getattr(model_opt, 'max_sparse_frames', 4)
+
+    # ── use_first_frame: one image → first_frame_pixels ───────────────────────
+    if use_first_frame:
+        img_path = all_files[0]
+        print(f'  [visual] First-frame conditioning: {img_path.name}')
+        img = Image.open(img_path).convert('RGB')
+        tensor = preprocess(img).unsqueeze(0)                      # (1,3,224,224)
+        first_frame_pixels = tensor.expand(batch_size, -1, -1, -1).to(device)
+        return first_frame_pixels, None, None, None
+
+    # ── use_sparse_frames: up to K images → sparse conditioning ───────────────
+    if use_sparse_frames:
+        K = max_sparse_frames
+
+        # Resolve raw frame indices
+        if keyframe_indices_str:
+            raw_indices = [int(x.strip()) for x in keyframe_indices_str.split(',')]
+        else:
+            # Auto-spread uniformly across raw frame timeline
+            n      = len(all_files)
+            raw_max = token_seq_len * 4 - 1
+            raw_indices = [round(i * raw_max / max(1, n - 1)) for i in range(n)]
+
+        n_use = min(len(all_files), len(raw_indices), K)
+
+        frames     = torch.zeros(1, K, 3, 224, 224)
+        vq_indices = torch.zeros(1, K, dtype=torch.long)
+        valid_mask = torch.zeros(1, K, dtype=torch.bool)
+
+        print(f'  [visual] Sparse keyframe conditioning ({n_use}/{K} slots):')
+        for slot, (img_path, raw_idx) in enumerate(
+                zip(all_files[:n_use], raw_indices[:n_use])):
+            vq_idx = raw_idx // 4          # matches transformer_trainer line 165
+            img = Image.open(img_path).convert('RGB')
+            frames[0, slot]     = preprocess(img)
+            vq_indices[0, slot] = vq_idx
+            valid_mask[0, slot] = True
+            print(f'    slot {slot}: {img_path.name}'
+                  f'  raw={raw_idx}  VQ_token={vq_idx}')
+
+        sparse_frames_t  = frames.expand(batch_size, -1, -1, -1, -1).to(device)
+        visual_indices_t = vq_indices.expand(batch_size, -1).to(device)
+        visual_valid_t   = valid_mask.expand(batch_size, -1).to(device)
+        return None, sparse_frames_t, visual_indices_t, visual_valid_t
+
+    # Model uses neither mode — nothing to do
+    print('  [visual] Model has no visual conditioning (use_first_frame=False, '
+          'use_sparse_frames=False). Keyframe dir ignored.')
+    return None, None, None, None
+
+# matches training processing
+def _clip_preprocess():
+    from torchvision import transforms
+    return transforms.Compose([
+        transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],
+            std=[0.26862954, 0.26130258, 0.27577711],
+        ),
+    ])
+
+
+def _resolve_frame_source_to_keyframe_dir(
+    frame_source: str,
+    frame_root: Path,
+    scene_id_mapping: dict,
+):
+    """Resolve text#length#frame_source field to a concrete keyframe directory.
+
+    Supports:
+    - Absolute keyframe directory path
+    - Relative directory under frame_root
+    - Scene ID / hash ID (resolved via scene_id_mapping when available)
     """
-    keyframe_dir = Path(keyframe_dir)
-    
-    # Get all image files
-    image_files = sorted(list(keyframe_dir.glob('*.jpg')) + list(keyframe_dir.glob('*.png')))
-    
-    if len(image_files) == 0:
-        raise ValueError(f"No images found in {keyframe_dir}")
-    
-    if len(image_files) != len(keyframe_indices):
-        raise ValueError(f"Number of images ({len(image_files)}) must match number of indices ({len(keyframe_indices)})")
-    
-    # Validate indices
-    for idx in keyframe_indices:
-        if idx < 0 or idx >= target_length:
-            raise ValueError(f"Keyframe index {idx} out of range [0, {target_length})")
-    
-    # Create sparse frame path list
-    # We'll create a list where most entries are None, and keyframe positions have actual paths
-    frame_paths = [None] * target_length
-    
-    for img_path, frame_idx in zip(image_files, keyframe_indices):
-        frame_paths[frame_idx] = img_path
-    
-    print(f"✓ Loaded {len(image_files)} keyframes at indices: {keyframe_indices}")
-    print(f"  Total trajectory length: {target_length} frames")
-    
-    # Convert to the format expected by dataset (list of Path objects, with placeholder paths for non-keyframes)
-    # The encoder will handle None/missing paths appropriately
-    return frame_paths
+    if frame_source is None:
+        return None
+    src = frame_source.strip()
+    if not src:
+        return None
+
+    p = Path(src).expanduser()
+    if p.exists() and p.is_dir():
+        return str(p)
+
+    # Relative path under --frame_dir root
+    rel = (frame_root / src).expanduser()
+    if rel.exists() and rel.is_dir():
+        return str(rel)
+
+    # scene_id -> hash_id via mapping, then hash_id under frame_root
+    mapped = scene_id_mapping.get(src, src)
+    mapped_dir = (frame_root / mapped).expanduser()
+    if mapped_dir.exists() and mapped_dir.is_dir():
+        return str(mapped_dir)
+
+    return None
+
+
+def prepare_visual_conditioning_per_sample(
+    keyframe_dirs,
+    token_seq_lens,
+    model_opt,
+    device,
+):
+    """Build CLIP-based visual conditioning with **per-sample** keyframe dirs.
+
+    Unlike ``prepare_visual_conditioning_for_inference`` (single dir broadcast),
+    this function accepts a list of directories (one per batch item) and builds
+    independent visual tensors for each.
+
+    Parameters
+    ----------
+    keyframe_dirs : list[str | None]
+        One directory path per batch item. ``None`` entries yield zero tensors
+        (visual tokens masked out for that sample).
+    token_seq_lens : list[int] | Tensor
+        VQ-level token lengths per batch item (used to auto-spread indices).
+    model_opt : Namespace
+    device : torch.device
+
+    Returns
+    -------
+    first_frame_pixels, sparse_frames, visual_indices, visual_valid_mask
+    """
+    use_first_frame = getattr(model_opt, 'use_first_frame', False)
+    use_sparse_frames = getattr(model_opt, 'use_sparse_frames', False)
+    if not use_first_frame and not use_sparse_frames:
+        return None, None, None, None
+
+    preprocess = _clip_preprocess()
+    B = len(keyframe_dirs)
+    max_k = getattr(model_opt, 'max_sparse_frames', 4)
+
+    if use_first_frame:
+        pixels = torch.zeros(B, 3, 224, 224)
+        for b, kd in enumerate(keyframe_dirs):
+            if kd is None:
+                continue
+            frame_dir = Path(kd)
+            files = sorted([
+                f for f in frame_dir.iterdir()
+                if f.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp')
+            ]) if frame_dir.exists() else []
+            if files:
+                img = Image.open(files[0]).convert('RGB')
+                pixels[b] = preprocess(img)
+        return pixels.to(device), None, None, None
+
+    # use_sparse_frames
+    sparse = torch.zeros(B, max_k, 3, 224, 224)
+    indices = torch.zeros(B, max_k, dtype=torch.long)
+    valid = torch.zeros(B, max_k, dtype=torch.bool)
+
+    if hasattr(token_seq_lens, 'tolist'):
+        token_seq_lens = token_seq_lens.tolist()
+
+    for b, kd in enumerate(keyframe_dirs):
+        if kd is None:
+            continue
+        frame_dir = Path(kd)
+        if not frame_dir.exists():
+            continue
+        files = sorted([
+            f for f in frame_dir.iterdir()
+            if f.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp')
+        ])
+        if not files:
+            continue
+        n_avail = len(files)
+        n_use = min(n_avail, max_k)
+        tsl = token_seq_lens[b]
+        raw_max = max(tsl * 4 - 1, 1)
+
+        chosen = np.linspace(0, n_avail - 1, n_use, dtype=int) if n_avail > 1 else [0]
+        for slot, fi in enumerate(chosen[:max_k]):
+            raw_idx = round(int(fi) * raw_max / max(n_avail - 1, 1))
+            img = Image.open(files[fi]).convert('RGB')
+            sparse[b, slot] = preprocess(img)
+            indices[b, slot] = raw_idx // 4
+            valid[b, slot] = True
+
+    return None, sparse.to(device), indices.to(device), valid.to(device)
+
+
+@torch.no_grad()
+def debug_trace_single_sample(
+    *,
+    t2m_transformer,
+    conds,
+    token_lens,
+    cond_scale,
+    norm_mean,
+    norm_std,
+    vis_first_frame=None,
+    vis_sparse_frames=None,
+    vis_indices=None,
+    vis_valid_mask=None,
+):
+    """Print one-sample debug trace for conditioning + first-step logits.
+
+    Enable once per run with:
+        GEN_CAMERA_DEBUG_TRACE=1 python gen_camera.py ...
+    """
+    device = next(t2m_transformer.parameters()).device
+    m_lens_1 = token_lens[:1].to(device)
+    seq_len = int(m_lens_1.max().item())
+    pos = torch.arange(seq_len, device=device).unsqueeze(0)
+    padding_mask = pos >= m_lens_1.unsqueeze(1)  # (1, S), True = pad
+
+    if torch.is_tensor(conds):
+        conds_1 = conds[:1]
+    else:
+        conds_1 = [conds[0]]
+
+    ff_1 = vis_first_frame[:1] if vis_first_frame is not None else None
+    sp_1 = vis_sparse_frames[:1] if vis_sparse_frames is not None else None
+    vi_1 = vis_indices[:1] if vis_indices is not None else None
+    vm_1 = vis_valid_mask[:1] if vis_valid_mask is not None else None
+
+    cond_vector, _, cond_mask = t2m_transformer.encode_condition(conds_1, 1, device)
+    if cond_vector.dim() == 2:
+        emb_norm = cond_vector.norm(dim=1)
+        emb_msg = f"shape={tuple(cond_vector.shape)}, L2={emb_norm.detach().cpu().numpy().tolist()}"
+    else:
+        flat_norm = cond_vector.flatten(1).norm(dim=1)
+        token_norm = cond_vector.norm(dim=-1).mean(dim=1)
+        emb_msg = (
+            f"shape={tuple(cond_vector.shape)}, "
+            f"flatten_L2={flat_norm.detach().cpu().numpy().tolist()}, "
+            f"mean_token_L2={token_norm.detach().cpu().numpy().tolist()}"
+        )
+
+    if ff_1 is not None:
+        img_msg = (
+            f"first_frame_pixels shape={tuple(ff_1.shape)}, "
+            f"min={ff_1.min().item():.6f}, max={ff_1.max().item():.6f}"
+        )
+    elif sp_1 is not None:
+        img_msg = (
+            f"sparse_frames shape={tuple(sp_1.shape)}, "
+            f"min={sp_1.min().item():.6f}, max={sp_1.max().item():.6f}, "
+            f"valid_mask={vm_1.detach().cpu().numpy().astype(int).tolist() if vm_1 is not None else None}, "
+            f"indices={vi_1.detach().cpu().numpy().tolist() if vi_1 is not None else None}"
+        )
+    else:
+        img_msg = "no visual tensor (text-only conditioning)"
+
+    z_mean = float(norm_mean[2]) if norm_mean is not None and len(norm_mean) > 2 else float("nan")
+    z_std = float(norm_std[2]) if norm_std is not None and len(norm_std) > 2 else float("nan")
+    vz_mean = float(norm_mean[5]) if norm_mean is not None and len(norm_mean) > 5 else float("nan")
+    vz_std = float(norm_std[5]) if norm_std is not None and len(norm_std) > 5 else float("nan")
+
+    ids = torch.where(
+        padding_mask,
+        torch.full_like(padding_mask, t2m_transformer.pad_id, dtype=torch.long),
+        torch.full_like(padding_mask, t2m_transformer.mask_id, dtype=torch.long),
+    )
+
+    logits = t2m_transformer.forward_with_cond_scale(
+        ids,
+        cond_vector=cond_vector,
+        padding_mask=padding_mask,
+        cond_scale=cond_scale,
+        cond_mask=cond_mask,
+        first_frame_pixels=ff_1,
+        sparse_frames=sp_1,
+        visual_indices=vi_1,
+        visual_valid_mask=vm_1,
+    )  # (1, vocab, S)
+
+    logits_step = logits.permute(0, 2, 1)  # (1, S, vocab)
+    argmax_ids = logits_step.argmax(dim=-1)
+    first_valid_pos = int((~padding_mask[0]).nonzero(as_tuple=False)[0].item())
+    first_argmax = int(argmax_ids[0, first_valid_pos].item())
+
+    print("\n" + "=" * 80)
+    print("[Debug Trace] Single-sample conditioning + first-step logits")
+    print(f"text_embedding: {emb_msg}")
+    print(f"image_tensor(pre-CLIP): {img_msg}")
+    print(
+        "norm_stats: "
+        f"z_mean={z_mean:.6f}, z_std={z_std:.6f}, "
+        f"vz_mean={vz_mean:.6f}, vz_std={vz_std:.6f}"
+    )
+    print(
+        "timestep1: "
+        f"logits_shape={tuple(logits_step.shape)}, "
+        f"first_valid_pos={first_valid_pos}, first_argmax_token={first_argmax}"
+    )
+    print("=" * 80 + "\n")
 
 def plot_camera_trajectory_animation(data, save_path, title="Camera Trajectory", 
                                    fps=30, arrow_scale_factor=0.05, 
@@ -457,8 +798,10 @@ def plot_camera_trajectory_animation(data, save_path, title="Camera Trajectory",
         # Default to gif
         writer = PillowWriter(fps=fps)
         anim.save(save_path + '.gif', writer=writer, dpi=100)
-    
-    plt.close()
+
+    # Release FuncAnimation + its closure (holds positions/orientations arrays) before GC
+    del anim
+    plt.close(fig)
     print(f"Camera trajectory animation saved to {save_path}")
 
 def plot_camera_trajectory_debug(data, save_path, title="Camera Trajectory Debug", 
@@ -726,8 +1069,9 @@ Speed: {velocity_magnitudes[frame]:.3f}
         # Default to mp4 for better quality
         writer = FFMpegWriter(fps=fps, metadata=dict(artist='CamTraj'), bitrate=1800)
         anim.save(save_path + '.mp4', writer=writer, dpi=100)
-    
-    plt.close()
+
+    del anim
+    plt.close(fig)
     print(f"Debug animation saved to {save_path}")
 
 def plot_camera_trajectory(data, save_path, title="Camera Trajectory", arrow_scale_factor=0.05, 
@@ -868,7 +1212,186 @@ def plot_camera_trajectory(data, save_path, title="Camera Trajectory", arrow_sca
     #           bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
     
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
+    plt.close(fig)
+
+def plot_camera_trajectory_animation_vel_integrated(
+    data, save_path, title="Camera Trajectory (Vel. Integrated)",
+    fps=30, show_trail=True, trail_length=30, figsize=(12, 10),
+    format_type=None, stride=1, rotate_view=True,
+    smooth=True, smooth_sigma=1.5,
+):
+    """Animate camera trajectory reconstructed by integrating the velocity channels.
+
+    Uses the  [dx, dy, dz]  channels (indices 3-5) of the 12-D feature vector
+    ``[x, y, z, dx, dy, dz, rot6d(6)]`` to reconstruct positions via cumulative
+    summation, anchored at the first frame's direct position.  Gaussian smoothing
+    is applied to the integrated positions before rendering.
+
+    The current position-based visualization does **not** apply any smoothing;
+    this function adds smoothing only to the velocity-integrated trajectory.
+
+    Args:
+        data:         (N, D) camera features.  D must be >= 9 (position + velocity +
+                      at least one orientation channel).  If D < 6 the function logs
+                      a warning and returns without writing any file.
+        save_path:    Output path (.mp4 or .gif).
+        title:        Plot title.
+        fps:          Frames per second.
+        show_trail:   Draw a coloured trail behind the current camera position.
+        trail_length: Number of frames in the trail.
+        figsize:      Matplotlib figure size.
+        format_type:  CameraDataFormat override for orientation extraction.
+        stride:       Render every N-th frame.
+        rotate_view:  Slowly rotate the 3-D view each frame.
+        smooth:       Apply Gaussian smoothing to the integrated positions.
+        smooth_sigma: Gaussian sigma (frames) for smoothing.
+    """
+    from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
+    import matplotlib.pyplot as plt
+    from utils.camera_geometry import integrate_velocity_to_positions
+
+    if data.shape[-1] < 6:
+        print(
+            f"[vel_integrated] Skipping: data has only {data.shape[-1]} channels "
+            f"(need >= 6 for velocity integration)."
+        )
+        return
+
+    # Integrate velocity channels → positions in OpenGL frame
+    try:
+        raw_positions = integrate_velocity_to_positions(
+            data, smooth=smooth, smooth_sigma=smooth_sigma
+        )
+    except ValueError as exc:
+        print(f"[vel_integrated] Skipping: {exc}")
+        return
+
+    # Map to Matplotlib Z-up convention: [x, y, z] → [x, -z, y]
+    positions = to_mpl(raw_positions)
+
+    # Extract orientations from original data via UnifiedCameraData
+    unified_data = UnifiedCameraData(data, format_type=format_type)
+    orientations = unified_data.orientations.numpy()
+
+    # ── Figure setup ──────────────────────────────────────────────────────────
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+
+    pos_ranges = np.ptp(positions, axis=0)
+    trajectory_extent = np.max(pos_ranges) if np.max(pos_ranges) > 0 else 1.0
+
+    if len(positions) > 1:
+        step_distances = np.sqrt(np.sum(np.diff(positions, axis=0) ** 2, axis=1))
+        avg_step_size = np.mean(step_distances)
+        scale_reference = max(trajectory_extent, avg_step_size * 10)
+    else:
+        scale_reference = trajectory_extent
+
+    arrow_scale_factor, min_arrow_length, max_arrow_length = 0.05, 0.01, 0.2
+    base_arrow_length = max(arrow_scale_factor * scale_reference, min_arrow_length)
+    base_arrow_length = min(base_arrow_length, max_arrow_length)
+
+    padding = trajectory_extent * 0.1
+    ax.set_xlim(positions[:, 0].min() - padding, positions[:, 0].max() + padding)
+    ax.set_ylim(positions[:, 1].min() - padding, positions[:, 1].max() + padding)
+    ax.set_zlim(positions[:, 2].min() - padding, positions[:, 2].max() + padding)
+
+    import textwrap
+    wrapped_caption = '\n'.join(textwrap.wrap(title, width=60))
+    smooth_tag = f"σ={smooth_sigma}" if smooth else "no-smooth"
+    # Use suptitle for the (potentially long) caption so it never clips against
+    # the 3D axes bounding box; reserve ax.set_title for the concise technical tag.
+    fig.suptitle(wrapped_caption, fontsize=10, y=0.98, wrap=True)
+    ax.set_title(f"[vel-integrated · {smooth_tag}]", fontsize=9, pad=8)
+    fig.subplots_adjust(top=0.88)
+    ax.set_xlabel('X (Right)')
+    ax.set_ylabel('Depth (Forward)')
+    ax.set_zlabel('Y (Up)')
+
+    trajectory_line, = ax.plot([], [], [], 'b-', linewidth=2, alpha=0.6, label='Full Path')
+    trail_line, = ax.plot([], [], [], 'orange', linewidth=3, alpha=0.8, label='Trail')
+    current_point = ax.scatter([], [], [], c='red', s=200, label='Current')
+
+    ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2],
+               c='green', s=150, label='Start', marker='^')
+    ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2],
+               c='red', s=150, label='End', marker='v')
+    ax.legend()
+
+    # Pre-compute orientation vectors
+    orientation_vectors = []
+    for frame_idx in range(len(positions)):
+        ori = orientations[frame_idx]
+        if unified_data.format_type == CameraDataFormat.FULL_12_ROTMAT:
+            from utils.camera_geometry import forward_from_sixd
+            fwd_gl = forward_from_sixd(ori.reshape(1, 6)).squeeze(0)
+        else:
+            pitch, yaw = ori[0], ori[1]
+            fwd_gl = np.array([
+                np.cos(pitch) * np.sin(yaw),
+                -np.sin(pitch),
+                -np.cos(pitch) * np.cos(yaw),
+            ])
+        fwd_mpl = to_mpl(fwd_gl.reshape(1, 3)).squeeze(0)
+        norm = np.linalg.norm(fwd_mpl)
+        if norm > 1e-6:
+            fwd_mpl = fwd_mpl / norm
+        orientation_vectors.append(tuple(fwd_mpl))
+
+    orientation_arrow = [None]
+
+    def animate(frame):
+        if orientation_arrow[0] is not None:
+            orientation_arrow[0].remove()
+
+        trajectory_line.set_data_3d(
+            positions[:frame + 1, 0],
+            positions[:frame + 1, 1],
+            positions[:frame + 1, 2],
+        )
+        trajectory_line.set_alpha(min(1.0, frame / 20) * 0.6)
+
+        if show_trail and frame > 0:
+            ts = max(0, frame - trail_length)
+            seg = positions[ts:frame + 1]
+            trail_line.set_data_3d(seg[:, 0], seg[:, 1], seg[:, 2])
+
+        cp = positions[frame]
+        current_point._offsets3d = ([cp[0]], [cp[1]], [cp[2]])
+
+        dx, dy, dz = orientation_vectors[frame]
+        orientation_arrow[0] = ax.quiver(
+            cp[0], cp[1], cp[2], dx, dy, dz,
+            length=1.5 * base_arrow_length,
+            color='purple', alpha=0.8, arrow_length_ratio=0.3, linewidth=2,
+        )
+
+        if rotate_view:
+            ax.view_init(elev=20, azim=frame * 0.5 % 360)
+
+        return trajectory_line, trail_line, current_point, orientation_arrow[0]
+
+    frame_indices = list(range(0, len(positions), stride))
+    if frame_indices[-1] != len(positions) - 1:
+        frame_indices.append(len(positions) - 1)
+
+    anim = FuncAnimation(fig, animate, frames=frame_indices,
+                         interval=1000 / fps, blit=False, repeat=True)
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    if save_path.endswith('.gif'):
+        anim.save(save_path, writer=PillowWriter(fps=fps), dpi=100)
+    elif save_path.endswith('.mp4'):
+        writer = FFMpegWriter(fps=fps, metadata=dict(artist='CamTraj'), bitrate=1800)
+        anim.save(save_path, writer=writer, dpi=100)
+    else:
+        writer = FFMpegWriter(fps=fps, metadata=dict(artist='CamTraj'), bitrate=1800)
+        anim.save(save_path + '.mp4', writer=writer, dpi=100)
+
+    del anim
+    plt.close(fig)
+    print(f"Velocity-integrated trajectory animation saved to {save_path}")
+
 
 if __name__ == '__main__':
     parser = EvalT2MOptions()
@@ -891,9 +1414,9 @@ if __name__ == '__main__':
     print(f"Detected camera format: {detected_format}")
     print(f"Feature dimensions: {dim_pose}")
     print(f"Visualization format: {viz_format_type}")
+    print("Vel-integration visualization: ENABLED (always using velocity-integrated plotting)")
 
     root_dir = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.name)
-    model_dir = pjoin(root_dir, 'model')
     result_dir = pjoin('./generation', opt.ext)
     joints_dir = pjoin(result_dir, 'joints')
     animation_dir = pjoin(result_dir, 'animations')
@@ -924,31 +1447,25 @@ if __name__ == '__main__':
     #################################
     res_opt_path = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.res_name, 'opt.txt')
     res_opt = get_opt(res_opt_path, device=opt.device)
-    res_model = load_res_model(res_opt, vq_opt, opt)
+
+    text_cond_m = _resolve_text_conditioning(model_opt, opt, role='mask_transformer')
+    text_cond_r = _resolve_text_conditioning(res_opt, opt, role='res_transformer')
+    if text_cond_m[0] != text_cond_r[0]:
+        print(
+            f'[gen_camera] WARNING: mask conditioning_mode={text_cond_m[0]!r} != '
+            f'res {text_cond_r[0]!r} — encoders may disagree.',
+        )
+
+    res_model = load_res_model(res_opt, vq_opt, opt, text_cond=text_cond_r)
 
     assert res_opt.vq_name == model_opt.vq_name
 
     #################################
     ######Loading M-Transformer######
     #################################
-    t2m_transformer = load_trans_model(model_opt, opt, 'latest.tar')
-
-    ##################################
-    #####Loading Length Predictor#####
-    ##################################
-    is_camera_dataset = any(name in opt.dataset_name.lower() for name in ["cam", "estate", "realestate"])
-    if is_camera_dataset:
-        length_estimator = None
-        print("Camera dataset: skipping length estimator (not trained on camera data, uses fixed length).")
-    else:
-        try:
-            length_estimator = load_len_estimator(model_opt)
-            length_estimator.eval()
-            length_estimator.to(opt.device)
-        except:
-            length_estimator = None
-            print("Length estimator not found, length prediction disabled.")
-
+    which_ckpt = getattr(opt, 'which_epoch', 'latest')
+    ckpt_name = which_ckpt if which_ckpt.endswith('.tar') else f'{which_ckpt}.tar'
+    t2m_transformer = load_trans_model(model_opt, opt, ckpt_name, text_cond=text_cond_m)
 
     t2m_transformer.eval()
     vq_model.eval()
@@ -969,12 +1486,14 @@ if __name__ == '__main__':
 
     prompt_list = []
     length_list = []
-    conditioning_mode = getattr(opt, 'conditioning_mode', 'clip')
+    keyframe_dirs_per_prompt = []
+    # Must match MaskTransformer (from checkpoint opt.txt via text_cond_m).
+    conditioning_mode = text_cond_m[0]
 
     # ── id_embedding mode: conditions are sample IDs, not text ──
     if conditioning_mode == 'id_embedding':
         sample_ids_str = getattr(opt, 'sample_ids', '')
-        num_id_samples = getattr(opt, 'num_id_samples', 50)
+        num_id_samples = text_cond_m[1]
         
         if sample_ids_str:
             sample_id_list = [int(x.strip()) for x in sample_ids_str.split(',')]
@@ -1005,7 +1524,6 @@ if __name__ == '__main__':
         
         # Load ground truth data and text descriptions for comparison
         gt_data_list = []
-        gt_lengths = []
         gt_text_descriptions = []  # Actual text prompts for each sample
         train_split_file = pjoin(opt.data_root, 'train.txt')
         if os.path.exists(train_split_file):
@@ -1021,10 +1539,8 @@ if __name__ == '__main__':
                     if os.path.exists(gt_path):
                         gt_motion = np.load(gt_path)
                         gt_data_list.append(gt_motion)
-                        gt_lengths.append(len(gt_motion))
                     else:
                         gt_data_list.append(None)
-                        gt_lengths.append(0)
                         print(f"  Warning: GT not found for sample ID {sid} at {gt_path}")
                     
                     # Load text description
@@ -1038,7 +1554,6 @@ if __name__ == '__main__':
                         gt_text_descriptions.append(f"Sample ID: {sid}")
                 else:
                     gt_data_list.append(None)
-                    gt_lengths.append(0)
                     gt_text_descriptions.append(f"Sample ID: {sid}")
             print(f"  Loaded {sum(1 for g in gt_data_list if g is not None)}/{len(sample_id_list)} ground truth trajectories")
             print(f"  Loaded {sum(1 for t in gt_text_descriptions if not t.startswith('Sample ID'))} text descriptions")
@@ -1050,8 +1565,21 @@ if __name__ == '__main__':
     # ── text-based modes (clip / t5) ──
     else:
         est_length = False
+        keyframe_dirs_per_prompt = []
+        frame_root = Path(getattr(
+            opt, 'frame_dir', '/data4/haozhe/CamTraj/data/processed_estate/train_frames'))
+        scene_id_mapping = {}
+        mapping_path = Path(opt.data_root) / 'scene_id_mapping.json'
+        if mapping_path.exists():
+            try:
+                with open(mapping_path, 'r') as mf:
+                    scene_id_mapping = json.load(mf)
+            except Exception as e:
+                print(f"Warning: failed to load scene_id_mapping at {mapping_path}: {e}")
+
         if opt.text_prompt != "":
             prompt_list.append(opt.text_prompt)
+            keyframe_dirs_per_prompt.append(None)
             if opt.motion_length == 0:
                 est_length = True
             else:
@@ -1060,13 +1588,31 @@ if __name__ == '__main__':
             with open(opt.text_path, 'r') as f:
                 lines = f.readlines()
                 for line in lines:
-                    infos = line.split('#')
+                    line = line.strip()
+                    if not line:
+                        continue
+                    infos = line.split('#', 2)
                     prompt_list.append(infos[0])
-                    if len(infos) == 1 or (not infos[1].isdigit()):
+                    if len(infos) >= 2 and infos[1].strip().isdigit():
+                        length_list.append(int(infos[1].strip()))
+                    else:
                         est_length = True
                         length_list = []
+                    if len(infos) >= 3 and infos[2].strip():
+                        frame_source = infos[2].strip()
+                        resolved_dir = _resolve_frame_source_to_keyframe_dir(
+                            frame_source=frame_source,
+                            frame_root=frame_root,
+                            scene_id_mapping=scene_id_mapping,
+                        )
+                        if resolved_dir is None:
+                            print(
+                                f"Warning: cannot resolve frame_source '{frame_source}' "
+                                f"to a keyframe directory. This prompt will use no keyframes."
+                            )
+                        keyframe_dirs_per_prompt.append(resolved_dir)
                     else:
-                        length_list.append(int(infos[-1]))
+                        keyframe_dirs_per_prompt.append(None)
         else:
             raise ValueError("A text prompt, or a file of text prompts are required!!!")
 
@@ -1086,85 +1632,148 @@ if __name__ == '__main__':
         gt_data_list = None  # No GT comparison for text modes
         gt_text_descriptions = None
     
-    # Load keyframes if specified
-    keyframe_paths_list = None
-    if opt.use_keyframes and opt.keyframe_dir and opt.keyframe_indices:
-        print(f"\n{'='*70}")
-        print("Keyframe conditioning enabled for inference")
-        print(f"{'='*70}")
-        
-        # Parse keyframe indices
-        keyframe_indices = [int(x.strip()) for x in opt.keyframe_indices.split(',')]
-        
-        # Load keyframes for each sample (assuming same keyframes for all samples)
-        keyframe_paths_list = []
-        for i, traj_length in enumerate(m_length.cpu().numpy()):
-            frame_paths = load_keyframes_for_inference(opt.keyframe_dir, keyframe_indices, traj_length)
-            keyframe_paths_list.append(frame_paths)
-        
-        # Initialize sparse keyframe encoder (same as in trainer)
-        from models.sparse_keyframe_encoder import SparseKeyframeEncoder
-        keyframe_arch = getattr(model_opt, 'keyframe_arch', 'resnet18')
-        latent_dim = model_opt.latent_dim
-        
-        sparse_keyframe_encoder = SparseKeyframeEncoder(
-            resnet_arch=keyframe_arch,
-            latent_dim=latent_dim,
-            pretrained=True
-        ).to(opt.device)
-        sparse_keyframe_encoder.eval()
-        
-        print(f"✓ SparseKeyframeEncoder loaded (arch={keyframe_arch}, latent_dim={latent_dim})")
-        print(f"  Keyframes will condition trajectory generation")
-        print(f"{'='*70}\n")
-    else:
-        sparse_keyframe_encoder = None
+    # ── Visual conditioning (CLIP-based) ─────────────────────────────────────
+    # Prepare once before the repeat loop; tensors are reused across repeats.
+    vis_first_frame   = None   # (B, 3, 224, 224)  or None
+    vis_sparse_frames = None   # (B, K, 3, 224, 224) or None
+    vis_indices       = None   # (B, K) long  — VQ-level
+    vis_valid_mask    = None   # (B, K) bool
 
-    sample = 0
+    _model_has_visual = (
+        getattr(model_opt, 'use_first_frame', False)
+        or getattr(model_opt, 'use_sparse_frames', False)
+    )
+
+    _has_per_prompt_dirs = any(d is not None for d in keyframe_dirs_per_prompt)
+    _has_global_dir = bool(opt.keyframe_dir)
+
+    # --use_keyframes is the single runtime gate.
+    # If disabled, ignore both per-prompt frame_source and global keyframe_dir.
+    if _model_has_visual and opt.use_keyframes and (_has_per_prompt_dirs or _has_global_dir):
+        print(f"\n{'='*70}")
+        print("Visual keyframe conditioning enabled for inference")
+        print(f"{'='*70}")
+
+        if _has_per_prompt_dirs:
+            # Per-sample mode: fill in global fallback for None entries
+            fallback = opt.keyframe_dir if opt.keyframe_dir else None
+            resolved_dirs = [d if d is not None else fallback for d in keyframe_dirs_per_prompt]
+            n_with_kf = sum(1 for d in resolved_dirs if d is not None)
+            print(f"  Per-prompt keyframe dirs: {n_with_kf}/{len(resolved_dirs)} prompts have keyframes")
+            (vis_first_frame,
+             vis_sparse_frames,
+             vis_indices,
+             vis_valid_mask) = prepare_visual_conditioning_per_sample(
+                keyframe_dirs=resolved_dirs,
+                token_seq_lens=token_lens,
+                model_opt=model_opt,
+                device=opt.device,
+            )
+        else:
+            # Single-dir broadcast mode (original behavior)
+            batch_size_inf = len(captions) if conditioning_mode != 'id_embedding' \
+                             else len(cond_ids)
+            (vis_first_frame,
+             vis_sparse_frames,
+             vis_indices,
+             vis_valid_mask) = prepare_visual_conditioning_for_inference(
+                keyframe_dir=opt.keyframe_dir,
+                keyframe_indices_str=opt.keyframe_indices or '',
+                model_opt=model_opt,
+                batch_size=batch_size_inf,
+                token_seq_len=token_lens[0].item(),
+                device=opt.device,
+            )
+        print(f"{'='*70}\n")
+    elif (opt.use_keyframes and (_has_global_dir or _has_per_prompt_dirs)) and not _model_has_visual:
+        print("Warning: keyframes provided but model has no visual conditioning. "
+              "Keyframe dirs will be ignored.")
+    elif (not opt.use_keyframes) and (_has_global_dir or _has_per_prompt_dirs):
+        print("Keyframe inputs detected but --use_keyframes is OFF. Ignoring all keyframes.")
+
+    debug_trace_enabled = os.environ.get("GEN_CAMERA_DEBUG_TRACE", "0") == "1"
+    debug_trace_done = False
+
+    # Process samples in mini-batches matching the batch size used during training
+    # evaluation.  Sending all prompts at once (e.g. 251) causes T5/attention to
+    # degrade — producing near-identical degenerate outputs for every prompt.
+    gen_batch_size = getattr(opt, 'batch_size', 32)
+    n_samples = len(captions)
+    print(f"[gen_camera] Effective generation batch_size={gen_batch_size}, n_samples={n_samples}")
 
     for r in range(opt.repeat_times):
         print("-->Repeat %d"%r)
-        with torch.no_grad():
-            # Encode keyframes if provided
-            frame_emb_batch = None
-            if keyframe_paths_list is not None:
-                # Encode frames for this batch
-                m_lens_tensor = token_lens * 4  # Original lengths
-                frame_emb_batch, has_frames = sparse_keyframe_encoder(
-                    keyframe_paths_list, 
-                    m_lens_tensor,
-                    deterministic=True  # Use deterministic sampling for inference
+        all_data_batches = []
+
+        for batch_start in range(0, n_samples, gen_batch_size):
+            batch_end = min(batch_start + gen_batch_size, n_samples)
+            print(f"  Generating samples {batch_start}–{batch_end - 1} / {n_samples - 1}")
+
+            b_token_lens = token_lens[batch_start:batch_end]
+
+            if conditioning_mode == 'id_embedding':
+                b_gen_conds = cond_ids[batch_start:batch_end]
+            else:
+                b_gen_conds = captions[batch_start:batch_end]
+
+            # Slice visual conditioning tensors if present
+            b_vis_first  = vis_first_frame[batch_start:batch_end]   if vis_first_frame   is not None else None
+            b_vis_sparse = vis_sparse_frames[batch_start:batch_end] if vis_sparse_frames is not None else None
+            b_vis_idx    = vis_indices[batch_start:batch_end]       if vis_indices       is not None else None
+            b_vis_mask   = vis_valid_mask[batch_start:batch_end]    if vis_valid_mask    is not None else None
+
+            if debug_trace_enabled and not debug_trace_done:
+                try:
+                    debug_trace_single_sample(
+                        t2m_transformer=t2m_transformer,
+                        conds=b_gen_conds,
+                        token_lens=b_token_lens,
+                        cond_scale=opt.cond_scale,
+                        norm_mean=mean,
+                        norm_std=std,
+                        vis_first_frame=b_vis_first,
+                        vis_sparse_frames=b_vis_sparse,
+                        vis_indices=b_vis_idx,
+                        vis_valid_mask=b_vis_mask,
+                    )
+                    debug_trace_done = True
+                except Exception as _e:
+                    print(f"[Debug Trace] failed: {_e}")
+
+            with torch.no_grad():
+                mids = t2m_transformer.generate(
+                    b_gen_conds, b_token_lens,
+                    timesteps=opt.time_steps,
+                    cond_scale=opt.cond_scale,
+                    temperature=opt.temperature,
+                    topk_filter_thres=opt.topkr,
+                    gsample=opt.gumbel_sample,
+                    first_frame_pixels=b_vis_first,
+                    sparse_frames=b_vis_sparse,
+                    visual_indices=b_vis_idx,
+                    visual_valid_mask=b_vis_mask,
                 )
-                
-                # Pad to match token sequence length
-                target_seq_len = token_lens[0].item()  # Token length (T//4)
-                if frame_emb_batch.shape[0] < target_seq_len:
-                    pad_len = target_seq_len - frame_emb_batch.shape[0]
-                    padding = torch.zeros(pad_len, frame_emb_batch.shape[1], frame_emb_batch.shape[2], 
-                                        device=frame_emb_batch.device)
-                    frame_emb_batch = torch.cat([frame_emb_batch, padding], dim=0)
-                
-                print(f"  Frame embeddings: {frame_emb_batch.shape}, has_frames={has_frames}")
-            
-            # Generate with optional keyframe conditioning
-            # Note: We need to modify transformer.generate() to accept frame_emb
-            # For now, we'll use a workaround through the forward pass
-            
-            # Choose conditions based on mode
-            gen_conds = cond_ids if conditioning_mode == 'id_embedding' else captions
-            
-            mids = t2m_transformer.generate(gen_conds, token_lens,
-                                            timesteps=opt.time_steps,
-                                            cond_scale=opt.cond_scale,
-                                            temperature=opt.temperature,
-                                            topk_filter_thres=opt.topkr,
-                                            gsample=opt.gumbel_sample)
-            mids = res_model.generate(mids, gen_conds, token_lens, temperature=1, cond_scale=5)
-            pred_motions = vq_model.forward_decoder(mids)
+                mids = res_model.generate(
+                    mids, b_gen_conds, b_token_lens,
+                    temperature=1, cond_scale=getattr(opt, 'res_cond_scale', 5),
+                    first_frame_pixels=b_vis_first,
+                    sparse_frames=b_vis_sparse,
+                    visual_indices=b_vis_idx,
+                    visual_valid_mask=b_vis_mask,
+                )
+                pred_motions = vq_model.forward_decoder(mids)
+                pred_motions = pred_motions.detach().cpu().numpy()
+                all_data_batches.append(inv_transform(pred_motions))
 
-            pred_motions = pred_motions.detach().cpu().numpy()
-
-            data = inv_transform(pred_motions)
+        # Merge all mini-batch outputs; each entry is (B, T, D) — pad to common T
+        max_t = max(x.shape[1] for x in all_data_batches)
+        padded = []
+        for x in all_data_batches:
+            if x.shape[1] < max_t:
+                pad = np.zeros((x.shape[0], max_t - x.shape[1], x.shape[2]), dtype=x.dtype)
+                x = np.concatenate([x, pad], axis=1)
+            padded.append(x)
+        data = np.concatenate(padded, axis=0)
 
         for k, (caption, joint_data) in enumerate(zip(captions, data)):
             print("---->Sample %d: %s %d"%(k, caption, m_length[k]))
@@ -1179,24 +1788,20 @@ if __name__ == '__main__':
             # Save raw camera data
             np.save(pjoin(joint_path, "sample%d_repeat%d_len%d_pred.npy"%(k, r, m_length[k])), joint_data)
             
-            # Create camera trajectory visualization (both static and animated)
-            # Pass viz_format_type so rotmat datasets are not misdetected as euler
-            plot_path = pjoin(animation_path, "sample%d_repeat%d_len%d_pred_trajectory.png"%(k, r, m_length[k]))
-            plot_camera_trajectory(joint_data, plot_path, title=f"[Pred] {caption}",
-                                  format_type=viz_format_type)
-            
-            # Create animated version for better debugging (MP4 for better quality & smaller size)
-            anim_path = pjoin(animation_path, "sample%d_repeat%d_len%d_pred_trajectory.mp4"%(k, r, m_length[k]))
-            plot_camera_trajectory_animation(joint_data, anim_path, title=f"[Pred] {caption}",
-                                           fps=30, show_trail=True, trail_length=20,
-                                           format_type=viz_format_type)
-            
-            # Create comprehensive debug animation with analysis
-            debug_path = pjoin(animation_path, "sample%d_repeat%d_len%d_pred_debug.mp4"%(k, r, m_length[k]))
-            plot_camera_trajectory_debug(joint_data, debug_path, title=f"[Pred] {caption}",
-                                       fps=30, show_velocity=True, show_topdown=True, 
-                                       text_prompt=caption, format_type=viz_format_type)
-            
+            # Always use velocity-integrated visualization (no direct xyz plotting).
+            pred_velint_path = pjoin(animation_path, "sample%d_repeat%d_len%d_pred_velint.mp4"%(k, r, m_length[k]))
+            try:
+                plot_camera_trajectory_animation_vel_integrated(
+                    joint_data, pred_velint_path, title=f"[Pred / Vel-Int] {caption}",
+                    fps=30, show_trail=True, trail_length=20,
+                    format_type=viz_format_type, smooth=True, smooth_sigma=1.5,
+                )
+                print(f"Pred vel-integrated animation saved to {pred_velint_path}")
+            except Exception as e:
+                import traceback
+                print(f"[Warning] Vel-integrated pred animation failed: {e}")
+                traceback.print_exc()
+
             # ── Ground truth comparison for id_embedding mode ──
             if conditioning_mode == 'id_embedding' and gt_data_list is not None and gt_data_list[k] is not None:
                 gt_raw = gt_data_list[k]  # Already in raw (unnormalized) feature space
@@ -1206,26 +1811,37 @@ if __name__ == '__main__':
                 # Save GT raw data
                 np.save(pjoin(joint_path, "sample%d_repeat%d_len%d_gt.npy"%(k, r, gt_len)), gt_trimmed)
                 
-                # GT static trajectory plot
-                gt_plot_path = pjoin(animation_path, "sample%d_repeat%d_len%d_gt_trajectory.png"%(k, r, gt_len))
-                plot_camera_trajectory(gt_trimmed, gt_plot_path, title=f"[GT] {caption}",
-                                      format_type=viz_format_type)
-                
-                # GT animated trajectory
-                gt_anim_path = pjoin(animation_path, "sample%d_repeat%d_len%d_gt_trajectory.mp4"%(k, r, gt_len))
-                plot_camera_trajectory_animation(gt_trimmed, gt_anim_path, title=f"[GT] {caption}",
-                                               fps=30, show_trail=True, trail_length=20,
-                                               format_type=viz_format_type)
-                
-                # GT debug animation (same comprehensive view as predicted)
-                # Use actual text description in sidebar instead of numeric ID
-                gt_text = gt_text_descriptions[k] if gt_text_descriptions else caption
-                gt_debug_path = pjoin(animation_path, "sample%d_repeat%d_len%d_gt_debug.mp4"%(k, r, gt_len))
-                plot_camera_trajectory_debug(gt_trimmed, gt_debug_path, title=f"[GT] {caption}",
-                                           fps=30, show_velocity=True, show_topdown=True,
-                                           text_prompt=gt_text, format_type=viz_format_type)
-                
-                print(f"  GT trajectory saved ({gt_len} frames) with trajectory + debug views")
+                # Always use velocity-integrated GT visualization + GT-vs-Pred comparison.
+                gt_velint_path = pjoin(animation_path, "sample%d_repeat%d_len%d_gt_velint.mp4"%(k, r, gt_len))
+                try:
+                    plot_camera_trajectory_animation_vel_integrated(
+                        gt_trimmed, gt_velint_path, title=f"[GT / Vel-Int] {caption}",
+                        fps=30, show_trail=True, trail_length=20,
+                        format_type=viz_format_type, smooth=True, smooth_sigma=1.5,
+                    )
+                    print(f"  GT vel-integrated animation saved to {gt_velint_path}")
+                except Exception as e:
+                    import traceback
+                    print(f"[Warning] Vel-integrated GT animation failed: {e}")
+                    traceback.print_exc()
+
+                # Side-by-side comparison (GT vel-int vs Pred vel-int)
+                try:
+                    from utils.clatr_camera_eval import plot_trajectory_comparison_animation_vel_integrated
+                    cmp_velint_path = pjoin(animation_path, "sample%d_repeat%d_len%d_velint_cmp.mp4"%(k, r, m_length[k]))
+                    plot_trajectory_comparison_animation_vel_integrated(
+                        gt_trimmed, joint_data, caption,
+                        cmp_velint_path,
+                        fps=20, stride=2,
+                        format_type=viz_format_type,
+                    )
+                    print(f"  GT vs Pred vel-integrated comparison saved to {cmp_velint_path}")
+                except Exception as e:
+                    import traceback
+                    print(f"[Warning] Vel-integrated comparison animation failed: {e}")
+                    traceback.print_exc()
+
+                print(f"  GT trajectory saved ({gt_len} frames) with vel-integrated views")
             
             # Save camera data as text file for easy inspection with format-aware headers
             unified_data = UnifiedCameraData(joint_data, format_type=viz_format_type)
@@ -1255,48 +1871,49 @@ if __name__ == '__main__':
                 f.write(f"Orientation shape: {orientations.shape}\n")
                 f.write(f"Caption: {caption}\n")
 
-            print(f"Camera trajectory saved to {plot_path}")
-            print(f"Camera trajectory animation saved to {anim_path}")
-            print(f"Debug animation saved to {debug_path}")
-            print(f"Raw data saved to {pjoin(joint_path, 'sample%d_repeat%d_len%d.npy'%(k, r, m_length[k]))}") 
+            print(f"Pred vel-integrated animation saved to {pred_velint_path}")
+            print(f"Raw data saved to {pjoin(joint_path, 'sample%d_repeat%d_len%d.npy'%(k, r, m_length[k]))}")
+
+            # Force cyclic GC after each sample — matplotlib FuncAnimation objects
+            # create reference cycles (fig ↔ closure ↔ event handlers) that
+            # CPython's reference-counting GC alone cannot break promptly.
+            import gc
+            gc.collect() 
 
 """
 Enhanced Camera Trajectory Generation Script with 3D Animation Support
 
-Supports multiple camera data formats:
-- 5D: [x, y, z, pitch, yaw] (legacy cam dataset)
-- 6D: [x, y, z, pitch, yaw, roll] (realestate10k_6 dataset)
-- 12D: [x, y, z, dx, dy, dz, pitch, yaw, roll, dpitch, dyaw, droll] (full format)
-
-NEW FEATURES:
-- 3D animated trajectory visualization for better debugging
-- Comprehensive debug animations with velocity/acceleration analysis
-- Interactive trail visualization showing camera movement history
-- Multi-format support with automatic detection
-
-Output Files Generated Per Sample:
-- sample_X_repeat_Y_len_Z_trajectory.png (static 3D plot)
-- sample_X_repeat_Y_len_Z_trajectory.mp4 (smooth 3D animation video)
-- sample_X_repeat_Y_len_Z_debug.mp4 (comprehensive debug animation video)
-- sample_X_repeat_Y_len_Z.npy (raw trajectory data)
-- sample_X_repeat_Y_len_Z.txt (human-readable trajectory)
-- sample_X_repeat_Y_len_Z_format.txt (format information)
-
 Usage Examples:
 
-CUDA_VISIBLE_DEVICES=3 python gen_camera.py \
+CUDA_VISIBLE_DEVICES=6 python gen_camera.py \
     --dataset_name realestate10k_rotmat \
     --text_path camera_prompts.txt \
-    --name mtrans_3k_clip_crossattn_reduce \
-    --res_name rtrans_3k_clip_crossattn_reduce \
-    --conditioning_mode clip \
+    --name mtrans_5k_newdata_xframe_r4_latest \
+    --res_name rtrans_5k_newdata_xframe_r4_latest \
+    --conditioning_mode t5 \
     --gpu_id 0 \
     --repeat_times 2 \
     --time_steps 10 \
     --cond_scale 3 \
     --temperature 0.3 \
     --topkr 0.9 \
-    --ext camera_3k_clip_crossattn_reduce_1
+    --ext camera_5k_xframes_r4_latest_noframe_inference \
+
+
+    --use_keyframes \
+    --keyframe_dir /data4/haozhe/CamTraj/data/processed_estate/train_frames/0172e6a29a2f00e2   \
+    --keyframe_indices "0,60,120,180"  
+    
+
+python gen_camera.py   
+    --dataset_name realestate10k_rotmat   
+    --name mtrans_5k_newdata_xframe1   
+    --res_name rtrans_5k_newdata_xframe1   
+    --text_prompt "The camera pans right slowly and smoothly, gradually revealing more of the room's right side, including the kitchen area through the doorway, then continues panning right"   
+    --use_keyframes   
+    --keyframe_dir /data4/haozhe/CamTraj/data/processed_estate/train_frames/0172e6a29a2f00e2   
+    --keyframe_indices "0,60,120,180"   
+    --conditioning_mode t5
 
 python gen_camera.py \
     --dataset_name realestate10k_quat \

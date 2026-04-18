@@ -31,13 +31,15 @@ def plot_t2m(data, save_dir):
     
     if is_camera_dataset:
         # For camera data, use GT vs Pred comparison visualizations
-        from gen_camera import plot_camera_trajectory_animation, plot_camera_trajectory
+        from gen_camera import (plot_camera_trajectory_animation, plot_camera_trajectory,
+                                plot_camera_trajectory_animation_vel_integrated)
         from utils.camera_plot import plot_camera_trajectory_3d
         from utils.unified_data_format import detect_format_from_dataset_name
         import os
         
         # Detect format from dataset name
         viz_format_type = detect_format_from_dataset_name(opt.dataset_name)
+        use_vel_integration = getattr(opt, 'vis_vel_integration', False)
         
         os.makedirs(save_dir, exist_ok=True)
         
@@ -67,7 +69,7 @@ def plot_t2m(data, save_dir):
             except Exception as e:
                 print(f"Error creating comparison plot {i}: {e}")
             
-            # 2. Generate MP4 animations for both GT and Pred
+            # 2. Generate MP4 animations for both GT and Pred (position-based, no smoothing)
             gt_video_path = pjoin(save_dir, f'camera_viz_sample_{i:02d}_gt.mp4')
             pred_video_path = pjoin(save_dir, f'camera_viz_sample_{i:02d}_pred.mp4')
             try:
@@ -94,6 +96,37 @@ def plot_t2m(data, save_dir):
                 print(f"Camera videos saved: {gt_video_path}, {pred_video_path}")
             except Exception as e:
                 print(f"Error creating camera videos {i}: {e}")
+            
+            # 3. Velocity-integrated visualizations (optional, enabled via --vis_vel_integration)
+            if use_vel_integration:
+                gt_vel_path = pjoin(save_dir, f'camera_viz_sample_{i:02d}_gt_velint.mp4')
+                pred_vel_path = pjoin(save_dir, f'camera_viz_sample_{i:02d}_pred_velint.mp4')
+                try:
+                    plot_camera_trajectory_animation_vel_integrated(
+                        data=gt_trajectory,
+                        save_path=gt_vel_path,
+                        title=f"Sample {i:02d} - Ground Truth (Vel. Integrated)",
+                        fps=30,
+                        show_trail=True,
+                        trail_length=30,
+                        figsize=(10, 8),
+                        format_type=viz_format_type,
+                        smooth=True,
+                    )
+                    plot_camera_trajectory_animation_vel_integrated(
+                        data=pred_trajectory,
+                        save_path=pred_vel_path,
+                        title=f"Sample {i:02d} - Predicted (Vel. Integrated)",
+                        fps=30,
+                        show_trail=True,
+                        trail_length=30,
+                        figsize=(10, 8),
+                        format_type=viz_format_type,
+                        smooth=True,
+                    )
+                    print(f"Vel-integrated videos saved: {gt_vel_path}, {pred_vel_path}")
+                except Exception as e:
+                    print(f"Error creating vel-integrated videos {i}: {e}")
     else:
         # For human motion data, use original plotting
         for i in range(len(data)):
@@ -215,6 +248,9 @@ if __name__ == "__main__":
         val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, drop_last=True, num_workers=4,
                                 shuffle=True, pin_memory=True)
     
+    # Eval loader uses meta from dataset_opt_path (e.g. Comp_v6_KLD005/meta). Ensure that meta
+    # has format-specific mean.npy, std.npy matching the dataset (e.g. copy from dataset or from
+    # a VQ run's meta once). The evaluator is trained on the dataset, so mean/std must match.
     if opt.eval_on:
         eval_val_loader, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device,
                                                        data_root_override=opt.data_root)

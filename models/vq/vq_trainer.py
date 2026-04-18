@@ -301,13 +301,14 @@ class RVQTokenizerTrainer:
         if is_camera_dataset:
             eval_fn = evaluation_camera_vqvae_clatr if use_clatr else evaluation_camera_vqvae
             # Use camera-specific evaluation (now includes FID and other motion metrics)
+            _clatr_extra = dict(vis_vel_integration=getattr(self.opt, 'vis_vel_integration', False)) if use_clatr else {}
             best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_recon, best_smoothness, best_position_error, best_orientation_error, writer = eval_fn(
                 self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, 
                 best_recon=best_recon, best_smoothness=best_smoothness,
                 best_position_error=best_position_error, best_orientation_error=best_orientation_error,
                 best_fid=best_fid, best_div=best_div, best_top1=best_top1,
                 best_top2=best_top2, best_top3=best_top3, best_matching=best_matching,
-                eval_wrapper=eval_wrapper, save=False)
+                eval_wrapper=eval_wrapper, save=False, **_clatr_extra)
         else:
             # Use original evaluation for human motion
             best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer = evaluation_vqvae(
@@ -433,13 +434,14 @@ class RVQTokenizerTrainer:
             if is_camera_dataset:
                 eval_fn = evaluation_camera_vqvae_clatr if use_clatr else evaluation_camera_vqvae
                 # Use camera-specific evaluation (now includes FID and other motion metrics)
+                _clatr_extra = dict(vis_vel_integration=getattr(self.opt, 'vis_vel_integration', False)) if use_clatr else {}
                 best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_recon, best_smoothness, best_position_error, best_orientation_error, writer = eval_fn(
                     self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, 
                     best_recon=best_recon, best_smoothness=best_smoothness,
                     best_position_error=best_position_error, best_orientation_error=best_orientation_error,
                     best_fid=best_fid, best_div=best_div, best_top1=best_top1,
                     best_top2=best_top2, best_top3=best_top3, best_matching=best_matching,
-                    eval_wrapper=eval_wrapper)
+                    eval_wrapper=eval_wrapper, **_clatr_extra)
             else:
                 # Use original evaluation for human motion
                 best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer = evaluation_vqvae(

@@ -17,7 +17,10 @@ Path C: MTransformer predicted base token only (Level 0), decoded through RVQ.
 Path D: Standard full-model inference (MTransformer base + RTransformer residuals).
 
 All panels share axis limits, camera viewing angle, and OpenGL coordinate convention.
-Optional 1D Gaussian smoothing (--smooth / --sigma) applied uniformly to all paths.
+Positions are velocity-integrated (from dx, dy, dz channels) for plotting, consistent
+with plot_camera_trajectory_animation_vel_integrated. Optional 1D Gaussian smoothing
+(--smooth / --sigma) applied to raw paths before processing; integration uses its own
+smoothing (smooth_sigma) on the integrated positions.
 L2 position error (vs Path B) overlaid on Path A and Path C panels.
 
 Usage:
@@ -32,12 +35,35 @@ Usage:
         --time_steps 10 --cond_scale 3 --temperature 0.3 --topkr 0.9 \\
         --smooth --sigma 1.0 \\
         --repeat_times 1
+
+python utils/vis_ablation_comparison.py \
+    --name mtrans_5k_newdata_xframe_r4_latest \
+    --res_name rtrans_5k_newdata_xframe_r4_latest \
+    --dataset_name realestate10k_rotmat \
+    --conditioning_mode t5 \
+    --use_keyframes \
+    --time_steps 20 --cond_scale 1.0 --temperature 0.2 --topkr 0.9 \
+    --smooth --sigma 1.0 \
+    --repeat_times 2 \
+    --split test --num_samples 100 \
+    --ext ablation_study_xframe_r4
 """
 
+import json
 import os
 import sys
 import textwrap
+from pathlib import Path
 from os.path import join as pjoin
+
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+# Ensure the project root is first on sys.path and remove the utils/ dir
+# to prevent circular imports (this script lives inside the utils package).
+_utils_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path = [p for p in sys.path if os.path.abspath(p) != _utils_dir]
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+os.chdir(_PROJECT_ROOT)
 
 import numpy as np
 import torch
@@ -47,6 +73,8 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from scipy.ndimage import gaussian_filter1d
+from PIL import Image
+from torchvision import transforms
 
 from models.mask_transformer.transformer import MaskTransformer, ResidualTransformer
 from models.vq.model import RVQVAE, LengthEstimator
@@ -64,9 +92,112 @@ from utils.camera_geometry import (
     forward_from_sixd,
     to_mpl,
     matrix_to_sixd,
+    integrate_velocity_to_positions,
 )
 
 clip_version = 'ViT-B/32'
+
+
+def _resolve_text_conditioning(ckpt_opt, cli_opt, role='model'):
+    """Prefer conditioning_mode / T5 / id counts from checkpoint opt.txt (see gen_camera.py)."""
+    cm_saved = getattr(ckpt_opt, 'conditioning_mode', None)
+    cm_cli = getattr(cli_opt, 'conditioning_mode', 'clip')
+    if cm_saved is not None and cm_saved != cm_cli:
+        print(
+            f'[vis_ablation] {role}: using conditioning_mode={cm_saved!r} from opt.txt '
+            f'(CLI was {cm_cli!r}).',
+        )
+    cm = cm_saved if cm_saved is not None else cm_cli
+    num_id = getattr(ckpt_opt, 'num_id_samples', getattr(cli_opt, 'num_id_samples', 50))
+    t5_name = getattr(ckpt_opt, 't5_model_name', getattr(cli_opt, 't5_model_name', 't5-base'))
+    return cm, num_id, t5_name
+
+
+def _build_clip_preprocess(use_bicubic_resize: bool):
+    resize = (
+        transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC)
+        if use_bicubic_resize else
+        transforms.Resize(224)
+    )
+    return transforms.Compose([
+        resize,
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],
+            std=[0.26862954, 0.26130258, 0.27577711],
+        ),
+    ])
+
+
+def prepare_visual_conditioning_for_ablation(
+    sample_names,
+    gt_frame_lengths,
+    scene_id_mapping,
+    frame_dir,
+    model_opt,
+    device,
+    clip_preprocess,
+):
+    """Build per-sample CLIP visual conditioning tensors for the ablation batch.
+
+    Each sample is looked up via *scene_id_mapping* -> hash_id ->
+    ``frame_dir/{hash_id}/`` and up to ``max_sparse_frames`` images are loaded
+    with uniform temporal sampling.
+
+    Returns (first_frame_pixels, sparse_frames, visual_indices, visual_valid_mask),
+    all ``None`` when the model does not use visual conditioning.
+    """
+    use_first_frame = getattr(model_opt, 'use_first_frame', False)
+    use_sparse_frames = getattr(model_opt, 'use_sparse_frames', False)
+    if not use_first_frame and not use_sparse_frames:
+        return None, None, None, None
+
+    max_k = getattr(model_opt, 'max_sparse_frames', 4)
+    B = len(sample_names)
+    frame_dir = Path(frame_dir)
+
+    if use_first_frame:
+        pixels = torch.zeros(B, 3, 224, 224)
+        for b, name in enumerate(sample_names):
+            hash_id = scene_id_mapping.get(name, name)
+            scene_dir = frame_dir / hash_id
+            if not scene_dir.exists():
+                continue
+            files = sorted(scene_dir.glob('frame_*.jpg'))
+            if not files:
+                continue
+            img = Image.open(files[0]).convert('RGB')
+            pixels[b] = clip_preprocess(img)
+        return pixels.to(device), None, None, None
+
+    # use_sparse_frames
+    sparse = torch.zeros(B, max_k, 3, 224, 224)
+    indices = torch.zeros(B, max_k, dtype=torch.long)
+    valid = torch.zeros(B, max_k, dtype=torch.bool)
+
+    for b, (name, gt_len) in enumerate(zip(sample_names, gt_frame_lengths)):
+        hash_id = scene_id_mapping.get(name, name)
+        scene_dir = frame_dir / hash_id
+        if not scene_dir.exists():
+            continue
+        files = sorted(scene_dir.glob('frame_*.jpg'))
+        if not files:
+            continue
+        n_avail = len(files)
+        n_use = min(n_avail, max_k, max(1, gt_len))
+        chosen_file_idxs = np.linspace(0, n_avail - 1, n_use, dtype=int)
+        raw_max = max(gt_len - 1, 1)
+        for slot, fi in enumerate(chosen_file_idxs):
+            raw_frame_idx = round(fi * raw_max / max(n_avail - 1, 1))
+            vq_idx = raw_frame_idx // 4
+            img = Image.open(files[fi]).convert('RGB')
+            sparse[b, slot] = clip_preprocess(img)
+            indices[b, slot] = vq_idx
+            valid[b, slot] = True
+
+    return None, sparse.to(device), indices.to(device), valid.to(device)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Model loaders (reused from gen_camera.py)
@@ -104,8 +235,10 @@ def load_vq_model(vq_opt):
     return vq_model, vq_opt
 
 
-def load_trans_model(model_opt, opt, which_model):
-    conditioning_mode = getattr(opt, 'conditioning_mode', 'clip')
+def load_trans_model(model_opt, opt, which_model, text_cond=None, allow_root_fallback=True):
+    if text_cond is None:
+        text_cond = _resolve_text_conditioning(model_opt, opt, role='mask_transformer')
+    conditioning_mode, num_id_samples, t5_model_name = text_cond
     t2m_transformer = MaskTransformer(
         code_dim=model_opt.code_dim, cond_mode='text',
         latent_dim=model_opt.latent_dim, ff_size=model_opt.ff_size,
@@ -113,24 +246,43 @@ def load_trans_model(model_opt, opt, which_model):
         dropout=model_opt.dropout, clip_dim=512,
         cond_drop_prob=model_opt.cond_drop_prob, clip_version=clip_version,
         conditioning_mode=conditioning_mode,
-        num_id_samples=getattr(opt, 'num_id_samples', 50),
-        t5_model_name=getattr(opt, 't5_model_name', 't5-base'),
+        num_id_samples=num_id_samples,
+        t5_model_name=t5_model_name,
+        use_first_frame=getattr(model_opt, 'use_first_frame', False),
+        use_sparse_frames=getattr(model_opt, 'use_sparse_frames', False),
+        max_sparse_frames=getattr(model_opt, 'max_sparse_frames', 4),
+        visual_drop_prob=getattr(model_opt, 'visual_drop_prob', 0.0),
         opt=model_opt,
     )
-    ckpt = torch.load(pjoin(model_opt.checkpoints_dir, model_opt.dataset_name,
-                            model_opt.name, 'model', which_model), map_location='cpu')
+    model_path = pjoin(model_opt.checkpoints_dir, model_opt.dataset_name, model_opt.name, 'model', which_model)
+    root_path = pjoin(model_opt.checkpoints_dir, model_opt.dataset_name, model_opt.name, which_model)
+    if os.path.exists(model_path):
+        ckpt_path = model_path
+    elif allow_root_fallback and os.path.exists(root_path):
+        ckpt_path = root_path
+        print(f'  Loading from root (CLaTr eval saves net_best_fid to root): {which_model}')
+    else:
+        if allow_root_fallback:
+            raise FileNotFoundError(f'Checkpoint not found: {model_path} or {root_path}')
+        raise FileNotFoundError(f'Checkpoint not found: {model_path}')
+
+    ckpt = torch.load(ckpt_path, map_location='cpu')
     key = 't2m_transformer' if 't2m_transformer' in ckpt else 'trans'
     missing, unexpected = t2m_transformer.load_state_dict(ckpt[key], strict=False)
-    assert len(unexpected) == 0
-    assert all(k.startswith('clip_model.') or k.startswith('cond_provider.') for k in missing)
+    _allowed = ('clip_model.', 'cond_provider.', 'clip_image_encoder.')
+    assert len(unexpected) == 0, f'Unexpected keys in MaskTransformer: {unexpected}'
+    assert all(any(k.startswith(p) for p in _allowed) for k in missing), \
+        f'Missing trainable keys in MaskTransformer: {missing}'
     print(f'Loading Transformer {opt.name} from epoch {ckpt["ep"]}!')
     return t2m_transformer
 
 
-def load_res_model(res_opt, vq_opt, opt):
+def load_res_model(res_opt, vq_opt, opt, text_cond=None):
     res_opt.num_quantizers = vq_opt.num_quantizers
     res_opt.num_tokens = vq_opt.nb_code
-    conditioning_mode = getattr(opt, 'conditioning_mode', 'clip')
+    if text_cond is None:
+        text_cond = _resolve_text_conditioning(res_opt, opt, role='res_transformer')
+    conditioning_mode, num_id_samples, t5_model_name = text_cond
     res_transformer = ResidualTransformer(
         code_dim=vq_opt.code_dim, cond_mode='text',
         latent_dim=res_opt.latent_dim, ff_size=res_opt.ff_size,
@@ -140,18 +292,42 @@ def load_res_model(res_opt, vq_opt, opt):
         cond_drop_prob=res_opt.cond_drop_prob,
         share_weight=res_opt.share_weight, clip_version=clip_version,
         conditioning_mode=conditioning_mode,
-        num_id_samples=getattr(opt, 'num_id_samples', 50),
-        t5_model_name=getattr(opt, 't5_model_name', 't5-base'),
+        num_id_samples=num_id_samples,
+        t5_model_name=t5_model_name,
+        use_first_frame=getattr(res_opt, 'use_first_frame', False),
+        use_sparse_frames=getattr(res_opt, 'use_sparse_frames', False),
+        max_sparse_frames=getattr(res_opt, 'max_sparse_frames', 4),
+        visual_drop_prob=getattr(res_opt, 'visual_drop_prob', 0.0),
         opt=res_opt,
     )
     is_camera = any(n in res_opt.dataset_name.lower() for n in ("cam", "estate", "realestate"))
-    if is_camera:
+    res_which = getattr(opt, 'res_which_epoch', None)
+
+    def _res_ckpt_full_path(basename):
+        mp = pjoin(res_opt.checkpoints_dir, res_opt.dataset_name, res_opt.name, 'model', basename)
+        rp = pjoin(res_opt.checkpoints_dir, res_opt.dataset_name, res_opt.name, basename)
+        if os.path.exists(mp):
+            return mp
+        if os.path.exists(rp):
+            print(f'  Loading residual ckpt from run root: {basename}')
+            return rp
+        return None
+
+    if res_which:
+        ckpt_bn = res_which if str(res_which).endswith('.tar') else f'{res_which}.tar'
+        ckpt_path = _res_ckpt_full_path(ckpt_bn)
+        if ckpt_path is None:
+            raise FileNotFoundError(
+                f'res_which_epoch={res_which!r}: no {ckpt_bn} for {res_opt.dataset_name}/{res_opt.name}',
+            )
+        ckpt = torch.load(ckpt_path, map_location=opt.device)
+    elif is_camera:
         ckpt_files = ['net_best_acc.tar', 'net_best_loss.tar', 'latest.tar']
         loaded = False
         for cf in ckpt_files:
-            path = pjoin(res_opt.checkpoints_dir, res_opt.dataset_name, res_opt.name, 'model', cf)
-            if os.path.exists(path):
-                ckpt = torch.load(path, map_location=opt.device)
+            ckpt_path = _res_ckpt_full_path(cf)
+            if ckpt_path is not None:
+                ckpt = torch.load(ckpt_path, map_location=opt.device)
                 loaded = True
                 print(f'Loading Residual Transformer {res_opt.name} from {cf}')
                 break
@@ -161,8 +337,10 @@ def load_res_model(res_opt, vq_opt, opt):
         ckpt = torch.load(pjoin(res_opt.checkpoints_dir, res_opt.dataset_name, res_opt.name,
                                 'model', 'net_best_fid.tar'), map_location=opt.device)
     missing, unexpected = res_transformer.load_state_dict(ckpt['res_transformer'], strict=False)
-    assert len(unexpected) == 0
-    assert all(k.startswith('clip_model.') or k.startswith('cond_provider.') for k in missing)
+    _allowed = ('clip_model.', 'cond_provider.', 'clip_image_encoder.')
+    assert len(unexpected) == 0, f'Unexpected keys in ResidualTransformer: {unexpected}'
+    assert all(any(k.startswith(p) for p in _allowed) for k in missing), \
+        f'Missing trainable keys in ResidualTransformer: {missing}'
     print(f'Loading Residual Transformer {res_opt.name} from epoch {ckpt["ep"]}!')
     return res_transformer
 
@@ -251,8 +429,13 @@ def render_ablation_comparison(
     arrow_scale_factor: float = 0.06,
     show_trail: bool = True,
     trail_length: int = 30,
+    smooth: bool = True,
+    smooth_sigma: float = 1.5,
 ):
     """Render a 2×2 animated comparison of four trajectory paths.
+
+    Uses velocity-integrated positions (from dx, dy, dz channels) for plotting,
+    consistent with plot_camera_trajectory_animation_vel_integrated.
 
     Layout:
         top-left:  Path A (GT Base Only)       top-right: Path B (Full GT Recon)
@@ -266,12 +449,19 @@ def render_ablation_comparison(
     }
     panel_positions = {'A': 1, 'B': 2, 'C': 3, 'D': 4}
 
-    # Parse all paths through UnifiedCameraData → positions + orientations
+    # Parse all paths: velocity-integrated positions + orientations
     parsed = {}
     for key, raw in paths.items():
         ud = UnifiedCameraData(raw, format_type=format_type)
-        raw_pos = ud.positions.numpy()
         orientations = ud.orientations.numpy()
+        # Velocity-integrated positions (from dx, dy, dz channels)
+        try:
+            raw_pos = integrate_velocity_to_positions(
+                raw, smooth=smooth, smooth_sigma=smooth_sigma
+            )
+        except ValueError as exc:
+            print(f"[ablation] Path {key}: velocity integration failed ({exc}), using direct positions")
+            raw_pos = ud.positions.numpy()
         mpl_pos = to_mpl(raw_pos)
         parsed[key] = {
             'positions': mpl_pos,
@@ -435,8 +625,14 @@ def render_ablation_static(
     format_type: CameraDataFormat = None,
     arrow_scale_factor: float = 0.06,
     figsize: tuple = (16, 14),
+    smooth: bool = True,
+    smooth_sigma: float = 1.5,
 ):
-    """Render a static 2×2 comparison plot (PNG)."""
+    """Render a static 2×2 comparison plot (PNG).
+
+    Uses velocity-integrated positions (from dx, dy, dz channels) for plotting,
+    consistent with plot_camera_trajectory_animation_vel_integrated.
+    """
     labels = {
         'A': 'Path A: GT Base-Only (L0)',
         'B': 'Path B: Full GT Recon (All Levels)',
@@ -448,8 +644,15 @@ def render_ablation_static(
     parsed = {}
     for key, raw in paths.items():
         ud = UnifiedCameraData(raw, format_type=format_type)
-        raw_pos = ud.positions.numpy()
         orientations = ud.orientations.numpy()
+        # Velocity-integrated positions (from dx, dy, dz channels)
+        try:
+            raw_pos = integrate_velocity_to_positions(
+                raw, smooth=smooth, smooth_sigma=smooth_sigma
+            )
+        except ValueError as exc:
+            print(f"[ablation] Path {key}: velocity integration failed ({exc}), using direct positions")
+            raw_pos = ud.positions.numpy()
         mpl_pos = to_mpl(raw_pos)
         parsed[key] = {
             'positions': mpl_pos,
@@ -554,6 +757,17 @@ def add_ablation_args(parser):
                         help='Number of samples to draw from the dataset split (default: 10)')
     parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'],
                         help='Which dataset split to draw GT samples from (default: test)')
+    parser.add_argument('--frame_dir', type=str,
+                        default='/data4/haozhe/CamTraj/data/processed_estate/train_frames',
+                        help='Root directory containing per-scene frame subdirectories '
+                             '(default: /data4/haozhe/CamTraj/data/processed_estate/train_frames)')
+    # Temporary factor-isolation flags (remove after diagnosis is complete).
+    parser.add_argument('--legacy_single_batch_generation', action='store_true',
+                        help='Disable mini-batch generation and run all prompts in one giant batch (legacy behavior).')
+    parser.add_argument('--disable_mask_root_fallback', action='store_true',
+                        help='Force mask checkpoint loading from model/ only (disable run-root fallback).')
+    parser.add_argument('--legacy_clip_resize', action='store_true',
+                        help='Use legacy CLIP preprocess Resize(224) instead of BICUBIC resize.')
     return parser
 
 
@@ -593,11 +807,23 @@ if __name__ == '__main__':
     # ── Load R-Transformer ──
     res_opt_path = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.res_name, 'opt.txt')
     res_opt = get_opt(res_opt_path, device=opt.device)
-    res_model = load_res_model(res_opt, vq_opt, opt)
+    text_cond_m = _resolve_text_conditioning(model_opt, opt, role='mask_transformer')
+    text_cond_r = _resolve_text_conditioning(res_opt, opt, role='res_transformer')
+    if text_cond_m[0] != text_cond_r[0]:
+        print(
+            f'[vis_ablation] WARNING: mask conditioning_mode={text_cond_m[0]!r} != '
+            f'res {text_cond_r[0]!r}',
+        )
+    res_model = load_res_model(res_opt, vq_opt, opt, text_cond=text_cond_r)
     assert res_opt.vq_name == model_opt.vq_name
 
     # ── Load M-Transformer ──
-    t2m_transformer = load_trans_model(model_opt, opt, 'latest.tar')
+    which_m = getattr(opt, 'which_epoch', 'latest')
+    ckpt_m = which_m if str(which_m).endswith('.tar') else f'{which_m}.tar'
+    t2m_transformer = load_trans_model(
+        model_opt, opt, ckpt_m, text_cond=text_cond_m,
+        allow_root_fallback=(not getattr(opt, 'disable_mask_root_fallback', False)),
+    )
 
     t2m_transformer.eval()
     vq_model.eval()
@@ -633,7 +859,7 @@ if __name__ == '__main__':
 
     # ── Load samples directly from dataset split ──
     # This ensures every sample has GT data for Path A & B
-    conditioning_mode = getattr(opt, 'conditioning_mode', 'clip')
+    conditioning_mode = text_cond_m[0]
     motion_dir = pjoin(data_root, 'new_joint_vecs')
     texts_dir = pjoin(data_root, 'texts')
 
@@ -703,6 +929,48 @@ if __name__ == '__main__':
     else:
         gen_conds = captions
 
+    # ── Visual conditioning (per-sample, from dataset frames) ──────────────
+    vis_first_frame = None
+    vis_sparse_frames = None
+    vis_indices = None
+    vis_valid_mask = None
+    clip_preprocess = _build_clip_preprocess(
+        use_bicubic_resize=(not getattr(opt, 'legacy_clip_resize', False)))
+    print(
+        "[vis_ablation] Factor toggles: "
+        f"mini_batch={'OFF' if getattr(opt, 'legacy_single_batch_generation', False) else 'ON'}, "
+        f"mask_root_fallback={'OFF' if getattr(opt, 'disable_mask_root_fallback', False) else 'ON'}, "
+        f"clip_bicubic_resize={'OFF' if getattr(opt, 'legacy_clip_resize', False) else 'ON'}"
+    )
+
+    _model_has_visual = (
+        getattr(model_opt, 'use_first_frame', False)
+        or getattr(model_opt, 'use_sparse_frames', False)
+    )
+    if opt.use_keyframes and _model_has_visual:
+        mapping_path = pjoin(data_root, 'scene_id_mapping.json')
+        if os.path.exists(mapping_path):
+            with open(mapping_path) as _f:
+                scene_id_mapping = json.load(_f)
+        else:
+            scene_id_mapping = {}
+            print(f"Warning: scene_id_mapping.json not found at {mapping_path}")
+
+        gt_frame_lengths = [len(m) for m in gt_motions]
+        (vis_first_frame,
+         vis_sparse_frames,
+         vis_indices,
+         vis_valid_mask) = prepare_visual_conditioning_for_ablation(
+            gt_sample_names, gt_frame_lengths, scene_id_mapping,
+            opt.frame_dir, model_opt, opt.device, clip_preprocess,
+        )
+        vis_mode = 'first_frame' if vis_first_frame is not None else 'sparse_frames'
+        print(f"Visual conditioning: {vis_mode} "
+              f"(model use_first_frame={getattr(model_opt, 'use_first_frame', False)}, "
+              f"use_sparse_frames={getattr(model_opt, 'use_sparse_frames', False)})")
+    elif opt.use_keyframes and not _model_has_visual:
+        print("Warning: --use_keyframes set but model has no visual conditioning. Ignoring.")
+
     # ── Main generation loop ──
     for r in range(opt.repeat_times):
         print(f"{'='*70}")
@@ -710,32 +978,79 @@ if __name__ == '__main__':
         print(f"{'='*70}")
 
         with torch.no_grad():
-            # ─────────────────────────────────────────────────────────
-            # Path C: MTransformer predicted base tokens only (Level 0)
-            # ─────────────────────────────────────────────────────────
-            mids_base = t2m_transformer.generate(
-                gen_conds, token_lens,
-                timesteps=opt.time_steps,
-                cond_scale=opt.cond_scale,
-                temperature=opt.temperature,
-                topk_filter_thres=opt.topkr,
-                gsample=opt.gumbel_sample,
-            )
-            # mids_base shape: (B, N) — just the base tokens (level 0)
-            # Decode through RVQ with only level 0
-            mids_base_only = mids_base.unsqueeze(-1)  # (B, N, 1)
-            pred_base_only = vq_model.forward_decoder(mids_base_only)
-            pred_base_only = pred_base_only.detach().cpu().numpy()
-            path_C_all = inv_transform(pred_base_only)
+            # Generate in mini-batches (default) to avoid prompt-collapse on large
+            # T5 batches. Legacy factor-isolation mode can force one giant batch.
+            if getattr(opt, 'legacy_single_batch_generation', False):
+                gen_batch_size = len(captions)
+            else:
+                gen_batch_size = getattr(opt, 'batch_size', 32)
+            n_samples = len(captions)
+            print(f"[vis_ablation] Effective generation batch_size={gen_batch_size}, n_samples={n_samples}")
+            path_c_chunks = []
+            path_d_chunks = []
 
-            # ─────────────────────────────────────────────────────────
-            # Path D: Full model prediction (MTransformer + RTransformer)
-            # ─────────────────────────────────────────────────────────
-            mids_full = res_model.generate(mids_base, gen_conds, token_lens,
-                                           temperature=1, cond_scale=5)
-            pred_full = vq_model.forward_decoder(mids_full)
-            pred_full = pred_full.detach().cpu().numpy()
-            path_D_all = inv_transform(pred_full)
+            for batch_start in range(0, n_samples, gen_batch_size):
+                batch_end = min(batch_start + gen_batch_size, n_samples)
+                b_token_lens = token_lens[batch_start:batch_end]
+
+                if conditioning_mode == 'id_embedding':
+                    b_conds = gen_conds[batch_start:batch_end]
+                else:
+                    b_conds = captions[batch_start:batch_end]
+
+                b_vis_first = vis_first_frame[batch_start:batch_end] if vis_first_frame is not None else None
+                b_vis_sparse = vis_sparse_frames[batch_start:batch_end] if vis_sparse_frames is not None else None
+                b_vis_idx = vis_indices[batch_start:batch_end] if vis_indices is not None else None
+                b_vis_mask = vis_valid_mask[batch_start:batch_end] if vis_valid_mask is not None else None
+
+                # ── Path C: base-only prediction ──
+                mids_base = t2m_transformer.generate(
+                    b_conds, b_token_lens,
+                    timesteps=opt.time_steps,
+                    cond_scale=opt.cond_scale,
+                    temperature=opt.temperature,
+                    topk_filter_thres=opt.topkr,
+                    gsample=opt.gumbel_sample,
+                    first_frame_pixels=b_vis_first,
+                    sparse_frames=b_vis_sparse,
+                    visual_indices=b_vis_idx,
+                    visual_valid_mask=b_vis_mask,
+                )
+                mids_base_only = mids_base.unsqueeze(-1)
+                pred_base_only = vq_model.forward_decoder(mids_base_only)
+                path_c_chunks.append(inv_transform(pred_base_only.detach().cpu().numpy()))
+
+                # ── Path D: full prediction (base + residual) ──
+                mids_full = res_model.generate(
+                    mids_base, b_conds, b_token_lens,
+                    temperature=1, cond_scale=getattr(opt, 'res_cond_scale', 5),
+                    first_frame_pixels=b_vis_first,
+                    sparse_frames=b_vis_sparse,
+                    visual_indices=b_vis_idx,
+                    visual_valid_mask=b_vis_mask,
+                )
+                pred_full = vq_model.forward_decoder(mids_full)
+                path_d_chunks.append(inv_transform(pred_full.detach().cpu().numpy()))
+
+            # Different mini-batches can decode to different temporal lengths.
+            # Pad to a common T before concatenation (same strategy as gen_camera.py).
+            max_t_c = max(x.shape[1] for x in path_c_chunks)
+            padded_c = []
+            for x in path_c_chunks:
+                if x.shape[1] < max_t_c:
+                    pad = np.zeros((x.shape[0], max_t_c - x.shape[1], x.shape[2]), dtype=x.dtype)
+                    x = np.concatenate([x, pad], axis=1)
+                padded_c.append(x)
+            path_C_all = np.concatenate(padded_c, axis=0)
+
+            max_t_d = max(x.shape[1] for x in path_d_chunks)
+            padded_d = []
+            for x in path_d_chunks:
+                if x.shape[1] < max_t_d:
+                    pad = np.zeros((x.shape[0], max_t_d - x.shape[1], x.shape[2]), dtype=x.dtype)
+                    x = np.concatenate([x, pad], axis=1)
+                padded_d.append(x)
+            path_D_all = np.concatenate(padded_d, axis=0)
 
         # Process each sample
         for k, caption in enumerate(captions):
@@ -812,6 +1127,8 @@ if __name__ == '__main__':
                 render_ablation_static(
                     paths_dict, static_path, text_prompt=caption,
                     format_type=viz_format_type,
+                    smooth=True,
+                    smooth_sigma=opt.sigma,
                 )
 
             # ── Render animation ──
@@ -824,6 +1141,8 @@ if __name__ == '__main__':
                     format_type=viz_format_type,
                     fps=opt.anim_fps,
                     stride=opt.stride,
+                    smooth=True,
+                    smooth_sigma=opt.sigma,
                 )
 
             # ── Print L2 errors ──

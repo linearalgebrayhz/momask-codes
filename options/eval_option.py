@@ -4,6 +4,14 @@ class EvalT2MOptions(BaseOptions):
     def initialize(self):
         BaseOptions.initialize(self)
         self.parser.add_argument('--which_epoch', type=str, default="latest", help='Checkpoint you want to use, {latest, net_best_fid, etc}')
+        self.parser.add_argument(
+            '--res_which_epoch',
+            type=str,
+            default=None,
+            help='Residual transformer checkpoint (e.g. latest, net_best_loss). '
+                 'If unset, camera datasets try net_best_acc → net_best_loss → latest '
+                 '(mask transformer still follows --which_epoch only — mismatched epochs can hurt quality).',
+        )
         self.parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
 
         self.parser.add_argument('--ext', type=str, default='text2motion', help='Extension of the result file or folder')
@@ -12,7 +20,9 @@ class EvalT2MOptions(BaseOptions):
         self.parser.add_argument("--repeat_times", default=1, type=int,
                                  help="Number of repetitions, per sample text prompt")
         self.parser.add_argument("--cond_scale", default=4, type=float,
-                                 help="For classifier-free sampling - specifies the s parameter, as defined in the paper.")
+                                 help="CFG scale for the mask transformer stage.")
+        self.parser.add_argument("--res_cond_scale", default=5, type=float,
+                                 help="CFG scale for the residual transformer stage (matches training CLaTr eval / common gen_camera usage).")
         self.parser.add_argument("--temperature", default=1., type=float,
                                  help="Sampling Temperature.")
         self.parser.add_argument("--topkr", default=0.9, type=float,
@@ -49,6 +59,11 @@ class EvalT2MOptions(BaseOptions):
         self.parser.add_argument('--sample_ids', type=str, default='',
                                  help='Comma-separated sample IDs for id_embedding generation (e.g., "0,1,2,3"). '
                                       'If empty, generates for all IDs [0, num_id_samples).')
+
+        self.parser.add_argument('--vis_vel_integration', action="store_true",
+                                 help='Also generate velocity-integrated trajectory animations '
+                                      '(cumulative sum of dx/dy/dz with Gaussian smoothing) '
+                                      'alongside the standard position-based visualizations.')
 
         '''Keyframe Conditioning (Inference)'''
         self.parser.add_argument('--keyframe_dir', type=str, default=None, help='Directory containing keyframe images (jpg/png)')

@@ -1,3 +1,5 @@
+import os
+import numpy as np
 import torch
 from collections import defaultdict
 import torch.optim as optim
@@ -7,6 +9,7 @@ from utils.utils import *
 from os.path import join as pjoin
 from utils.eval_t2m import evaluation_mask_transformer, evaluation_res_transformer
 from utils.clatr_camera_eval import evaluation_mask_transformer_clatr, evaluation_res_transformer_clatr
+from utils.unified_data_format import detect_format_from_dataset_name
 from models.mask_transformer.tools import *
 
 from einops import rearrange, repeat
@@ -25,7 +28,6 @@ class BaseTransformerTrainer:
     """Shared training logic for MaskTransformerTrainer and ResidualTransformerTrainer.
 
     Consolidates:
-      - Sparse keyframe encoding (encode_frames)
       - Direction loss computation
       - Gradient clipping, AMP, NaN detection
       - Checkpoint save / resume
@@ -61,56 +63,26 @@ class BaseTransformerTrainer:
         if args.is_train:
             self.logger = create_experiment_logger(args)
 
-    # ── Frame encoding ─────────────────────────────────────
-
-    def encode_frames(self, frames_batch, m_lens, target_seq_len=None):
-        """
-        Encode frames using SparseKeyframeEncoder (ResNet + Temporal Conv).
-
-        Args:
-            frames_batch: List of List[Path], length B
-            m_lens: Tensor of motion lengths (B,) ORIGINAL lengths (before VQ downsampling)
-            target_seq_len: Target sequence length to pad to (after //4)
-
-        Returns:
-            frame_embeddings: Tensor (target_seq_len, B, latent_dim)
-            has_frames: bool
-        """
-        if not hasattr(self, 'sparse_keyframe_encoder'):
-            from models.sparse_keyframe_encoder import SparseKeyframeEncoder
-
-            resnet_arch = getattr(self.opt, 'keyframe_arch', 'resnet18')
-            latent_dim = self._model.latent_dim
-
-            print(f"Loading SparseKeyframeEncoder ({resnet_arch})...")
-            self.sparse_keyframe_encoder = SparseKeyframeEncoder(
-                resnet_arch=resnet_arch,
-                latent_dim=latent_dim,
-                pretrained=True
-            ).to(self.device)
-            self.sparse_keyframe_encoder.train()
-            print(f"✓ SparseKeyframeEncoder loaded (arch={resnet_arch}, latent_dim={latent_dim})")
-
-        frame_embeddings, has_frames = self.sparse_keyframe_encoder(
-            frames_batch, m_lens,
-            deterministic=not self.sparse_keyframe_encoder.training)
-
-        # Pad to target sequence length if needed
-        if target_seq_len is not None and frame_embeddings.shape[0] < target_seq_len:
-            pad_len = target_seq_len - frame_embeddings.shape[0]
-            padding = torch.zeros(pad_len, frame_embeddings.shape[1], frame_embeddings.shape[2],
-                                  device=frame_embeddings.device)
-            frame_embeddings = torch.cat([frame_embeddings, padding], dim=0)
-
-        return frame_embeddings, has_frames
+        # Normalisation stats — loaded from VQ checkpoint meta so that
+        # eval comparison plots are rendered in raw (real-world) units.
+        _vq_meta = pjoin(args.checkpoints_dir, args.dataset_name,
+                         getattr(args, 'vq_name', ''), 'meta')
+        _mean_path = pjoin(_vq_meta, 'mean.npy')
+        _std_path  = pjoin(_vq_meta, 'std.npy')
+        if os.path.exists(_mean_path) and os.path.exists(_std_path):
+            self.norm_mean = np.load(_mean_path)
+            self.norm_std  = np.load(_std_path)
+        else:
+            self.norm_mean = None
+            self.norm_std  = None
 
     # ── Batch preparation ──────────────────────────────────
 
     def _prepare_batch(self, batch_data, step=None):
-        """Unpack batch, VQ encode, encode frames, downsample m_lens.
+        """Unpack batch, VQ encode, downsample m_lens.
 
         Returns:
-            conds, code_idx, m_lens (downsampled), frame_emb, has_frames_flag,
+            conds, code_idx, m_lens (downsampled),
             first_frame_pixels (or None),
             sparse_frames (or None), visual_indices (or None), visual_valid_mask (or None)
         """
@@ -125,36 +97,21 @@ class BaseTransformerTrainer:
             sparse_frames = sparse_frames_data.float().to(self.device)        # (B, 4, 3, 224, 224)
             visual_valid_mask = visual_valid_mask_data.to(self.device)        # (B, 4) bool
             visual_indices = visual_indices_data.long().to(self.device)       # (B, 4)
-            has_frames = False
-            frames_batch = None
         elif len(batch_data) == 4:
             conds, motion, m_lens, fourth = batch_data
-            # Distinguish first-frame tensor (B,3,224,224) from frame paths (list of lists)
             if torch.is_tensor(fourth) and fourth.dim() == 4:
-                # First-frame conditioning mode
                 first_frame_pixels = fourth.float().to(self.device)
-                has_frames = False
-                frames_batch = None
             else:
-                has_frames = True
-                frames_batch = fourth
+                raise TypeError(
+                    "Expected (caption, motion, m_len, first_frame_tensor[B,3,224,224]); "
+                    "legacy ResNet frame-path batches are no longer supported.")
         else:
             conds, motion, m_lens = batch_data
-            frames_batch = None
-            has_frames = False
 
         motion = motion.detach().float().to(self.device)
         m_lens = m_lens.detach().long().to(self.device)
 
         code_idx, _ = self.vq_model.encode(motion)
-
-        # Encode frames BEFORE downsampling m_lens
-        frame_emb = None
-        has_frames_flag = False
-        if has_frames and frames_batch is not None:
-            target_seq_len = code_idx.shape[1]
-            frame_emb, has_frames_flag = self.encode_frames(frames_batch, m_lens,
-                                                            target_seq_len=target_seq_len)
 
         # Downsample m_lens for VQ tokens
         m_lens = torch.div(m_lens, 4, rounding_mode='floor')
@@ -169,7 +126,7 @@ class BaseTransformerTrainer:
             conds = conds.to(self.device)
         # else: conds is a list of strings (text mode) — leave as-is
 
-        return (conds, code_idx, m_lens, frame_emb, has_frames_flag, 
+        return (conds, code_idx, m_lens,
                 first_frame_pixels, sparse_frames, visual_indices, visual_valid_mask)
 
     # ── Direction loss ─────────────────────────────────────
@@ -328,9 +285,6 @@ class BaseTransformerTrainer:
             'total_it': total_it,
         }
 
-        if hasattr(self, 'sparse_keyframe_encoder'):
-            state['sparse_keyframe_encoder'] = self.sparse_keyframe_encoder.state_dict()
-
         torch.save(state, file_name)
 
     def resume(self, model_dir):
@@ -355,18 +309,6 @@ class BaseTransformerTrainer:
         if unexpected_missing:
             print(f"Warning: Unexpected missing keys: {unexpected_missing}")
         print(f"Loaded {self.MODEL_KEY} model")
-
-        # Resume SparseKeyframeEncoder if available
-        if 'sparse_keyframe_encoder' in checkpoint:
-            if not hasattr(self, 'sparse_keyframe_encoder'):
-                from models.sparse_keyframe_encoder import SparseKeyframeEncoder
-                resnet_arch = getattr(self.opt, 'keyframe_arch', 'resnet18')
-                latent_dim = self._model.latent_dim
-                self.sparse_keyframe_encoder = SparseKeyframeEncoder(
-                    resnet_arch=resnet_arch, latent_dim=latent_dim, pretrained=False
-                ).to(self.device)
-            self.sparse_keyframe_encoder.load_state_dict(checkpoint['sparse_keyframe_encoder'])
-            print(f"Loaded SparseKeyframeEncoder")
 
         return checkpoint['ep'], checkpoint['total_it']
 
@@ -404,11 +346,7 @@ class BaseTransformerTrainer:
 
         # Collect parameters
         params_to_optimize = list(self._model.parameters())
-        if hasattr(self, 'sparse_keyframe_encoder'):
-            params_to_optimize += list(self.sparse_keyframe_encoder.parameters())
-            print(f"Optimizer: transformer + SparseKeyframeEncoder")
-        else:
-            print("Optimizer: transformer only")
+        print("Optimizer: transformer only")
 
         self._optimizer = optim.AdamW(params_to_optimize, betas=(0.9, 0.99),
                                       lr=self.opt.lr, weight_decay=1e-5)
@@ -445,9 +383,6 @@ class BaseTransformerTrainer:
         while epoch < self.opt.max_epoch:
             self._model.train()
             self.vq_model.eval()
-            if hasattr(self, 'sparse_keyframe_encoder'):
-                self.sparse_keyframe_encoder.train()
-
             for i, batch in enumerate(tqdm(train_loader,
                                            desc=f"Train Epoch {epoch + 1}/{self.opt.max_epoch}")):
                 it += 1
@@ -486,9 +421,6 @@ class BaseTransformerTrainer:
             print('Validation time:')
             self.vq_model.eval()
             self._model.eval()
-            if hasattr(self, 'sparse_keyframe_encoder'):
-                self.sparse_keyframe_encoder.eval()
-
             val_loss, val_acc = [], []
             with torch.no_grad():
                 for i, batch_data in enumerate(val_loader):
@@ -544,12 +476,11 @@ class MaskTransformerTrainer(BaseTransformerTrainer):
         self.t2m_transformer = t2m_transformer
 
     def forward(self, batch_data, step=None):
-        (conds, code_idx, m_lens, frame_emb, has_frames_flag, 
+        (conds, code_idx, m_lens,
          first_frame_pixels, sparse_frames, visual_indices, visual_valid_mask) = self._prepare_batch(batch_data, step)
 
         _loss, _pred_ids, _acc = self._model(
             code_idx[..., 0], conds, m_lens,
-            frame_emb=frame_emb, has_frames=has_frames_flag,
             first_frame_pixels=first_frame_pixels,
             sparse_frames=sparse_frames,
             visual_indices=visual_indices,
@@ -579,13 +510,21 @@ class MaskTransformerTrainer(BaseTransformerTrainer):
                         for name in ["cam", "estate", "realestate"])
         use_clatr = is_camera and hasattr(eval_wrapper, 'traj_encoder')
         if use_clatr:
+            fmt = detect_format_from_dataset_name(self.opt.dataset_name)
             return evaluation_mask_transformer_clatr(
                 self.opt.save_root, eval_val_loader, self._model, self.vq_model,
                 self.logger, epoch,
                 best_fid=best_fid, best_div=best_div,
                 best_top1=best_top1, best_top2=best_top2, best_top3=best_top3,
                 best_matching=best_matching, eval_wrapper=eval_wrapper,
-                plot_func=plot_eval, save_ckpt=save_ckpt, save_anim=save_anim)
+                plot_func=plot_eval, save_ckpt=save_ckpt, save_anim=save_anim,
+                mean=self.norm_mean, std=self.norm_std, format_type=fmt,
+                cond_scale=getattr(self.opt, 'eval_mask_cond_scale', 3),
+                timesteps=getattr(self.opt, 'eval_time_steps', 18),
+                temperature=getattr(self.opt, 'eval_temperature', 1.0),
+                topkr=getattr(self.opt, 'eval_topkr', 0.9),
+                gsample=getattr(self.opt, 'gumbel_sample', False),
+                vis_vel_integration=getattr(self.opt, 'vis_vel_integration', False))
         return evaluation_mask_transformer(
             self.opt.save_root, eval_val_loader, self._model, self.vq_model,
             self.logger, epoch,
@@ -607,12 +546,11 @@ class ResidualTransformerTrainer(BaseTransformerTrainer):
         self.res_transformer = res_transformer
 
     def forward(self, batch_data, step=None):
-        (conds, code_idx, m_lens, frame_emb, has_frames_flag, 
+        (conds, code_idx, m_lens,
          first_frame_pixels, sparse_frames, visual_indices, visual_valid_mask) = self._prepare_batch(batch_data, step)
 
         ce_loss, pred_ids, acc = self._model(
             code_idx, conds, m_lens,
-            frame_emb=frame_emb, has_frames=has_frames_flag,
             first_frame_pixels=first_frame_pixels,
             sparse_frames=sparse_frames,
             visual_indices=visual_indices,
@@ -642,13 +580,18 @@ class ResidualTransformerTrainer(BaseTransformerTrainer):
                         for name in ["cam", "estate", "realestate"])
         use_clatr = is_camera and hasattr(eval_wrapper, 'traj_encoder')
         if use_clatr:
+            fmt = detect_format_from_dataset_name(self.opt.dataset_name)
             return evaluation_res_transformer_clatr(
                 self.opt.save_root, eval_val_loader, self._model, self.vq_model,
                 self.logger, epoch,
                 best_fid=best_fid, best_div=best_div,
                 best_top1=best_top1, best_top2=best_top2, best_top3=best_top3,
                 best_matching=best_matching, eval_wrapper=eval_wrapper,
-                plot_func=plot_eval, save_ckpt=save_ckpt, save_anim=save_anim)
+                plot_func=plot_eval, save_ckpt=save_ckpt, save_anim=save_anim,
+                mean=self.norm_mean, std=self.norm_std, format_type=fmt,
+                cond_scale=getattr(self.opt, 'eval_res_cond_scale', 5),
+                temperature=getattr(self.opt, 'eval_temperature', 1.0),
+                vis_vel_integration=getattr(self.opt, 'vis_vel_integration', False))
         return evaluation_res_transformer(
             self.opt.save_root, eval_val_loader, self._model, self.vq_model,
             self.logger, epoch,

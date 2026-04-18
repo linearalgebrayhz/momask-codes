@@ -2,7 +2,7 @@ echo "Starting Camera Masked Transformer Training..."
 
 DATASET_NAME="realestate10k_rotmat"
 
-EXPERIMENT_NAME="mtrans_5k_newdata_1frame2"
+EXPERIMENT_NAME="mtrans_5k_newdata_1frame_r4_latest"
 TENSORBOARD_DIR="./log/t2m/${DATASET_NAME}/${EXPERIMENT_NAME}"
 CHECKPOINT_DIR="./checkpoints/${DATASET_NAME}/${EXPERIMENT_NAME}"
 
@@ -20,13 +20,13 @@ echo "  tensorboard --logdir=${TENSORBOARD_DIR} --port=6006"
 echo "  # Then access via browser at: http://localhost:6006"
 echo ""
 
-CUDA_VISIBLE_DEVICES=2 python train_t2m_transformer.py \
+CUDA_VISIBLE_DEVICES=3 python train_t2m_transformer.py \
     --name ${EXPERIMENT_NAME} \
     --gpu_id 0 \
     --dataset_name ${DATASET_NAME} \
     --data_root ./dataset/RealEstate10K_rotmat_5k \
     --batch_size 64 \
-    --vq_name rvq_window128_5k_newdata \
+    --vq_name rvq_window128_5k_newdata_4quantizers_lastest \
     --conditioning_mode t5 \
     --cond_drop_prob 0.2 \
     --latent_dim 384 \
@@ -37,12 +37,12 @@ CUDA_VISIBLE_DEVICES=2 python train_t2m_transformer.py \
     --max_epoch 600 \
     --lr 5e-5 \
     --evaluator_ckpt ./checkpoints/evaluator/rotmat_5k2/best.pt \
+    --vis_vel_integration \
     --use_first_frame \
     --visual_drop_prob 0.2 \
-    # --use_sparse_frames \
-    # --is_continue \
-    # --finetune_clip \
-    # --finetune_clip_layers 2 \
-    # --keyframe_arch resnet18 \
+    # --use_sparse_frames  \
+    # --max_sparse_frames 4 \
+    # --visual_drop_prob 0.2 \
+
 
 echo "Masked Transformer Training completed!"

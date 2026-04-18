@@ -117,52 +117,6 @@ def collate_fn_text2motion_camera_train(batch):
     return default_collate(padded_batch)
 
 
-def collate_fn_text2motion_camera_train_frames(batch):
-    """
-    Custom collate function for Text2MotionDataset with camera trajectories and frames (training).
-    Pads all motions to the maximum length in the batch and handles frame PATHS (not loaded tensors).
-    Expected format: (caption, motion, m_length, frame_paths)
-    where frame_paths is a list of Path objects
-    """
-    # Check if batch includes frames
-    has_frames = len(batch[0]) == 4
-    
-    if not has_frames:
-        # Fallback to original collate
-        return collate_fn_text2motion_camera_train(batch)
-    
-    # Sort by length (descending) to get the maximum length first
-    batch.sort(key=lambda x: x[2], reverse=True)  # m_length is at index 2
-    
-    # Get the maximum length in this batch
-    max_len = batch[0][2]  # motion length is at index 2
-    
-    # Separate components
-    captions = []
-    motions = []
-    m_lengths = []
-    frame_paths_list = []
-    
-    for item in batch:
-        caption, motion, m_length, frame_paths = item  # frame_paths is list of Path objects
-        
-        # Pad motion to max_len
-        if motion.shape[0] < max_len:
-            padding = np.zeros((max_len - motion.shape[0], motion.shape[1]))
-            motion = np.concatenate([motion, padding], axis=0)
-        
-        captions.append(caption)
-        motions.append(motion)
-        m_lengths.append(m_length)
-        frame_paths_list.append(frame_paths)  # Keep as list of paths
-    
-    # Convert to tensors
-    motions = torch.from_numpy(np.stack(motions, axis=0))
-    m_lengths = torch.tensor(m_lengths)
-    
-    return captions, motions, m_lengths, frame_paths_list  # frame_paths_list is List[List[Path]]
-
-
 def collate_fn_text2motion_camera_train_first_frame(batch):
     """Collate for first-frame conditioning.
 

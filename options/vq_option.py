@@ -75,6 +75,10 @@ def arg_parse(is_train=False):
     parser.add_argument('--log_codebook_usage', action="store_true", help='Log codebook usage statistics')
     parser.add_argument('--log_model_weights', action="store_true", help='Log model weight histograms periodically')
     parser.add_argument('--num_vis_samples', type=int, default=4, help='number of GT/Pred sample pairs to visualize per epoch')
+    parser.add_argument('--vis_vel_integration', action="store_true",
+                        help='Also generate visualizations using velocity-channel time-integration '
+                             '(cumulative sum of dx/dy/dz) with Gaussian smoothing, in addition to '
+                             'the standard position-based visualization.')
 
     parser.add_argument('--which_epoch', type=str, default="all", help='which epoch checkpoint to evaluate (e.g. all, best, latest)')
 

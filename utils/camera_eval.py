@@ -1,7 +1,10 @@
+# This evaluation is deprecated, use the new clatr evaluation
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from utils.camera_process import calculate_camera_metrics
+from utils.unified_data_format import detect_format_from_dataset_name
 from utils.metrics import calculate_R_precision, euclidean_distance_matrix, calculate_activation_statistics, calculate_frechet_distance, calculate_diversity, calculate_multimodality
 import os
 from os.path import join as pjoin
@@ -115,6 +118,11 @@ def evaluation_camera_vqvae(out_dir, val_loader, net, writer, ep, best_recon, be
     
     print(f"Starting evaluation with {len(val_loader)} batches in val_loader")
     
+    # Format type for metrics (rotmat vs euler)
+    fmt_type = None
+    if hasattr(val_loader.dataset, 'opt') and hasattr(val_loader.dataset.opt, 'dataset_name'):
+        fmt_type = detect_format_from_dataset_name(val_loader.dataset.opt.dataset_name)
+    
     # Camera-specific metrics
     total_recon_loss = 0
     total_position_error = 0
@@ -190,7 +198,7 @@ def evaluation_camera_vqvae(out_dir, val_loader, net, writer, ep, best_recon, be
             pred_data = pred_np[i, :m_length[i]]
             gt_data = gt_np[i, :m_length[i]]
             
-            metrics = calculate_camera_metrics(pred_data[None, ...], gt_data[None, ...])
+            metrics = calculate_camera_metrics(pred_data[None, ...], gt_data[None, ...], format_type=fmt_type)
             
             total_position_error += metrics['mean_position_error']
             total_orientation_error += metrics['mean_orientation_error']
@@ -375,6 +383,11 @@ def evaluation_camera_transformer(out_dir, val_loader, trans, vq_model, writer, 
     trans.eval()
     vq_model.eval()
     
+    # Format type for metrics (rotmat vs euler)
+    fmt_type = None
+    if hasattr(val_loader.dataset, 'opt') and hasattr(val_loader.dataset.opt, 'dataset_name'):
+        fmt_type = detect_format_from_dataset_name(val_loader.dataset.opt.dataset_name)
+    
     # Standard motion metrics
     motion_annotation_list = []
     motion_pred_list = []
@@ -434,7 +447,7 @@ def evaluation_camera_transformer(out_dir, val_loader, trans, vq_model, writer, 
             pred_data = pred_np[i, :m_length[i]]
             gt_data = gt_np[i, :m_length[i]]
             
-            metrics = calculate_camera_metrics(pred_data[None, ...], gt_data[None, ...])
+            metrics = calculate_camera_metrics(pred_data[None, ...], gt_data[None, ...], format_type=fmt_type)
             total_position_error += metrics['mean_position_error']
             total_orientation_error += metrics['mean_orientation_error']
             total_smoothness += metrics['pred_smoothness']

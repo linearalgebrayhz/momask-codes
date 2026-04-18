@@ -2,7 +2,7 @@ echo "Starting Camera Residual Transformer Training..."
 
 dataset_name="realestate10k_rotmat"
 
-EXPERIMENT_NAME="rtrans_5k_newdata_1frame2"
+EXPERIMENT_NAME="rtrans_5k_newdata_1frame_r4_latest"
 TENSORBOARD_DIR="./log/res/${dataset_name}/${EXPERIMENT_NAME}"
 CHECKPOINT_DIR="./checkpoints/${dataset_name}/${EXPERIMENT_NAME}"
 
@@ -25,7 +25,7 @@ CUDA_VISIBLE_DEVICES=3 python train_res_transformer.py \
     --dataset_name ${dataset_name} \
     --data_root ./dataset/RealEstate10K_rotmat_5k \
     --batch_size 64 \
-    --vq_name rvq_window128_5k_newdata \
+    --vq_name rvq_window128_5k_newdata_4quantizers_lastest \
     --conditioning_mode t5 \
     --cond_drop_prob 0.2 \
     --latent_dim 384 \
@@ -36,12 +36,12 @@ CUDA_VISIBLE_DEVICES=3 python train_res_transformer.py \
     --max_epoch 600 \
     --lr 5e-5 \
     --evaluator_ckpt ./checkpoints/evaluator/rotmat_5k2/best.pt \
+    --vis_vel_integration \
     --use_first_frame \
     --visual_drop_prob 0.2 \
-    # --use_sparse_frames \
-    # --share_weight \
-    # --is_continue \
-    # --keyframe_arch resnet18 \
-    # --use_frames \
+    # --use_sparse_frames  \
+    # --max_sparse_frames 4 \
+    # --visual_drop_prob 0.2 \
+
 
 echo "Residual Transformer Training completed!"
