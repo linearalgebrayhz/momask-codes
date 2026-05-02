@@ -5,6 +5,7 @@ This module provides a unified interface for handling different camera trajector
 - 5-feature: [x, y, z, pitch, yaw] (legacy cam dataset)
 - 6-feature: [x, y, z, pitch, yaw, roll] (position + full orientation)
 - 10-feature: [x, y, z, dx, dy, dz, qw, qx, qy, qz] (position + velocity + quaternion)
+- 9-feature RotMat: [x, y, z, r1x, r1y, r1z, r2x, r2y, r2z] (position + 2 rotation matrix columns)
 - 12-feature Euler: [x, y, z, dx, dy, dz, pitch, yaw, roll, dpitch, dyaw, droll] (position + velocity + Euler + angular velocity)
 - 12-feature RotMat: [x, y, z, dx, dy, dz, r1x, r1y, r1z, r2x, r2y, r2z] (position + velocity + 2 rotation matrix columns)
 
@@ -20,6 +21,7 @@ class CameraDataFormat(Enum):
     """Enumeration of supported camera data formats"""
     LEGACY_5 = 5  # [x, y, z, pitch, yaw]
     POSITION_ORIENTATION_6 = 6  # [x, y, z, pitch, yaw, roll]
+    POSITION_ROTMAT_9 = 9  # [x, y, z, r1x, r1y, r1z, r2x, r2y, r2z]
     QUATERNION_10 = 10  # [x, y, z, dx, dy, dz, qw, qx, qy, qz]
     FULL_12_EULER = 12  # [x, y, z, dx, dy, dz, pitch, yaw, roll, dpitch, dyaw, droll]
     FULL_12_ROTMAT = 13  # [x, y, z, dx, dy, dz, r1x, r1y, r1z, r2x, r2y, r2z] - uses 13 as unique ID
@@ -54,6 +56,8 @@ class UnifiedCameraData:
             return CameraDataFormat.LEGACY_5
         elif self.num_features == 6:
             return CameraDataFormat.POSITION_ORIENTATION_6
+        elif self.num_features == 9:
+            return CameraDataFormat.POSITION_ROTMAT_9
         elif self.num_features == 10:
             return CameraDataFormat.QUATERNION_10
         elif self.num_features == 12:
@@ -62,7 +66,7 @@ class UnifiedCameraData:
             return CameraDataFormat.FULL_12_ROTMAT
         else:
             raise ValueError(f"Unsupported data format with {self.num_features} features. "
-                           f"Supported formats: 5, 6, 10, or 12 features.")
+                           f"Supported formats: 5, 6, 9, 10, or 12 features.")
     
     def _validate_format(self):
         """Validate that data matches declared format"""
@@ -83,6 +87,8 @@ class UnifiedCameraData:
             return self.data[:, 3:5]  # [pitch, yaw]
         elif self.format_type == CameraDataFormat.POSITION_ORIENTATION_6:
             return self.data[:, 3:6]  # [pitch, yaw, roll]
+        elif self.format_type == CameraDataFormat.POSITION_ROTMAT_9:
+            return self.data[:, 3:9]  # [r1x, r1y, r1z, r2x, r2y, r2z]
         elif self.format_type == CameraDataFormat.QUATERNION_10:
             return self.data[:, 6:10]  # [qw, qx, qy, qz]
         elif self.format_type == CameraDataFormat.FULL_12_EULER:
@@ -116,6 +122,8 @@ class UnifiedCameraData:
         """Extract rotation matrix columns if available (returns first 2 columns as 6D vector)"""
         if self.format_type == CameraDataFormat.FULL_12_ROTMAT:
             return self.data[:, 6:12]  # [r1x, r1y, r1z, r2x, r2y, r2z]
+        if self.format_type == CameraDataFormat.POSITION_ROTMAT_9:
+            return self.data[:, 3:9]  # [r1x, r1y, r1z, r2x, r2y, r2z]
         return None
     
     def to_format(self, target_format: CameraDataFormat) -> 'UnifiedCameraData':
@@ -156,6 +164,23 @@ class UnifiedCameraData:
             else:  # Already [pitch, yaw, roll]
                 full_orientations = orientations
             converted_data = torch.cat([positions, full_orientations], dim=1)
+
+        elif target_format == CameraDataFormat.POSITION_ROTMAT_9:
+            # Convert to [x, y, z, r1x, r1y, r1z, r2x, r2y, r2z]
+            if self.format_type in [CameraDataFormat.POSITION_ROTMAT_9, CameraDataFormat.FULL_12_ROTMAT]:
+                rot_mat_cols = orientations
+            elif orientations.shape[1] == 2:
+                roll = torch.zeros(self.seq_len, 1, device=orientations.device)
+                full_euler = torch.cat([orientations, roll], dim=1)
+                rot_mat_cols = euler_to_rotation_matrix(full_euler)
+            elif orientations.shape[1] == 3:
+                rot_mat_cols = euler_to_rotation_matrix(orientations)
+            elif orientations.shape[1] == 4:
+                euler = quaternion_to_euler(orientations)
+                rot_mat_cols = euler_to_rotation_matrix(euler)
+            else:
+                raise ValueError(f"Cannot convert orientations of shape {orientations.shape} to 9D rotmat")
+            converted_data = torch.cat([positions, rot_mat_cols], dim=1)
         
         elif target_format == CameraDataFormat.QUATERNION_10:
             # Convert to [x, y, z, dx, dy, dz, qw, qx, qy, qz]
@@ -199,7 +224,7 @@ class UnifiedCameraData:
                 velocities = self._calculate_velocities(positions)
             
             # Convert orientation to rotation matrix columns
-            if self.format_type == CameraDataFormat.FULL_12_ROTMAT:
+            if self.format_type in [CameraDataFormat.FULL_12_ROTMAT, CameraDataFormat.POSITION_ROTMAT_9]:
                 # Already rotation matrix columns, just use it
                 rot_mat_cols = orientations
             elif orientations.shape[1] == 2:  # [pitch, yaw] -> [pitch, yaw, roll]
@@ -341,6 +366,8 @@ def detect_dataset_format(data_root: str, sample_file: str = None) -> CameraData
             return CameraDataFormat.LEGACY_5
         elif num_features == 6:
             return CameraDataFormat.POSITION_ORIENTATION_6
+        elif num_features == 9:
+            return CameraDataFormat.POSITION_ROTMAT_9
         elif num_features == 10:
             return CameraDataFormat.QUATERNION_10
         elif num_features == 12:
@@ -421,7 +448,7 @@ def batch_convert_dataset(input_dir: str, output_dir: str,
     # Create format info file
     format_info = {
         'format_type': target_format.name,
-        'num_features': target_format.value,
+        'num_features': 12 if target_format == CameraDataFormat.FULL_12_ROTMAT else target_format.value,
         'converted_from': source_format.name,
         'conversion_date': str(np.datetime64('now'))
     }
@@ -580,6 +607,8 @@ def detect_format_from_dataset_name(dataset_name: str) -> Optional[CameraDataFor
     # Check for explicit Euler marker first.
     if 'euler' in dataset_name_lower:
         return CameraDataFormat.FULL_12_EULER
+    if 'rotmat9' in dataset_name_lower or 'rotmat_9' in dataset_name_lower or '9d' in dataset_name_lower:
+        return CameraDataFormat.POSITION_ROTMAT_9
     # Check for rotation matrix format first (more specific)
     if 'rotmat' in dataset_name_lower or 'rot_mat' in dataset_name_lower:
         return CameraDataFormat.FULL_12_ROTMAT
@@ -592,6 +621,8 @@ def detect_format_from_dataset_name(dataset_name: str) -> Optional[CameraDataFor
         return CameraDataFormat.FULL_12_ROTMAT
     elif '10' in dataset_name_lower:
         return CameraDataFormat.QUATERNION_10
+    elif '9' in dataset_name_lower:
+        return CameraDataFormat.POSITION_ROTMAT_9
     elif '6' in dataset_name_lower:
         return CameraDataFormat.POSITION_ORIENTATION_6
     elif '5' in dataset_name_lower or 'legacy' in dataset_name_lower:

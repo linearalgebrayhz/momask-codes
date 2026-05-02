@@ -8,7 +8,7 @@ echo "Starting Camera RVQ Training..."
 DATASET_NAME="realestate10k_rotmat"
 
 # overfitting experiment on one sample
-EXPERIMENT_NAME="rvq_window128_5k_newdata_4quantizers_lastest"
+EXPERIMENT_NAME="rvq_window128_25k_4quantizers"
 TENSORBOARD_DIR="./log/vq/${DATASET_NAME}/${EXPERIMENT_NAME}"
 CHECKPOINT_DIR="./checkpoints/${DATASET_NAME}/${EXPERIMENT_NAME}"
 
@@ -26,12 +26,11 @@ echo "  tensorboard --logdir=${TENSORBOARD_DIR} --port=6006"
 echo "  # Then access via browser at: http://localhost:6006"
 echo ""
 
-# overfitting experiment on one sample
-CUDA_VISIBLE_DEVICES=4 python train_vq.py \
+CUDA_VISIBLE_DEVICES=6 python train_vq.py \
     --name ${EXPERIMENT_NAME} \
     --gpu_id 0 \
     --dataset_name ${DATASET_NAME} \
-    --data_root ./dataset/RealEstate10K_rotmat_5k \
+    --data_root ./dataset/RealEstate10K_rotmat_25k \
     --batch_size 256 \
     --num_quantizers 4 \
     --max_epoch 500 \
@@ -52,7 +51,7 @@ CUDA_VISIBLE_DEVICES=4 python train_vq.py \
     --output_emb_width 512  \
     --nb_code 256 \
     --vis_vel_integration \
-    --is_continue \
+    # --is_continue \
     # --loss_orthogonality 0.1 \
 
     # --nb_code 384 \ 

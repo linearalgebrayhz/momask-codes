@@ -188,11 +188,11 @@ def load_res_model(res_opt, vq_opt, opt, text_cond=None):
             )
         ckpt = torch.load(ckpt_path, map_location=opt.device)
     elif is_camera_dataset:
-        # For camera datasets, try different checkpoint files in order of preference
+        # For camera datasets, prefer validation-selected checkpoints.
         checkpoint_files = [
+            'net_best_fid.tar',        # Best CLaTr FID when available
             'net_best_acc.tar',        # Best accuracy
             'net_best_loss.tar',       # Best loss
-            'latest.tar'               # Latest checkpoint
         ]
 
         checkpoint_loaded = False
@@ -1463,7 +1463,7 @@ if __name__ == '__main__':
     #################################
     ######Loading M-Transformer######
     #################################
-    which_ckpt = getattr(opt, 'which_epoch', 'latest')
+    which_ckpt = getattr(opt, 'which_epoch', 'net_best_fid')
     ckpt_name = which_ckpt if which_ckpt.endswith('.tar') else f'{which_ckpt}.tar'
     t2m_transformer = load_trans_model(model_opt, opt, ckpt_name, text_cond=text_cond_m)
 

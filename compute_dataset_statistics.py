@@ -4,16 +4,16 @@ Dataset Statistics Calculator for RealEstate10K Camera Trajectory Dataset
 
 Computes statistics aligned with the actual processing pipeline:
   - Scene/frame counts, duration distributions
-  - Motion type distribution (using the same forward-vector analysis
-    as realestate10k_processor._generate_guidance())
+  - Motion type distribution (using the same local-velocity and
+    forward-vector analysis as realestate10k_processor._generate_guidance())
   - Vocabulary richness metrics
   - Caption quality metrics
 
-Supports both 12D rotmat and 10D quaternion formats.
+Supports the active 12D rotmat format.
 
 Usage:
     python compute_dataset_statistics.py ./dataset/RealEstate10K_rotmat
-    python compute_dataset_statistics.py ./dataset/RealEstate10K_rotmat --format rotmat --output stats.json
+    python compute_dataset_statistics.py ./dataset/RealEstate10K_rotmat --output stats.json
     python compute_dataset_statistics.py ./dataset/RealEstate10K_rotmat --text-dir untagged_text
 """
 
@@ -22,6 +22,7 @@ import argparse
 import json
 import re
 from collections import Counter, defaultdict
+from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -29,59 +30,72 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from utils.unified_data_format import CameraDataFormat, detect_format_from_dataset_name
-from utils.camera_geometry import forward_from_sixd
+from utils.camera_geometry import forward_from_sixd, sixd_to_matrix
 
 
 # ============================================================================
 # Motion Classification (mirrors _generate_guidance in realestate10k_processor)
 # ============================================================================
 
-# Thresholds — same as realestate10k_processor._generate_guidance
+# Thresholds - same as realestate10k_processor._generate_guidance
 THRESHOLD_TRANSLATION = 0.10      # minimum total displacement to count
-THRESHOLD_DOMINANCE = 0.6         # axis must be >= 60% of max displacement
 THRESHOLD_YAW = 0.12              # radians
 THRESHOLD_PITCH = 0.10            # radians
+TRANSLATION_JITTER_EPS = 0.005    # zero tiny COLMAP jitter before integration
+HOURS_FPS = 30.0                  # canonical dataset-duration reporting FPS
 
 
-def _quat_to_forward(quat: np.ndarray) -> np.ndarray:
-    """Compute camera forward vector from quaternion [qw, qx, qy, qz].
+class CameraDataFormat(Enum):
+    """Minimal format enum for rotmat-only statistics/curation scripts."""
 
-    Converts to rotation matrix, then uses -col2 (OpenGL forward).
-    """
-    from scipy.spatial.transform import Rotation as R
-    # scipy expects [qx, qy, qz, qw]
-    quat_scipy = np.concatenate([quat[1:4], quat[0:1]])
-    rot_mat = R.from_quat(quat_scipy).as_matrix()  # (3, 3)
-    return -rot_mat[:, 2]  # forward = -col2
+    FULL_12_ROTMAT = "FULL_12_ROTMAT"
+    QUATERNION_10 = "QUATERNION_10"
+    FULL_12_EULER = "FULL_12_EULER"
+    UNSUPPORTED = "UNSUPPORTED"
+
+
+def detect_format_from_dataset_name(dataset_name: str) -> Optional[CameraDataFormat]:
+    """Detect only enough format information to reject non-rotmat datasets."""
+    dataset_name_lower = dataset_name.lower()
+    if "euler" in dataset_name_lower:
+        return CameraDataFormat.FULL_12_EULER
+    if "rotmat" in dataset_name_lower or "rot_mat" in dataset_name_lower:
+        return CameraDataFormat.FULL_12_ROTMAT
+    if "quat" in dataset_name_lower:
+        return CameraDataFormat.QUATERNION_10
+    if "12" in dataset_name_lower:
+        return CameraDataFormat.FULL_12_ROTMAT
+    if "legacy" in dataset_name_lower:
+        return CameraDataFormat.UNSUPPORTED
+    return None
 
 
 def classify_motion(trajectory: np.ndarray,
                     fmt: CameraDataFormat) -> Dict[str, bool]:
     """Classify camera motion using the same logic as the data processor.
 
-    Translation: OpenGL convention (+X right, +Y up, -Z forward).
+    Translation: integrate per-frame camera-local velocity, matching
+    realestate10k_processor._generate_guidance().
     Rotation: forward-vector yaw/pitch analysis (no Euler conversion).
 
     Returns dict of motion flags aligned with guidance labels:
+        arcs_left, arcs_right,
         tracks_left, tracks_right, moves_up, moves_down,
         dollies_forward, dollies_backward,
         pans_left, pans_right, tilts_up, tilts_down, static
     """
-    positions = trajectory[:, :3]
+    if fmt != CameraDataFormat.FULL_12_ROTMAT:
+        raise ValueError(f"Only rotmat motion classification is supported, got {fmt.name}")
+    if trajectory.ndim != 2 or trajectory.shape[1] != 12:
+        raise ValueError(f"Expected 12D rotmat trajectory, got shape {trajectory.shape}")
 
-    # Extract forward vector for first and last frame
-    if fmt == CameraDataFormat.FULL_12_ROTMAT:
-        fwd0 = forward_from_sixd(trajectory[0, 6:12])
-        fwd1 = forward_from_sixd(trajectory[-1, 6:12])
-    elif fmt == CameraDataFormat.QUATERNION_10:
-        fwd0 = _quat_to_forward(trajectory[0, 6:10])
-        fwd1 = _quat_to_forward(trajectory[-1, 6:10])
-    else:
-        raise ValueError(f"Unsupported format for motion classification: {fmt.name}")
+    positions = trajectory[:, :3]
+    rotations = sixd_to_matrix(trajectory[:, 6:12])
 
     flags = {
         "static": False,
+        "arcs_left": False,
+        "arcs_right": False,
         "dollies_forward": False,
         "dollies_backward": False,
         "tracks_left": False,
@@ -94,36 +108,21 @@ def classify_motion(trajectory: np.ndarray,
         "tilts_down": False,
     }
 
-    # --- Translation (same as _generate_guidance) ---
-    total_t = positions[-1] - positions[0]
-    abs_t = np.abs(total_t)
-    max_t = float(np.max(abs_t))
+    if len(trajectory) < 2:
+        flags["static"] = True
+        return flags
 
-    has_translation = False
-    if max_t > THRESHOLD_TRANSLATION:
-        # X: right / left
-        if abs_t[0] > THRESHOLD_TRANSLATION and abs_t[0] >= THRESHOLD_DOMINANCE * max_t:
-            has_translation = True
-            if total_t[0] > 0:
-                flags["tracks_right"] = True
-            else:
-                flags["tracks_left"] = True
-        # Y: up / down
-        if abs_t[1] > THRESHOLD_TRANSLATION and abs_t[1] >= THRESHOLD_DOMINANCE * max_t:
-            has_translation = True
-            if total_t[1] > 0:
-                flags["moves_up"] = True
-            else:
-                flags["moves_down"] = True
-        # Z: forward / backward (forward = -Z in OpenGL)
-        if abs_t[2] > THRESHOLD_TRANSLATION and abs_t[2] >= THRESHOLD_DOMINANCE * max_t:
-            has_translation = True
-            if total_t[2] < 0:
-                flags["dollies_forward"] = True
-            else:
-                flags["dollies_backward"] = True
+    # --- Translation via integrated local velocity (same as _generate_guidance) ---
+    v_world = np.diff(positions, axis=0)
+    r_w2c = np.transpose(rotations[:-1], (0, 2, 1))
+    v_local = np.einsum("nij,nj->ni", r_w2c, v_world)
+    v_local[np.abs(v_local) < TRANSLATION_JITTER_EPS] = 0.0
+    accumulated_local_t = np.sum(v_local, axis=0)
 
     # --- Rotation (forward-vector method, same as _generate_guidance) ---
+    fwd0 = forward_from_sixd(trajectory[0, 6:12])
+    fwd1 = forward_from_sixd(trajectory[-1, 6:12])
+
     yaw0 = np.arctan2(fwd0[0], -fwd0[2])
     yaw1 = np.arctan2(fwd1[0], -fwd1[2])
     dyaw = np.arctan2(np.sin(yaw1 - yaw0), np.cos(yaw1 - yaw0))  # wrap to [-π, π]
@@ -132,22 +131,53 @@ def classify_motion(trajectory: np.ndarray,
     pitch1 = np.arcsin(np.clip(fwd1[1], -1, 1))
     dpitch = pitch1 - pitch0
 
-    has_rotation = False
-    if abs(dyaw) > THRESHOLD_YAW:
-        has_rotation = True
+    is_panning = abs(dyaw) > THRESHOLD_YAW
+    is_trucking = abs(accumulated_local_t[0]) > THRESHOLD_TRANSLATION
+
+    has_motion = False
+
+    # Joint kinematic branch: panning + trucking => cinematic arc/orbit.
+    if is_panning and is_trucking:
+        has_motion = True
         if dyaw > 0:
-            flags["pans_right"] = True
+            flags["arcs_right"] = True
         else:
-            flags["pans_left"] = True
+            flags["arcs_left"] = True
+    else:
+        if is_trucking:
+            has_motion = True
+            if accumulated_local_t[0] > 0:
+                flags["tracks_right"] = True
+            else:
+                flags["tracks_left"] = True
+        if is_panning:
+            has_motion = True
+            if dyaw > 0:
+                flags["pans_right"] = True
+            else:
+                flags["pans_left"] = True
+
+    if abs(accumulated_local_t[1]) > THRESHOLD_TRANSLATION:
+        has_motion = True
+        if accumulated_local_t[1] > 0:
+            flags["moves_up"] = True
+        else:
+            flags["moves_down"] = True
+    if abs(accumulated_local_t[2]) > THRESHOLD_TRANSLATION:
+        has_motion = True
+        if accumulated_local_t[2] < 0:
+            flags["dollies_forward"] = True
+        else:
+            flags["dollies_backward"] = True
+
     if abs(dpitch) > THRESHOLD_PITCH:
-        has_rotation = True
+        has_motion = True
         if dpitch > 0:
             flags["tilts_up"] = True
         else:
             flags["tilts_down"] = True
 
-    # Static only if no translation AND no rotation detected
-    if not has_translation and not has_rotation:
+    if not has_motion:
         flags["static"] = True
 
     return flags
@@ -211,7 +241,7 @@ class DatasetStatistics:
     """Compute comprehensive statistics for a processed camera trajectory dataset."""
 
     def __init__(self, dataset_root: Path, fmt: CameraDataFormat,
-                 text_subdir: str = "texts", fps: float = 24.0):
+                 text_subdir: str = "texts", fps: float = HOURS_FPS):
         self.dataset_root = dataset_root
         self.fmt = fmt
         self.fps = fps
@@ -275,6 +305,8 @@ class DatasetStatistics:
 
         seq_arr = np.array(seq_lengths)
         dur_arr = seq_arr / self.fps
+        total_frames = int(seq_arr.sum())
+        total_seconds_at_30fps = total_frames / HOURS_FPS
 
         # --- Aggregate stats ---
         self.stats = {
@@ -283,7 +315,9 @@ class DatasetStatistics:
             "fps": self.fps,
             "num_scenes": num_scenes,
             "num_captions": len(captions),
-            "total_frames": int(seq_arr.sum()),
+            "total_frames": total_frames,
+            "total_duration_seconds_at_30fps": round(float(total_seconds_at_30fps), 2),
+            "total_duration_hours_at_30fps": round(float(total_seconds_at_30fps / 3600.0), 4),
             "sequence_length": {
                 "mean": round(float(seq_arr.mean()), 1),
                 "median": float(np.median(seq_arr)),
@@ -342,6 +376,7 @@ class DatasetStatistics:
         print(f"  Total scenes:         {s['num_scenes']:,}")
         print(f"  Total captions:       {s['num_captions']:,}")
         print(f"  Total frames:         {s['total_frames']:,}")
+        print(f"  Total hours @ 30fps:  {s['total_duration_hours_at_30fps']:.4f}")
 
         sl = s["sequence_length"]
         dur = s["duration_seconds"]
@@ -358,8 +393,9 @@ class DatasetStatistics:
         pcts = md["percentages"]
 
         # Separate translation, rotation, static
-        trans_keys = ["dollies_forward", "dollies_backward", "tracks_left",
-                      "tracks_right", "moves_up", "moves_down"]
+        trans_keys = ["arcs_left", "arcs_right", "dollies_forward",
+                      "dollies_backward", "tracks_left", "tracks_right",
+                      "moves_up", "moves_down"]
         rot_keys = ["pans_left", "pans_right", "tilts_up", "tilts_down"]
 
         print(f"\n{'MOTION DISTRIBUTION':^80}")
@@ -431,9 +467,9 @@ def main():
     )
     parser.add_argument(
         "--format",
-        choices=["rotmat", "quat", "auto"],
+        choices=["rotmat", "auto"],
         default="auto",
-        help="Data format, or 'auto' to detect from directory name (default: auto)",
+        help="Data format, or 'auto' to detect rotmat from directory name (default: auto)",
     )
     parser.add_argument(
         "--text-dir",
@@ -443,8 +479,8 @@ def main():
     parser.add_argument(
         "--fps",
         type=float,
-        default=24.0,
-        help="Frame rate for duration calculations (default: 24.0)",
+        default=HOURS_FPS,
+        help="Frame rate for per-sequence duration calculations (default: 30.0)",
     )
     parser.add_argument(
         "--output", "-o",
@@ -468,8 +504,11 @@ def main():
             print("Cannot auto-detect format, defaulting to rotmat")
             fmt = CameraDataFormat.FULL_12_ROTMAT
     else:
-        fmt = (CameraDataFormat.FULL_12_ROTMAT if args.format == "rotmat"
-               else CameraDataFormat.QUATERNION_10)
+        fmt = CameraDataFormat.FULL_12_ROTMAT
+
+    if fmt != CameraDataFormat.FULL_12_ROTMAT:
+        print(f"Error: only rotmat datasets are supported, detected {fmt.name}")
+        return 1
 
     analyzer = DatasetStatistics(dataset_root, fmt, args.text_dir, args.fps)
     analyzer.compute()

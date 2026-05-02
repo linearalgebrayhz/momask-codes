@@ -25,6 +25,9 @@ class TrainT2MOptions(BaseOptions):
         self.parser.add_argument('--conditioning_mode', type=str, default='clip',
                                 choices=['clip', 't5', 'id_embedding'],
                                 help='Conditioning encoder: clip (default), t5 (token-level), id_embedding (per-sample learnable)')
+        self.parser.add_argument('--condition_fusion', type=str, default='cross_attn',
+                                choices=['cross_attn', 'prefix_self_attn'],
+                                help='How condition tokens are fused: current self+cross attention, or MoMask-style condition prefix in self-attention.')
         self.parser.add_argument('--num_id_samples', type=int, default=50,
                                 help='Number of learnable sample embeddings for id_embedding mode')
         self.parser.add_argument('--t5_model_name', type=str, default='t5-base',

@@ -31,16 +31,17 @@ def plot_t2m(data, save_dir):
     
     if is_camera_dataset:
         # For camera data, use GT vs Pred comparison visualizations
-        from gen_camera import (plot_camera_trajectory_animation, plot_camera_trajectory,
-                                plot_camera_trajectory_animation_vel_integrated)
+        from gen_camera import (
+            plot_camera_trajectory_animation,
+            plot_camera_trajectory_animation_vel_integrated,
+        )
         from utils.camera_plot import plot_camera_trajectory_3d
+        from utils.camera_geometry import integrate_velocity_to_positions
         from utils.unified_data_format import detect_format_from_dataset_name
         import os
         
         # Detect format from dataset name
         viz_format_type = detect_format_from_dataset_name(opt.dataset_name)
-        use_vel_integration = getattr(opt, 'vis_vel_integration', False)
-        
         os.makedirs(save_dir, exist_ok=True)
         
         # Data is structured as: [GT_0, GT_1, GT_2, GT_3, Pred_0, Pred_1, Pred_2, Pred_3]
@@ -52,16 +53,35 @@ def plot_t2m(data, save_dir):
         for i in range(num_samples):
             gt_trajectory = gt_data[i]
             pred_trajectory = pred_data[i]
+
+            def _prepare_velint_trajectory(trajectory):
+                """Replace xyz with velocity-integrated positions when available."""
+                if trajectory.shape[-1] < 6:
+                    return trajectory
+                try:
+                    trajectory_velint = trajectory.copy()
+                    trajectory_velint[:, :3] = integrate_velocity_to_positions(
+                        trajectory,
+                        smooth=True,
+                        smooth_sigma=1.5,
+                    )
+                    return trajectory_velint
+                except Exception as e:
+                    print(f"[Warning] Vel-integration fallback to direct xyz: {e}")
+                    return trajectory
+
+            gt_trajectory_velint = _prepare_velint_trajectory(gt_trajectory)
+            pred_trajectory_velint = _prepare_velint_trajectory(pred_trajectory)
             
             # 1. Generate comprehensive GT vs Pred comparison plot
             # This includes: 3D trajectory, top-down view, position error, orientation comparison
             comparison_path = pjoin(save_dir, f'camera_viz_sample_{i:02d}_comparison.png')
             try:
                 plot_camera_trajectory_3d(
-                    gt_data=gt_trajectory[None, ...],  # Add batch dimension
-                    pred_data=pred_trajectory[None, ...],  # Add batch dimension
+                    gt_data=gt_trajectory_velint[None, ...],  # Add batch dimension
+                    pred_data=pred_trajectory_velint[None, ...],  # Add batch dimension
                     save_path=comparison_path,
-                    title=f"RVQ Training Sample {i:02d} - GT vs Pred Comparison",
+                    title=f"RVQ Training Sample {i:02d} - GT vs Pred Comparison (Vel. Integrated)",
                     seq_idx=0,
                     format_type=viz_format_type
                 )
@@ -69,7 +89,7 @@ def plot_t2m(data, save_dir):
             except Exception as e:
                 print(f"Error creating comparison plot {i}: {e}")
             
-            # 2. Generate MP4 animations for both GT and Pred (position-based, no smoothing)
+            # 2. Generate MP4 animations (GT direct xyz, Pred velocity-integrated)
             gt_video_path = pjoin(save_dir, f'camera_viz_sample_{i:02d}_gt.mp4')
             pred_video_path = pjoin(save_dir, f'camera_viz_sample_{i:02d}_pred.mp4')
             try:
@@ -83,50 +103,20 @@ def plot_t2m(data, save_dir):
                     figsize=(10, 8),
                     format_type=viz_format_type
                 )
-                plot_camera_trajectory_animation(
+                plot_camera_trajectory_animation_vel_integrated(
                     data=pred_trajectory,
                     save_path=pred_video_path,
-                    title=f"Sample {i:02d} - Predicted",
+                    title=f"Sample {i:02d} - Predicted (Vel. Integrated)",
                     fps=30,
                     show_trail=True,
                     trail_length=30,
                     figsize=(10, 8),
-                    format_type=viz_format_type
+                    format_type=viz_format_type,
+                    smooth=True,
                 )
                 print(f"Camera videos saved: {gt_video_path}, {pred_video_path}")
             except Exception as e:
                 print(f"Error creating camera videos {i}: {e}")
-            
-            # 3. Velocity-integrated visualizations (optional, enabled via --vis_vel_integration)
-            if use_vel_integration:
-                gt_vel_path = pjoin(save_dir, f'camera_viz_sample_{i:02d}_gt_velint.mp4')
-                pred_vel_path = pjoin(save_dir, f'camera_viz_sample_{i:02d}_pred_velint.mp4')
-                try:
-                    plot_camera_trajectory_animation_vel_integrated(
-                        data=gt_trajectory,
-                        save_path=gt_vel_path,
-                        title=f"Sample {i:02d} - Ground Truth (Vel. Integrated)",
-                        fps=30,
-                        show_trail=True,
-                        trail_length=30,
-                        figsize=(10, 8),
-                        format_type=viz_format_type,
-                        smooth=True,
-                    )
-                    plot_camera_trajectory_animation_vel_integrated(
-                        data=pred_trajectory,
-                        save_path=pred_vel_path,
-                        title=f"Sample {i:02d} - Predicted (Vel. Integrated)",
-                        fps=30,
-                        show_trail=True,
-                        trail_length=30,
-                        figsize=(10, 8),
-                        format_type=viz_format_type,
-                        smooth=True,
-                    )
-                    print(f"Vel-integrated videos saved: {gt_vel_path}, {pred_vel_path}")
-                except Exception as e:
-                    print(f"Error creating vel-integrated videos {i}: {e}")
     else:
         # For human motion data, use original plotting
         for i in range(len(data)):
@@ -203,7 +193,7 @@ if __name__ == "__main__":
     # Register pipeline normalization stats with CLaTr evaluator
     if evaluator_ckpt and is_camera_dataset and hasattr(eval_wrapper, 'set_pipeline_stats'):
         eval_wrapper.set_pipeline_stats(
-            torch.from_numpy(mean), torch.from_numpy(std))
+            torch.from_numpy(mean), torch.from_numpy(std), dataset_name=opt.dataset_name)
 
     train_split_file = pjoin(opt.data_root, 'train.txt')
     val_split_file = pjoin(opt.data_root, 'val.txt')

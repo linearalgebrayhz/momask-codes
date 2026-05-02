@@ -3,7 +3,12 @@ from options.base_option import BaseOptions
 class EvalT2MOptions(BaseOptions):
     def initialize(self):
         BaseOptions.initialize(self)
-        self.parser.add_argument('--which_epoch', type=str, default="latest", help='Checkpoint you want to use, {latest, net_best_fid, etc}')
+        self.parser.add_argument(
+            '--which_epoch',
+            type=str,
+            default="net_best_fid",
+            help='Mask transformer checkpoint to use. Defaults to validation-selected net_best_fid; pass latest explicitly only for diagnostics.',
+        )
         self.parser.add_argument(
             '--res_which_epoch',
             type=str,

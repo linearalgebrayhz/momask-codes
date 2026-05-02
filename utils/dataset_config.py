@@ -46,6 +46,7 @@ class DatasetConfig:
             'realestate10k_12': 12,
             'realestate10k_quat': 10,
             'realestate10k_rotmat': 12,
+            'realestate10k_rotmat9': 9,
         }
         self.dim_pose = _dim_defaults.get(self.dataset_name, 6)
     
@@ -88,6 +89,8 @@ class DatasetConfig:
             return f'{checkpoints_dir}/realestate10k_quat/Comp_v6_KLD005/opt.txt'
         elif self.dataset_name == "realestate10k_rotmat":
             return f'{checkpoints_dir}/realestate10k_rotmat/Comp_v6_KLD005/opt.txt'
+        elif self.dataset_name == "realestate10k_rotmat9":
+            return f'{checkpoints_dir}/realestate10k_rotmat9/Comp_v6_KLD005/opt.txt'
         else:
             raise ValueError(f"Unknown dataset '{self.dataset_name}'. Please provide custom_data_root or use: {list(default_roots.keys())}")
 
@@ -144,7 +147,8 @@ def create_dataset_config(dataset_name: str, custom_data_root: Optional[str] = N
         "realestate10k_6": "./dataset/RealEstate10K_6feat/",
         "realestate10k_12": "./dataset/RealEstate10K_12feat/",
         "realestate10k_quat": "./dataset/RealEstate10K_quat/",
-        "realestate10k_rotmat": "./dataset/RealEstate10K_rotmat/"
+        "realestate10k_rotmat": "./dataset/RealEstate10K_rotmat/",
+        "realestate10k_rotmat9": "./dataset/RealEstate10K_rotmat9/"
     }
     
     # Use custom root or default
@@ -240,6 +244,17 @@ def get_legacy_config(dataset_name: str) -> Dict[str, Any]:
             'max_motion_length': 240,
             'kinematic_chain': paramUtil.kit_kinematic_chain,
             'dataset_opt_path': './checkpoints/realestate10k_12/Comp_v6_KLD005/opt.txt'
+        }
+    elif dataset_name == "realestate10k_rotmat9":
+        return {
+            'data_root': './dataset/RealEstate10K_rotmat9/',
+            'joints_num': 1,
+            'dim_pose': 9,
+            'fps': 30,
+            'radius': 240 * 8,
+            'max_motion_length': 500,
+            'kinematic_chain': paramUtil.kit_kinematic_chain,
+            'dataset_opt_path': './checkpoints/realestate10k_rotmat9/Comp_v6_KLD005/opt.txt'
         }
     else:
         raise KeyError(f'Dataset {dataset_name} does not exist')

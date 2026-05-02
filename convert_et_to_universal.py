@@ -19,7 +19,7 @@ Output (universal root):
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 try:
@@ -28,7 +28,7 @@ except ImportError:
     def tqdm(iterable, **kwargs):
         return iterable
 
-from utils.camera_geometry import matrix_to_sixd, validate_rotation
+from utils.camera_geometry import matrix_to_sixd, validate_rotation, forward_from_sixd
 
 
 def read_lines(path: Path) -> List[str]:
@@ -70,12 +70,22 @@ def parse_et_pose_file(traj_path: Path) -> np.ndarray:
     return np.stack(rows, axis=0).astype(np.float32)
 
 
-def load_et_caption(caption_path: Path) -> str:
-    lines = read_lines(caption_path)
-    if not lines:
-        return ""
-    # Keep first non-empty line to match single-caption training usage.
-    return lines[0]
+def load_et_caption_multi(caption_paths: List[Path]) -> str:
+    """Concatenate unique first lines from caption sources (e.g., caption + caption_cam)."""
+    pieces: List[str] = []
+    seen = set()
+    for cp in caption_paths:
+        lines = read_lines(cp)
+        if not lines:
+            continue
+        text = lines[0].strip()
+        if not text:
+            continue
+        norm = " ".join(text.lower().split())
+        if norm not in seen:
+            pieces.append(text)
+            seen.add(norm)
+    return " ".join(pieces).strip()
 
 
 def load_et_split_stems(et_root: Path) -> Dict[str, List[str]]:
@@ -110,16 +120,65 @@ def upsert_lines(path: Path, new_items: List[str]):
             f.write(item + "\n")
 
 
+def _motion_profile_from_traj9(
+    traj9: np.ndarray,
+    translation_thresh: float = 0.10,
+    yaw_thresh: float = 0.12,
+    pitch_thresh: float = 0.10,
+) -> Dict[str, float]:
+    """
+    Compute simple motion profile from 9D [rot6d, pos].
+    Mirrors static detection style from classify_motion.
+    """
+    pos = traj9[:, 6:9]
+    total_disp = float(np.linalg.norm(pos[-1] - pos[0]))
+
+    fwd0 = forward_from_sixd(traj9[0, :6])
+    fwd1 = forward_from_sixd(traj9[-1, :6])
+    yaw0 = np.arctan2(fwd0[0], -fwd0[2])
+    yaw1 = np.arctan2(fwd1[0], -fwd1[2])
+    dyaw = float(np.arctan2(np.sin(yaw1 - yaw0), np.cos(yaw1 - yaw0)))
+
+    pitch0 = np.arcsin(np.clip(fwd0[1], -1, 1))
+    pitch1 = np.arcsin(np.clip(fwd1[1], -1, 1))
+    dpitch = float(pitch1 - pitch0)
+
+    is_static = (
+        total_disp <= translation_thresh
+        and abs(dyaw) <= yaw_thresh
+        and abs(dpitch) <= pitch_thresh
+    )
+    return {
+        "total_disp": total_disp,
+        "dyaw": dyaw,
+        "dpitch": dpitch,
+        "is_static": is_static,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert ET data to universal 9D+text format")
     parser.add_argument("--et_root", type=str, default="/data4/haozhe/CamTraj/data/ET/et-data")
     parser.add_argument("--out_root", type=str, default="./dataset/RE10K_ET_GenDoP")
-    parser.add_argument("--caption_subdir", type=str, default="caption",
-                        help="ET caption folder name under et_root")
+    parser.add_argument(
+        "--caption_subdirs",
+        type=str,
+        default="caption,caption_cam",
+        help="Comma-separated ET caption folders to concatenate (order preserved)",
+    )
     parser.add_argument("--min_frames", type=int, default=8)
     parser.add_argument("--max_samples", type=int, default=10000)
     parser.add_argument("--prefix", type=str, default="et")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--fps", type=float, default=24.0)
+    parser.add_argument("--min_duration_sec", type=float, default=3.0)
+    parser.add_argument("--enable_motion_filter", action="store_true",
+                        help="Enable duration/static-scene filtering.")
+    parser.add_argument("--max_static_ratio", type=float, default=0.35,
+                        help="Max accepted static ratio among kept scenes when filtering.")
+    parser.add_argument("--translation_thresh", type=float, default=0.10)
+    parser.add_argument("--yaw_thresh", type=float, default=0.12)
+    parser.add_argument("--pitch_thresh", type=float, default=0.10)
     parser.add_argument("--append_global_splits", action="store_true",
                         help="Append converted IDs into out_root/{train,val,test}.txt")
     args = parser.parse_args()
@@ -127,12 +186,15 @@ def main():
     et_root = Path(args.et_root)
     out_root = Path(args.out_root)
     traj_dir = et_root / "traj"
-    caption_dir = et_root / args.caption_subdir
+    caption_subdirs = [s.strip() for s in args.caption_subdirs.split(",") if s.strip()]
+    caption_dirs = [et_root / sub for sub in caption_subdirs]
 
     if not traj_dir.exists():
         raise FileNotFoundError(f"ET traj dir not found: {traj_dir}")
-    if not caption_dir.exists():
-        raise FileNotFoundError(f"ET caption dir not found: {caption_dir}")
+    if not any(cd.exists() for cd in caption_dirs):
+        raise FileNotFoundError(
+            f"No ET caption dirs found among: {[str(cd) for cd in caption_dirs]}"
+        )
 
     ensure_output_dirs(out_root)
 
@@ -145,6 +207,10 @@ def main():
     converted_ids: Dict[str, List[str]] = {"train": [], "val": [], "test": []}
     processed = 0
     skipped = 0
+    skipped_short = 0
+    skipped_static = 0
+    accepted_static = 0
+    accepted_total = 0
 
     train_set = set(split_stems["train"])
     val_set = set(split_stems["val"])
@@ -155,8 +221,8 @@ def main():
             break
 
         traj_path = traj_dir / f"{stem}.txt"
-        cap_path = caption_dir / f"{stem}.txt"
-        if not traj_path.exists() or not cap_path.exists():
+        cap_paths = [cd / f"{stem}.txt" for cd in caption_dirs if cd.exists()]
+        if not traj_path.exists() or not any(cp.exists() for cp in cap_paths):
             skipped += 1
             continue
 
@@ -178,7 +244,26 @@ def main():
             skipped += 1
             continue
 
-        caption = load_et_caption(cap_path)
+        duration_sec = float(len(traj9) / max(args.fps, 1e-8))
+        if args.enable_motion_filter and duration_sec < args.min_duration_sec:
+            skipped_short += 1
+            continue
+
+        motion = _motion_profile_from_traj9(
+            traj9,
+            translation_thresh=args.translation_thresh,
+            yaw_thresh=args.yaw_thresh,
+            pitch_thresh=args.pitch_thresh,
+        )
+        if args.enable_motion_filter and motion["is_static"]:
+            projected_static = accepted_static + 1
+            projected_total = accepted_total + 1
+            projected_ratio = projected_static / max(projected_total, 1)
+            if projected_ratio > args.max_static_ratio:
+                skipped_static += 1
+                continue
+
+        caption = load_et_caption_multi(cap_paths)
         if not caption:
             skipped += 1
             continue
@@ -191,10 +276,12 @@ def main():
             "source": "ET",
             "original_id": stem,
             "traj_file": str(traj_path),
-            "caption_file": str(cap_path),
+            "caption_files": [str(cp) for cp in cap_paths if cp.exists()],
             "num_frames": int(traj9.shape[0]),
+            "duration_sec": duration_sec,
             "feature_dim": 9,
             "pose_semantics": "T_wc (converted from ET w2c)",
+            "motion_profile": motion,
         }
         with open(out_root / "metadata" / f"{sid}.json", "w") as f:
             json.dump(meta, f, indent=2)
@@ -209,6 +296,9 @@ def main():
             # If split files are unavailable/incomplete, place in train by default.
             converted_ids["train"].append(sid)
 
+        accepted_total += 1
+        if motion["is_static"]:
+            accepted_static += 1
         processed += 1
 
     # Write ET source split files
@@ -223,6 +313,11 @@ def main():
     print("\nET conversion complete")
     print(f"  processed: {processed}")
     print(f"  skipped:   {skipped}")
+    if args.enable_motion_filter:
+        print(f"  skipped_short(<{args.min_duration_sec:.2f}s): {skipped_short}")
+        print(f"  skipped_static(ratio>{args.max_static_ratio:.2f}): {skipped_static}")
+        ratio = accepted_static / max(accepted_total, 1)
+        print(f"  kept_static_ratio: {ratio:.3f} ({accepted_static}/{accepted_total})")
     print(f"  out_root:  {out_root}")
 
 

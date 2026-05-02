@@ -277,7 +277,7 @@ if __name__ == '__main__':
         # de-normalize from the pipeline's Z-space and re-normalize into
         # its own Z-space (they may differ).
         eval_wrapper.set_pipeline_stats(
-            torch.from_numpy(mean), torch.from_numpy(std))
+            torch.from_numpy(mean), torch.from_numpy(std), dataset_name=opt.dataset_name)
         print(f"[CLaTr] Using CLaTr evaluator from {evaluator_ckpt}")
     else:
         eval_wrapper = EvaluatorModelWrapper(wrapper_opt)

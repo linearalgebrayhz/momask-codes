@@ -11,6 +11,16 @@ from PIL import Image
 import torchvision.transforms as transforms
 
 
+CAMERA_DATASET_NAMES = (
+    "cam",
+    "realestate10k_6",
+    "realestate10k_12",
+    "realestate10k_quat",
+    "realestate10k_rotmat",
+    "realestate10k_rotmat9",
+)
+
+
 def collate_fn(batch):
     batch.sort(key=lambda x: x[3], reverse=True)
     return default_collate(batch)
@@ -266,6 +276,17 @@ class MotionDataset(data.Dataset):
                 mean = mean_rot
                 std = std_rot
             assert mean.shape[-1] == 12, f"Expected 12 features for realestate10k_rotmat dataset, got {mean.shape[-1]}"
+        elif opt.dataset_name == "realestate10k_rotmat9":
+            # 9D rotation matrix format: [x, y, z, r1x, r1y, r1z, r2x, r2y, r2z]
+            if opt.is_train:
+                # Only normalize translation; rot6d columns keep their unit-scale geometry.
+                mean_rot9 = np.concatenate([mean[:3], np.zeros(6)])
+                std_rot9 = np.concatenate([std[:3], np.ones(6)])
+                np.save(pjoin(opt.meta_dir, 'mean.npy'), mean_rot9)
+                np.save(pjoin(opt.meta_dir, 'std.npy'), std_rot9)
+                mean = mean_rot9
+                std = std_rot9
+            assert mean.shape[-1] == 9, f"Expected 9 features for realestate10k_rotmat9 dataset, got {mean.shape[-1]}"
         elif opt.dataset_name == "realestate10k_12":
             # 12D Euler format (existing): [x, y, z, dx, dy, dz, pitch, yaw, roll, dpitch, dyaw, droll]. The Euler Angle is really not a good representation
             if opt.is_train:
@@ -383,7 +404,7 @@ class Text2MotionDatasetEval(data.Dataset):
         
         new_name_list = []
         length_list = []
-        if opt.dataset_name == "cam" or opt.dataset_name == "realestate10k_6" or opt.dataset_name == "realestate10k_12" or opt.dataset_name == "realestate10k_quat" or opt.dataset_name == "realestate10k_rotmat":
+        if opt.dataset_name in CAMERA_DATASET_NAMES:
             for name in tqdm(id_list):
                 try:
                     # import pdb; pdb.set_trace()
@@ -678,7 +699,7 @@ class Text2MotionDataset(data.Dataset):
 
         new_name_list = []
         length_list = []
-        if opt.dataset_name == "cam" or opt.dataset_name == "realestate10k_6" or opt.dataset_name == "realestate10k_12" or opt.dataset_name == "realestate10k_quat" or opt.dataset_name == "realestate10k_rotmat":
+        if opt.dataset_name in CAMERA_DATASET_NAMES:
             # Camera dataset: text files have format "caption#tokens" (2 fields)
             for name in tqdm(id_list, desc="Loading motion & text data"):
                 try:

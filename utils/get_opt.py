@@ -66,6 +66,7 @@ def get_opt(opt_path, device, **kwargs):
         'realestate10k_12':  {'data_root': './dataset/RealEstate10K_12feat/','joints_num': 1,  'dim_pose': 12,  'max_motion_length': 500, 'max_motion_frame': 500, 'max_motion_token': 125},
         'realestate10k_quat':{'data_root': './dataset/RealEstate10K_quat/', 'joints_num': 1,  'dim_pose': 10,  'max_motion_length': 500, 'max_motion_frame': 500, 'max_motion_token': 125},
         'realestate10k_rotmat':{'data_root': './dataset/RealEstate10K_rotmat/','joints_num': 1,'dim_pose': 12,  'max_motion_length': 500, 'max_motion_frame': 500, 'max_motion_token': 125},
+        'realestate10k_rotmat9':{'data_root': './dataset/RealEstate10K_rotmat9/','joints_num': 1,'dim_pose': 9,  'max_motion_length': 500, 'max_motion_frame': 500, 'max_motion_token': 125},
     }
 
     if opt.dataset_name not in _dataset_defaults:

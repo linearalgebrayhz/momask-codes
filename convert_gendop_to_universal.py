@@ -26,7 +26,7 @@ except ImportError:
     def tqdm(iterable, **kwargs):
         return iterable
 
-from utils.camera_geometry import matrix_to_sixd, validate_rotation
+from utils.camera_geometry import matrix_to_sixd, validate_rotation, forward_from_sixd
 
 
 def read_lines(path: Path) -> List[str]:
@@ -109,6 +109,39 @@ def assign_split(indices: np.ndarray, train_ratio: float, val_ratio: float):
     return set(train_idx.tolist()), set(val_idx.tolist()), set(test_idx.tolist())
 
 
+def _motion_profile_from_traj9(
+    traj9: np.ndarray,
+    translation_thresh: float = 0.10,
+    yaw_thresh: float = 0.12,
+    pitch_thresh: float = 0.10,
+) -> Dict[str, float]:
+    """Compute simple motion profile from 9D [rot6d, pos]."""
+    pos = traj9[:, 6:9]
+    total_disp = float(np.linalg.norm(pos[-1] - pos[0]))
+
+    fwd0 = forward_from_sixd(traj9[0, :6])
+    fwd1 = forward_from_sixd(traj9[-1, :6])
+    yaw0 = np.arctan2(fwd0[0], -fwd0[2])
+    yaw1 = np.arctan2(fwd1[0], -fwd1[2])
+    dyaw = float(np.arctan2(np.sin(yaw1 - yaw0), np.cos(yaw1 - yaw0)))
+
+    pitch0 = np.arcsin(np.clip(fwd0[1], -1, 1))
+    pitch1 = np.arcsin(np.clip(fwd1[1], -1, 1))
+    dpitch = float(pitch1 - pitch0)
+
+    is_static = (
+        total_disp <= translation_thresh
+        and abs(dyaw) <= yaw_thresh
+        and abs(dpitch) <= pitch_thresh
+    )
+    return {
+        "total_disp": total_disp,
+        "dyaw": dyaw,
+        "dpitch": dpitch,
+        "is_static": is_static,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert GenDoP to universal 9D+text format")
     parser.add_argument("--gendop_root", type=str, default="/data4/haozhe/CamTraj/data/GenDop/DataDop")
@@ -120,6 +153,15 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train_ratio", type=float, default=0.85)
     parser.add_argument("--val_ratio", type=float, default=0.15)
+    parser.add_argument("--fps", type=float, default=24.0)
+    parser.add_argument("--min_duration_sec", type=float, default=3.0)
+    parser.add_argument("--enable_motion_filter", action="store_true",
+                        help="Enable duration/static-scene filtering.")
+    parser.add_argument("--max_static_ratio", type=float, default=0.35,
+                        help="Max accepted static ratio among kept scenes when filtering.")
+    parser.add_argument("--translation_thresh", type=float, default=0.10)
+    parser.add_argument("--yaw_thresh", type=float, default=0.12)
+    parser.add_argument("--pitch_thresh", type=float, default=0.10)
     parser.add_argument("--append_global_splits", action="store_true",
                         help="Append converted IDs into out_root/{train,val,test}.txt")
     args = parser.parse_args()
@@ -136,6 +178,10 @@ def main():
 
     processed_ids: List[str] = []
     skipped = 0
+    skipped_short = 0
+    skipped_static = 0
+    accepted_static = 0
+    accepted_total = 0
 
     for tf in tqdm(transforms_files, desc="Converting GenDoP"):
         if len(processed_ids) >= args.max_samples:
@@ -161,6 +207,25 @@ def main():
             skipped += 1
             continue
 
+        duration_sec = float(len(traj9) / max(args.fps, 1e-8))
+        if args.enable_motion_filter and duration_sec < args.min_duration_sec:
+            skipped_short += 1
+            continue
+
+        motion = _motion_profile_from_traj9(
+            traj9,
+            translation_thresh=args.translation_thresh,
+            yaw_thresh=args.yaw_thresh,
+            pitch_thresh=args.pitch_thresh,
+        )
+        if args.enable_motion_filter and motion["is_static"]:
+            projected_static = accepted_static + 1
+            projected_total = accepted_total + 1
+            projected_ratio = projected_static / max(projected_total, 1)
+            if projected_ratio > args.max_static_ratio:
+                skipped_static += 1
+                continue
+
         caption = parse_gendop_caption(caption_path)
         if not caption:
             skipped += 1
@@ -177,13 +242,18 @@ def main():
             "transforms_file": str(tf),
             "caption_file": str(caption_path),
             "num_frames": int(traj9.shape[0]),
+            "duration_sec": duration_sec,
             "feature_dim": 9,
             "pose_semantics": "T_wc (from GenDoP c2w)",
+            "motion_profile": motion,
         }
         with open(out_root / "metadata" / f"{sid}.json", "w") as f:
             json.dump(meta, f, indent=2)
 
         processed_ids.append(sid)
+        accepted_total += 1
+        if motion["is_static"]:
+            accepted_static += 1
 
     # Deterministic train/val/test split for converted GenDoP IDs.
     rng = np.random.RandomState(args.seed)
@@ -210,6 +280,11 @@ def main():
     print("\nGenDoP conversion complete")
     print(f"  processed: {len(processed_ids)}")
     print(f"  skipped:   {skipped}")
+    if args.enable_motion_filter:
+        print(f"  skipped_short(<{args.min_duration_sec:.2f}s): {skipped_short}")
+        print(f"  skipped_static(ratio>{args.max_static_ratio:.2f}): {skipped_static}")
+        ratio = accepted_static / max(accepted_total, 1)
+        print(f"  kept_static_ratio: {ratio:.3f} ({accepted_static}/{accepted_total})")
     print(f"  out_root:  {out_root}")
 
 

@@ -46,7 +46,7 @@ def get_dataset_motion_loader(opt_path, batch_size, fname, device, load_frames=F
         else:
             dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=4, drop_last=False,
                                     collate_fn=collate_fn, shuffle=True)
-    elif opt.dataset_name in ['realestate10k_6', 'realestate10k_12', 'realestate10k_quat', 'realestate10k_rotmat']:
+    elif opt.dataset_name in ['realestate10k_6', 'realestate10k_12', 'realestate10k_quat', 'realestate10k_rotmat', 'realestate10k_rotmat9']:
         print('Loading dataset %s ...' % opt.dataset_name)
         mean = np.load(pjoin(opt.meta_dir, 'mean.npy'), allow_pickle=True)
         std = np.load(pjoin(opt.meta_dir, 'std.npy'), allow_pickle=True)

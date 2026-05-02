@@ -289,7 +289,8 @@ class InfoNCELoss(nn.Module):
 
     def __init__(self, temperature: float = 0.07):
         super().__init__()
-        self.temperature = temperature
+        # CLIP-style learnable logit scale initialized as log(1/temperature).
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1.0 / temperature))
 
     def forward(
         self, text_emb: torch.Tensor, traj_emb: torch.Tensor
@@ -304,8 +305,8 @@ class InfoNCELoss(nn.Module):
         -------
         loss : scalar
         """
-        # Cosine similarity matrix
-        logits = (text_emb @ traj_emb.T) / self.temperature  # (B, B)
+        # Cosine similarity matrix with learnable temperature scaling.
+        logits = self.logit_scale.exp().clamp(max=100) * (text_emb @ traj_emb.T)  # (B, B)
 
         labels = torch.arange(logits.size(0), device=logits.device)
 
@@ -349,17 +350,32 @@ class CLaTrEvalWrapper:
         import clip as clip_module
         self.device = device
 
+        # Load checkpoint first so evaluator architecture follows the checkpoint.
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        traj_state = ckpt["traj_encoder"]
+        ckpt_input_dim = traj_state["input_proj.weight"].shape[1]
+        ckpt_output_dim = traj_state["output_proj.2.weight"].shape[0]
+
+        if input_dim != ckpt_input_dim:
+            print(
+                f"[CLaTrEvalWrapper] input_dim override: requested {input_dim}, "
+                f"checkpoint uses {ckpt_input_dim}. Using checkpoint dim."
+            )
+        if output_dim != ckpt_output_dim:
+            print(
+                f"[CLaTrEvalWrapper] output_dim override: requested {output_dim}, "
+                f"checkpoint uses {ckpt_output_dim}. Using checkpoint dim."
+            )
+
         # Build sub-networks
         self.traj_encoder = TrajectoryEncoder(
-            input_dim=input_dim, output_dim=output_dim,
+            input_dim=ckpt_input_dim, output_dim=ckpt_output_dim,
         ).to(device)
 
         self.text_encoder = CLIPTextEncoder(
-            output_dim=output_dim,
+            output_dim=ckpt_output_dim,
         ).to(device)
 
-        # Load checkpoint
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         self.traj_encoder.load_state_dict(ckpt["traj_encoder"])
         self.text_encoder.load_state_dict(ckpt["text_encoder"], strict=False)
         print(f"[CLaTrEvalWrapper] Loaded evaluator from {ckpt_path} "
@@ -387,8 +403,11 @@ class CLaTrEvalWrapper:
         # the generation pipeline uses different mean/std than the evaluator.
         self.pipeline_mean = None
         self.pipeline_std = None
+        self.pipeline_dataset_name = ""
+        self._warned_pipeline_dim_mismatch = False
+        self._warned_eval_stats_dim_mismatch = False
 
-    def set_pipeline_stats(self, mean: torch.Tensor, std: torch.Tensor):
+    def set_pipeline_stats(self, mean: torch.Tensor, std: torch.Tensor, dataset_name: str = ""):
         """Register the generation pipeline's Z-normalization stats.
 
         If these differ from the evaluator's own mean/std (stored in the
@@ -398,6 +417,58 @@ class CLaTrEvalWrapper:
         """
         self.pipeline_mean = mean.to(self.device).float()
         self.pipeline_std = std.to(self.device).float()
+        self.pipeline_dataset_name = dataset_name
+
+    def _convert_12d_to_9d_with_integrated_position(self, motions_raw: torch.Tensor) -> torch.Tensor:
+        """
+        Convert raw 12D [x,y,z,dx,dy,dz,rot6d] to raw 9D [rot6d,x,y,z].
+
+        Position is reconstructed by integrating velocity channels:
+            pos[0] = x0,y0,z0
+            pos[t] = pos[t-1] + vel[t], t>=1
+        """
+        B, T, D = motions_raw.shape
+        if D != 12:
+            raise ValueError(f"Expected 12D motions for conversion, got {D}D")
+
+        pos0 = motions_raw[:, 0:1, 0:3]              # (B,1,3)
+        vel = motions_raw[:, :, 3:6]                 # (B,T,3)
+        rot6d = motions_raw[:, :, 6:12]              # (B,T,6)
+
+        pos = torch.zeros((B, T, 3), device=motions_raw.device, dtype=motions_raw.dtype)
+        pos[:, 0:1, :] = pos0
+        if T > 1:
+            # integrate using vel[t] for transition (t-1 -> t), matching camera_geometry logic
+            pos[:, 1:, :] = pos0 + torch.cumsum(vel[:, 1:, :], dim=1)
+
+        return torch.cat([rot6d, pos], dim=-1)       # (B,T,9)
+
+    def _convert_tkcam9_to_clatr9(self, motions_raw: torch.Tensor) -> torch.Tensor:
+        """Convert raw TKCAM 9D [x,y,z,rot6d] to evaluator 9D [rot6d,x,y,z]."""
+        B, T, D = motions_raw.shape
+        if D != 9:
+            raise ValueError(f"Expected 9D motions for conversion, got {D}D")
+        return torch.cat([motions_raw[:, :, 3:9], motions_raw[:, :, :3]], dim=-1)
+
+    def _prepare_motion_for_evaluator(self, motions_raw: torch.Tensor) -> torch.Tensor:
+        """Convert raw pipeline motion into the evaluator's expected input dim."""
+        expected_dim = self.traj_encoder.input_dim
+        current_dim = motions_raw.shape[-1]
+
+        if current_dim == expected_dim:
+            dataset_name = getattr(self, "pipeline_dataset_name", "")
+            if current_dim == 9 and isinstance(dataset_name, str) and "rotmat9" in dataset_name.lower():
+                return self._convert_tkcam9_to_clatr9(motions_raw)
+            return motions_raw
+
+        # Main migration case: pipeline is 12D, evaluator is 9D.
+        if current_dim == 12 and expected_dim == 9:
+            return self._convert_12d_to_9d_with_integrated_position(motions_raw)
+
+        raise ValueError(
+            f"Unsupported evaluator motion conversion: pipeline dim={current_dim}, "
+            f"evaluator expects dim={expected_dim}."
+        )
 
     # ── Core embedding methods ─────────────────────────────
 
@@ -426,14 +497,35 @@ class CLaTrEvalWrapper:
         motions = motions.to(self.device).float()
         m_lens = m_lens.to(self.device).long()
 
-        # Re-normalize if pipeline stats differ from evaluator stats
-        if (self.pipeline_mean is not None and self.mean is not None):
-            # De-normalize from pipeline space: x_raw = x_pipe * std_pipe + mean_pipe
-            motions = motions * self.pipeline_std + self.pipeline_mean
-            # Re-normalize into evaluator space: x_eval = (x_raw - mean_eval) / std_eval
-            motions = (motions - self.mean) / self.std
+        # 1) De-normalize from pipeline space (if matching stats are available).
+        motions_raw = motions
+        if self.pipeline_mean is not None and self.pipeline_std is not None:
+            if self.pipeline_mean.shape[-1] == motions.shape[-1]:
+                motions_raw = motions * self.pipeline_std + self.pipeline_mean
+            elif not self._warned_pipeline_dim_mismatch:
+                print(
+                    f"[CLaTrEvalWrapper] Warning: pipeline stats dim "
+                    f"{self.pipeline_mean.shape[-1]} != motion dim {motions.shape[-1]}; "
+                    "skipping pipeline de-normalization."
+                )
+                self._warned_pipeline_dim_mismatch = True
 
-        emb = self.traj_encoder(motions, m_lens)
+        # 2) Convert raw trajectory to evaluator expected format/dim.
+        motions_eval = self._prepare_motion_for_evaluator(motions_raw)
+
+        # 3) Re-normalize into evaluator training space when stats are available.
+        if self.mean is not None and self.std is not None:
+            if self.mean.shape[-1] == motions_eval.shape[-1]:
+                motions_eval = (motions_eval - self.mean) / self.std
+            elif not self._warned_eval_stats_dim_mismatch:
+                print(
+                    f"[CLaTrEvalWrapper] Warning: evaluator stats dim "
+                    f"{self.mean.shape[-1]} != evaluator motion dim {motions_eval.shape[-1]}; "
+                    "skipping evaluator re-normalization."
+                )
+                self._warned_eval_stats_dim_mismatch = True
+
+        emb = self.traj_encoder(motions_eval, m_lens)
         emb = F.normalize(emb, dim=-1)
         return emb.cpu().numpy()
 

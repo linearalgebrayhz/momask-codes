@@ -440,7 +440,7 @@ if __name__ == "__main__":
 
     # Mask Transformer
     conditioning_mode = getattr(opt, "conditioning_mode", "clip")
-    t2m_transformer = load_trans_model(model_opt, opt, "latest.tar")
+    t2m_transformer = load_trans_model(model_opt, opt, "net_best_fid.tar")
 
     # Move to device & eval
     for m in (t2m_transformer, vq_model, res_model):

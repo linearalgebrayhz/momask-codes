@@ -22,6 +22,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -60,6 +61,8 @@ class UniversalTrajectoryTextDataset(Dataset):
         augment: bool = False,
         translation_slice=(6, 9),
         translation_noise_std: float = 0.01,
+        norm_stats: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        fit_normalization: bool = False,
     ):
         super().__init__()
         self.data_root = Path(data_root)
@@ -73,24 +76,34 @@ class UniversalTrajectoryTextDataset(Dataset):
         self.translation_slice = translation_slice
         self.translation_noise_std = translation_noise_std
 
-        self.mean = None
-        self.std = None
+        self.mean = np.zeros(self.input_dim, dtype=np.float32)
+        self.std = np.ones(self.input_dim, dtype=np.float32)
+        need_fit_stats = False
         if self.normalize:
-            mean_path = self.data_root / "Mean.npy"
-            std_path = self.data_root / "Std.npy"
-            if mean_path.exists() and std_path.exists():
-                self.mean = np.load(str(mean_path)).astype(np.float32)
-                self.std = np.load(str(std_path)).astype(np.float32)
-                if self.mean.shape[-1] != self.input_dim or self.std.shape[-1] != self.input_dim:
-                    raise ValueError(
-                        f"Mean/Std dim mismatch: mean={self.mean.shape}, std={self.std.shape}, "
-                        f"expected last dim {self.input_dim}"
-                    )
-                self.std = np.where(self.std < 1e-8, 1.0, self.std)
+            if norm_stats is not None:
+                m, s = norm_stats
+                self.mean = np.asarray(m, dtype=np.float32).copy()
+                self.std = np.asarray(s, dtype=np.float32).copy()
             else:
-                raise FileNotFoundError(
-                    f"Normalization requested but Mean/Std not found in {self.data_root}."
+                mean_path = self.data_root / "Mean.npy"
+                std_path = self.data_root / "Std.npy"
+                if mean_path.exists() and std_path.exists():
+                    self.mean = np.load(str(mean_path)).astype(np.float32)
+                    self.std = np.load(str(std_path)).astype(np.float32)
+                elif fit_normalization:
+                    need_fit_stats = True
+                else:
+                    print(
+                        f"[UniversalTrajectoryTextDataset] Mean/Std not found in {self.data_root}; "
+                        "using identity normalization."
+                    )
+
+            if self.mean.shape[-1] != self.input_dim or self.std.shape[-1] != self.input_dim:
+                raise ValueError(
+                    f"Mean/Std dim mismatch: mean={self.mean.shape}, std={self.std.shape}, "
+                    f"expected last dim {self.input_dim}"
                 )
+            self._apply_translation_only_normalization_mask()
 
         split_file = self.data_root / f"{split}.txt"
         if not split_file.exists():
@@ -127,6 +140,9 @@ class UniversalTrajectoryTextDataset(Dataset):
                 continue
 
             self.samples.append({"name": name, "motion": motion.astype(np.float32), "captions": captions})
+
+        if self.normalize and need_fit_stats:
+            self._fit_translation_stats_from_samples()
 
         print(
             f"[UniversalTrajectoryTextDataset] split={split}: loaded {len(self.samples)} "
@@ -167,6 +183,46 @@ class UniversalTrajectoryTextDataset(Dataset):
         caption = np.random.choice(sample["captions"])
         return {"motion": motion, "m_length": m_length, "caption": caption}
 
+    def _apply_translation_only_normalization_mask(self):
+        """Keep only translation channels normalized; leave rotation channels untouched."""
+        lo, hi = self.translation_slice
+        lo = max(0, lo)
+        hi = min(self.input_dim, hi)
+
+        masked_mean = np.zeros(self.input_dim, dtype=np.float32)
+        masked_std = np.ones(self.input_dim, dtype=np.float32)
+        if hi > lo:
+            masked_mean[lo:hi] = self.mean[lo:hi]
+            masked_std[lo:hi] = self.std[lo:hi]
+        self.mean = masked_mean
+        self.std = np.where(masked_std < 1e-8, 1.0, masked_std)
+
+    def _fit_translation_stats_from_samples(self):
+        """Fit translation-only mean/std from loaded samples."""
+        lo, hi = self.translation_slice
+        lo = max(0, lo)
+        hi = min(self.input_dim, hi)
+        if hi <= lo or not self.samples:
+            self.mean = np.zeros(self.input_dim, dtype=np.float32)
+            self.std = np.ones(self.input_dim, dtype=np.float32)
+            return
+
+        trans_chunks = [s["motion"][:, lo:hi] for s in self.samples if s["motion"].shape[0] > 0]
+        if not trans_chunks:
+            self.mean = np.zeros(self.input_dim, dtype=np.float32)
+            self.std = np.ones(self.input_dim, dtype=np.float32)
+            return
+
+        trans = np.concatenate(trans_chunks, axis=0).astype(np.float32)
+        self.mean = np.zeros(self.input_dim, dtype=np.float32)
+        self.std = np.ones(self.input_dim, dtype=np.float32)
+        self.mean[lo:hi] = trans.mean(axis=0)
+        self.std[lo:hi] = np.where(trans.std(axis=0) < 1e-8, 1.0, trans.std(axis=0))
+        print(
+            f"[UniversalTrajectoryTextDataset] Fitted translation stats from split={self.data_root.name}: "
+            f"indices [{lo}:{hi}]"
+        )
+
 
 def collate_evaluator(batch):
     motions = torch.from_numpy(np.stack([b["motion"] for b in batch]))
@@ -198,12 +254,15 @@ def train_one_epoch(
         lengths = lengths.to(device)
         text_tokens = clip_tokenize(captions, truncate=True).to(device)
 
-        traj_emb = F.normalize(traj_encoder(motions, lengths), dim=-1)
-        text_emb = F.normalize(text_encoder(text_tokens), dim=-1)
+        traj_emb = traj_encoder(motions, lengths)
+        text_emb = text_encoder(text_tokens)
 
         if emb_dropout > 0:
             traj_emb = F.dropout(traj_emb, p=emb_dropout, training=True)
             text_emb = F.dropout(text_emb, p=emb_dropout, training=True)
+
+        traj_emb = F.normalize(traj_emb, dim=-1)
+        text_emb = F.normalize(text_emb, dim=-1)
 
         loss = criterion(text_emb, traj_emb)
 
@@ -348,6 +407,7 @@ def main():
         augment=True,
         translation_slice=(args.translation_start_idx, args.translation_end_idx),
         translation_noise_std=args.translation_noise_std,
+        fit_normalization=True,
     )
     val_dataset = UniversalTrajectoryTextDataset(
         data_root=args.data_root,
@@ -359,6 +419,7 @@ def main():
         augment=False,
         translation_slice=(args.translation_start_idx, args.translation_end_idx),
         translation_noise_std=args.translation_noise_std,
+        norm_stats=(train_dataset.mean, train_dataset.std) if args.normalize else None,
     )
 
     train_loader = DataLoader(
@@ -397,7 +458,11 @@ def main():
     text_encoder = CLIPTextEncoder(output_dim=args.output_dim).to(device)
     criterion = InfoNCELoss(temperature=args.temperature)
 
-    trainable_params = list(traj_encoder.parameters()) + list(text_encoder.projection.parameters())
+    trainable_params = (
+        list(traj_encoder.parameters())
+        + list(text_encoder.projection.parameters())
+        + list(criterion.parameters())
+    )
     optimizer = optim.AdamW(
         trainable_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99)
     )

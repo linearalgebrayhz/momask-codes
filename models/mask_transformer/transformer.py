@@ -183,7 +183,7 @@ class BaseCondTransformer(nn.Module):
                  conditioning_mode='clip', num_id_samples=50,
                  t5_model_name='t5-base', use_first_frame=False,
                  use_sparse_frames=False, max_sparse_frames=4,
-                 visual_drop_prob=0.0, **kargs):
+                 visual_drop_prob=0.0, condition_fusion='cross_attn', **kargs):
         super().__init__()
         kargs.pop('use_frames', None)
         kargs.pop('frame_dim', None)
@@ -201,6 +201,9 @@ class BaseCondTransformer(nn.Module):
 
         # ── New: conditioning mode (clip / t5 / id_embedding) ──
         self.conditioning_mode = conditioning_mode
+        self.condition_fusion = getattr(opt, 'condition_fusion', condition_fusion)
+        if self.condition_fusion not in ('cross_attn', 'prefix_self_attn'):
+            raise ValueError(f"Unsupported condition_fusion: {self.condition_fusion}")
         self.num_id_samples = num_id_samples
         self.t5_model_name = t5_model_name
         self._use_new_provider = conditioning_mode in ('t5', 'id_embedding')
@@ -209,6 +212,7 @@ class BaseCondTransformer(nn.Module):
         self.max_sparse_frames = max_sparse_frames
         self.visual_drop_prob = visual_drop_prob
         print(f'Conditioning mode: {conditioning_mode}')
+        print(f'Condition fusion: {self.condition_fusion}')
         if visual_drop_prob > 0:
             print(f'Visual CFG dropout: {visual_drop_prob:.2f} '
                   f'(force_mask=True always drops visual for true unconditional)')
@@ -626,6 +630,37 @@ class BaseCondTransformer(nn.Module):
 
         return x, captured_weights
 
+    def _run_prefix_self_attn_blocks(
+        self,
+        x: torch.Tensor,
+        cond_seq: torch.Tensor,
+        motion_key_padding_mask: Optional[torch.Tensor],
+        cond_key_padding_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run MoMask-style condition-prefix self-attention and return motion tokens."""
+        cond_len, batch_size, _ = cond_seq.shape
+        if cond_key_padding_mask is None:
+            cond_key_padding_mask = torch.zeros(
+                batch_size, cond_len, dtype=torch.bool, device=cond_seq.device)
+        if motion_key_padding_mask is None:
+            motion_key_padding_mask = torch.zeros(
+                batch_size, x.shape[0], dtype=torch.bool, device=x.device)
+        joint = torch.cat([cond_seq, x], dim=0)
+        joint_key_padding_mask = torch.cat(
+            [cond_key_padding_mask.to(joint.device), motion_key_padding_mask.to(joint.device)],
+            dim=1,
+        )
+
+        for block in self.cross_attn_blocks:
+            joint_norm = block.norm1(joint)
+            joint = joint + block.self_attn(
+                joint_norm, joint_norm, joint_norm,
+                key_padding_mask=joint_key_padding_mask,
+                need_weights=False,
+            )[0]
+            joint = joint + block.ff(block.norm3(joint))
+        return joint[cond_len:]
+
 
 # ──────────────────── Mask Transformer ────────────────────
 
@@ -750,13 +785,23 @@ class MaskTransformer(BaseCondTransformer):
             visual_tokens=visual_tokens_sparse,
             visual_ignore_mask=visual_ignore_mask)
 
-        # ── Cross-attention stack ────────────────────────────────────────────
-        x, captured_attn_weights = self._run_cross_attn_blocks(
-            x, cond_seq,
-            motion_key_padding_mask=padding_mask,
-            cond_key_padding_mask=cond_kp,
-            return_attn_weights=return_attn_weights,
-        )   # (S, B, D)
+        captured_attn_weights = None
+        if self.condition_fusion == 'prefix_self_attn':
+            if return_attn_weights:
+                raise ValueError("return_attn_weights is only available for condition_fusion='cross_attn'")
+            x = self._run_prefix_self_attn_blocks(
+                x, cond_seq,
+                motion_key_padding_mask=padding_mask,
+                cond_key_padding_mask=cond_kp,
+            )
+        else:
+            # ── Cross-attention stack ────────────────────────────────────────
+            x, captured_attn_weights = self._run_cross_attn_blocks(
+                x, cond_seq,
+                motion_key_padding_mask=padding_mask,
+                cond_key_padding_mask=cond_kp,
+                return_attn_weights=return_attn_weights,
+            )   # (S, B, D)
 
         logits = self.output_process(x)     # (B, num_tokens, S)
         if return_attn_weights:
@@ -1244,13 +1289,23 @@ class ResidualTransformer(BaseCondTransformer):
             visual_tokens=visual_tokens_sparse,
             visual_ignore_mask=visual_ignore_mask)
 
-        # ── Cross-attention stack ────────────────────────────────────────────
-        x, captured_attn_weights = self._run_cross_attn_blocks(
-            x, cond_seq,
-            motion_key_padding_mask=padding_mask,
-            cond_key_padding_mask=cond_kp,
-            return_attn_weights=return_attn_weights,
-        )   # (S, B, D)
+        captured_attn_weights = None
+        if self.condition_fusion == 'prefix_self_attn':
+            if return_attn_weights:
+                raise ValueError("return_attn_weights is only available for condition_fusion='cross_attn'")
+            x = self._run_prefix_self_attn_blocks(
+                x, cond_seq,
+                motion_key_padding_mask=padding_mask,
+                cond_key_padding_mask=cond_kp,
+            )
+        else:
+            # ── Cross-attention stack ────────────────────────────────────────
+            x, captured_attn_weights = self._run_cross_attn_blocks(
+                x, cond_seq,
+                motion_key_padding_mask=padding_mask,
+                cond_key_padding_mask=cond_kp,
+                return_attn_weights=return_attn_weights,
+            )   # (S, B, D)
 
         logits = self.output_process(x)         # (B, code_dim, S)
         if return_attn_weights:

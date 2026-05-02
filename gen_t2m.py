@@ -148,7 +148,7 @@ if __name__ == '__main__':
     #################################
     ######Loading M-Transformer######
     #################################
-    t2m_transformer = load_trans_model(model_opt, opt, 'latest.tar')
+    t2m_transformer = load_trans_model(model_opt, opt, 'net_best_fid.tar')
 
     ##################################
     #####Loading Length Predictor#####

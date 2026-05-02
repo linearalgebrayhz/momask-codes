@@ -58,12 +58,19 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from utils.unified_data_format import CameraDataFormat, detect_format_from_dataset_name
-from compute_dataset_statistics import classify_motion
+from compute_dataset_statistics import (
+    CameraDataFormat,
+    classify_motion,
+    detect_format_from_dataset_name,
+)
 
 
 # ============================================================================
@@ -78,6 +85,8 @@ MOTION_BUCKETS = [
     "moves_down",
     "moves_up",
     "tilts_down",
+    "arcs_right",
+    "arcs_left",
     "dollies_backward",
     "tracks_right",
     "tracks_left",
@@ -89,6 +98,10 @@ MOTION_BUCKETS = [
 # Keyword mapping: motion flag → expected caption keywords.
 # The caption should mention at least one keyword for each active motion flag.
 MOTION_KEYWORDS = {
+    "arcs_left":        ["arc", "arcs", "arcing", "orbit", "orbits", "orbiting",
+                         "left", "curves", "circles"],
+    "arcs_right":       ["arc", "arcs", "arcing", "orbit", "orbits", "orbiting",
+                         "right", "curves", "circles"],
     "dollies_forward":  ["forward", "dolly", "dollies", "push", "pushing", "closer",
                          "approach", "advancing", "towards", "into", "toward"],
     "dollies_backward": ["backward", "back", "pull", "pulling", "away", "retreat",
@@ -113,6 +126,8 @@ MOTION_KEYWORDS = {
 
 # Direction conflict pairs: (flag, keyword_that_contradicts_it)
 DIRECTION_CONFLICTS = [
+    ("arcs_left",        []),
+    ("arcs_right",       []),
     ("dollies_forward",  ["backward", "back", "pull", "pulling", "retreat", "away"]),
     ("dollies_backward", ["forward", "push", "pushing", "closer", "approach", "toward"]),
     ("tracks_left",      []),   # "left" is shared with pans_left, hard to conflict
@@ -354,11 +369,15 @@ def generate_guidance_from_trajectory(
     on the saved 12D features (already relativized) rather than raw
     relative_motion_data.
     """
-    from utils.camera_geometry import forward_from_sixd
+    from utils.camera_geometry import forward_from_sixd, sixd_to_matrix
+
+    if len(trajectory) < 2:
+        return "camera remains static"
 
     positions = trajectory[:, :3]
 
     if fmt == CameraDataFormat.FULL_12_ROTMAT:
+        rotations = sixd_to_matrix(trajectory[:, 6:12])
         fwd0 = forward_from_sixd(trajectory[0, 6:12])
         fwd1 = forward_from_sixd(trajectory[-1, 6:12])
     else:
@@ -366,21 +385,12 @@ def generate_guidance_from_trajectory(
 
     parts: List[str] = []
 
-    # Translation (OpenGL: +X right, +Y up, -Z forward)
-    total_t = positions[-1] - positions[0]
-    abs_t = np.abs(total_t)
-    max_t = float(np.max(abs_t))
-
-    if max_t > 0.10:
-        cands = []
-        if abs_t[0] > 0.10 and abs_t[0] >= 0.6 * max_t:
-            cands.append((abs_t[0], "tracks right" if total_t[0] > 0 else "tracks left"))
-        if abs_t[1] > 0.10 and abs_t[1] >= 0.6 * max_t:
-            cands.append((abs_t[1], "moves up" if total_t[1] > 0 else "moves down"))
-        if abs_t[2] > 0.10 and abs_t[2] >= 0.6 * max_t:
-            cands.append((abs_t[2], "dollies forward" if total_t[2] < 0 else "dollies backward"))
-        cands.sort(key=lambda x: x[0], reverse=True)
-        parts.extend(c[1] for c in cands[:2])
+    # Translation via integrated local velocity, matching the processor.
+    v_world = np.diff(positions, axis=0)
+    r_w2c = np.transpose(rotations[:-1], (0, 2, 1))
+    v_local = np.einsum("nij,nj->ni", r_w2c, v_world)
+    v_local[np.abs(v_local) < 0.005] = 0.0
+    accumulated_local_t = np.sum(v_local, axis=0)
 
     # Rotation
     yaw0 = np.arctan2(fwd0[0], -fwd0[2])
@@ -391,8 +401,25 @@ def generate_guidance_from_trajectory(
     pitch1 = np.arcsin(np.clip(fwd1[1], -1, 1))
     dpitch = pitch1 - pitch0
 
-    if abs(dyaw) > 0.12:
-        parts.append("pans right" if dyaw > 0 else "pans left")
+    is_panning = abs(dyaw) > 0.12
+    is_trucking = abs(accumulated_local_t[0]) > 0.10
+
+    if is_panning and is_trucking:
+        parts.append("arcs right" if dyaw > 0 else "arcs left")
+    else:
+        if is_trucking:
+            parts.append("tracks right" if accumulated_local_t[0] > 0 else "tracks left")
+        if is_panning:
+            parts.append("pans right" if dyaw > 0 else "pans left")
+
+    if abs(accumulated_local_t[1]) > 0.10:
+        parts.append("moves up" if accumulated_local_t[1] > 0 else "moves down")
+    if abs(accumulated_local_t[2]) > 0.10:
+        parts.append(
+            "dollies forward"
+            if accumulated_local_t[2] < 0
+            else "dollies backward"
+        )
     if abs(dpitch) > 0.10:
         parts.append("tilts up" if dpitch > 0 else "tilts down")
 
@@ -686,8 +713,8 @@ def main():
         help="Disable direction-conflict rejection",
     )
     parser.add_argument(
-        "--format", choices=["rotmat", "quat", "auto"], default="auto",
-        help="Data format (default: auto-detect)",
+        "--format", choices=["rotmat", "auto"], default="auto",
+        help="Data format (default: auto-detect rotmat)",
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -718,8 +745,11 @@ def main():
             print("Cannot auto-detect format, defaulting to rotmat")
             fmt = CameraDataFormat.FULL_12_ROTMAT
     else:
-        fmt = (CameraDataFormat.FULL_12_ROTMAT if args.format == "rotmat"
-               else CameraDataFormat.QUATERNION_10)
+        fmt = CameraDataFormat.FULL_12_ROTMAT
+
+    if fmt != CameraDataFormat.FULL_12_ROTMAT:
+        print(f"Error: only rotmat datasets are supported, detected {fmt.name}")
+        return 1
 
     print(f"Source:           {source_dir}")
     print(f"Format:           {fmt.name}")

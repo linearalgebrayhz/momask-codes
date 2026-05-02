@@ -58,7 +58,7 @@ def compute_smoothness_loss(pred_motion, gt_motion):
         else:
             return loss_accel
     else:
-        # For legacy formats (5D, 6D without explicit velocity), use position-based smoothness
+        # For legacy formats and 9D rotmat without explicit velocity, use position-based smoothness.
         pred_pos = pred_motion[..., :3]
         gt_pos = gt_motion[..., :3]
         
@@ -127,6 +127,26 @@ class RVQTokenizerTrainer:
                 loss_pos = self.l1_criterion(pred_pos, gt_pos)
                 loss_ori = self.l1_criterion(pred_ori, gt_ori)
                 loss_explicit = loss_pos + loss_ori
+
+            elif feature_dim == 9:
+                # 9D rotmat: [x, y, z, r1x, r1y, r1z, r2x, r2y, r2z]
+                pred_pos = pred_motion[..., :3]
+                gt_pos = motions[..., :3]
+                pred_rot = pred_motion[..., 3:9]
+                gt_rot = motions[..., 3:9]
+
+                loss_pos = self.l1_criterion(pred_pos, gt_pos)
+                loss_rot = self.l1_criterion(pred_rot, gt_rot)
+
+                if 'rotmat' in self.opt.dataset_name.lower():
+                    from utils.unified_data_format import compute_orthogonality_loss
+                    loss_orth = compute_orthogonality_loss(pred_rot)
+                    orth_weight = getattr(self.opt, 'loss_orthogonality', 0.1)
+                    loss_explicit = loss_pos + loss_rot + orth_weight * loss_orth
+                    self.loss_orth = loss_orth
+                else:
+                    loss_explicit = loss_pos + loss_rot
+                    self.loss_orth = torch.tensor(0.0, device=self.device)
                 
             elif feature_dim == 10:
                 # 10D quaternion: [x, y, z, dx, dy, dz, qw, qx, qy, qz]
@@ -301,7 +321,7 @@ class RVQTokenizerTrainer:
         if is_camera_dataset:
             eval_fn = evaluation_camera_vqvae_clatr if use_clatr else evaluation_camera_vqvae
             # Use camera-specific evaluation (now includes FID and other motion metrics)
-            _clatr_extra = dict(vis_vel_integration=getattr(self.opt, 'vis_vel_integration', False)) if use_clatr else {}
+            _clatr_extra = dict(vis_vel_integration=True) if use_clatr else {}
             best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_recon, best_smoothness, best_position_error, best_orientation_error, writer = eval_fn(
                 self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, 
                 best_recon=best_recon, best_smoothness=best_smoothness,
@@ -434,7 +454,7 @@ class RVQTokenizerTrainer:
             if is_camera_dataset:
                 eval_fn = evaluation_camera_vqvae_clatr if use_clatr else evaluation_camera_vqvae
                 # Use camera-specific evaluation (now includes FID and other motion metrics)
-                _clatr_extra = dict(vis_vel_integration=getattr(self.opt, 'vis_vel_integration', False)) if use_clatr else {}
+                _clatr_extra = dict(vis_vel_integration=True) if use_clatr else {}
                 best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_recon, best_smoothness, best_position_error, best_orientation_error, writer = eval_fn(
                     self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, 
                     best_recon=best_recon, best_smoothness=best_smoothness,

@@ -322,7 +322,7 @@ def load_res_model(res_opt, vq_opt, opt, text_cond=None):
             )
         ckpt = torch.load(ckpt_path, map_location=opt.device)
     elif is_camera:
-        ckpt_files = ['net_best_acc.tar', 'net_best_loss.tar', 'latest.tar']
+        ckpt_files = ['net_best_fid.tar', 'net_best_acc.tar', 'net_best_loss.tar']
         loaded = False
         for cf in ckpt_files:
             ckpt_path = _res_ckpt_full_path(cf)
@@ -818,7 +818,7 @@ if __name__ == '__main__':
     assert res_opt.vq_name == model_opt.vq_name
 
     # ── Load M-Transformer ──
-    which_m = getattr(opt, 'which_epoch', 'latest')
+    which_m = getattr(opt, 'which_epoch', 'net_best_fid')
     ckpt_m = which_m if str(which_m).endswith('.tar') else f'{which_m}.tar'
     t2m_transformer = load_trans_model(
         model_opt, opt, ckpt_m, text_cond=text_cond_m,
